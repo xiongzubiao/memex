@@ -1,0 +1,3 @@
+name = "article"
+dimensions = ["Clarity", "Argument Strength", "Evidence", "Flow", "Originality"]
+sections = ["Thesis", "Introduction", "Body", "Counterarguments", "Conclusion"]

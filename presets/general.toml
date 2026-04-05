@@ -1,0 +1,3 @@
+name = "general"
+dimensions = ["Completeness", "Coherence", "Feasibility", "Originality"]
+sections = ["Problem Statement", "Key Ideas", "Analysis", "Recommendations"]

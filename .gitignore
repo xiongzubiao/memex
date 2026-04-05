@@ -1,0 +1,27 @@
+/target
+*.db
+*.db-journal
+.DS_Store
+._*
+
+# Environment files (may contain secrets)
+.env
+.env.local
+.env.*.local
+
+# Secret keys and credentials
+.secret_key
+*.key
+*.pem
+credentials.json
+
+# Claude Code
+.claude/worktrees/
+.claude/skills/*-workspace/
+
+# IDE
+.idea
+.vscode
+
+# Local state
+.local-state-backups/

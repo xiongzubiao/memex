@@ -1,0 +1,33 @@
+[package]
+name = "brainstormer"
+version = "0.1.0"
+edition = "2024"
+description = "Multi-LLM brainstorming with convergence detection"
+publish = false
+
+[[bin]]
+name = "brainstormer"
+path = "src/main.rs"
+
+[lib]
+name = "brainstormer"
+path = "src/lib.rs"
+
+[dependencies]
+zeroclaw = { git = "https://github.com/zeroclaw-labs/zeroclaw.git", tag = "v0.6.8", package = "zeroclawlabs" }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+uuid = { version = "1.0", features = ["v4"] }
+regex = "1.10"
+atty = "0.2"
+dirs = "5.0"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["test-util"] }

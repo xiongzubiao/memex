@@ -1,0 +1,3 @@
+name = "research"
+dimensions = ["Novelty", "Rigor", "Falsifiability", "Reproducibility", "Significance"]
+sections = ["Research Question", "Literature Review", "Methodology", "Expected Results", "Limitations", "Future Work"]
