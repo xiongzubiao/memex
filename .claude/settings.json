@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make *)",
+      "Bash(cargo *)",
+      "Bash(go *)",
+      "Bash(pnpm *)",
+      "Bash(npx *)",
+      "Bash(python3 *)",
+      "Bash(git *)",
+      "Bash(gh *)",
+      "Bash(curl *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(sed *)",
+      "Bash(agent-browser *)",
+      "WebFetch(*)"
+    ]
+  }
+}

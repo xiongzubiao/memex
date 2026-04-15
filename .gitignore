@@ -18,6 +18,7 @@ credentials.json
 # Claude Code
 .claude/worktrees/
 .claude/skills/*-workspace/
+.claude/settings.local.json
 
 # IDE
 .idea
@@ -25,3 +26,7 @@ credentials.json
 
 # Local state
 .local-state-backups/
+.worktrees/
+.gstack/
+.superpowers/
+docs/superpowers/plans/
