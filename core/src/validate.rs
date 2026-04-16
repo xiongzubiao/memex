@@ -99,7 +99,12 @@ fn fix_yaml_title_colons(yaml: &str) -> String {
 pub fn find_dangling_links(content: &str, wiki_dir: &Path) -> Vec<String> {
     extract_wiki_links(content)
         .into_iter()
-        .filter(|link| !wiki_dir.join(format!("{link}.md")).exists())
+        .filter(|link| {
+            // Reject links with path traversal or directory separators.
+            !link.contains("..")
+                && !link.contains('/')
+                && !wiki_dir.join(format!("{link}.md")).exists()
+        })
         .collect()
 }
 
@@ -108,7 +113,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    const VALID_PAGE: &str = "---\ntitle: Test Page\ntags:\n  - entity\ncreated: 2026-04-06T00:00:00Z\nlast_updated: 2026-04-06T00:00:00Z\nsources:\n  - sources/documents/abc.md\n---\n\nPage body here.\n";
+    const VALID_PAGE: &str = "---\ntitle: Test Page\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources:\n  - sources/documents/abc.md\n---\n\nPage body here.\n";
 
     #[test]
     fn parse_valid_frontmatter() {
@@ -138,7 +143,7 @@ mod tests {
 
     #[test]
     fn validate_page_rejects_empty_title() {
-        let page = "---\ntitle: \"\"\ntags:\n  - entity\ncreated: 2026-04-06T00:00:00Z\nlast_updated: 2026-04-06T00:00:00Z\nsources: []\n---\nbody";
+        let page = "---\ntitle: \"\"\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nbody";
         let err = validate_page(page).unwrap_err();
         assert!(format!("{err}").contains("title is empty"));
     }
@@ -181,7 +186,7 @@ mod tests {
 
     #[test]
     fn parse_frontmatter_with_colon_in_title() {
-        let page = "---\ntitle: Go: Deep Equal Comparison\ntags:\n  - entity\ncreated: 2026-04-06T00:00:00Z\nlast_updated: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
+        let page = "---\ntitle: Go: Deep Equal Comparison\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
         let (fm, _) = parse_frontmatter(page).unwrap();
         assert_eq!(fm.title, "Go: Deep Equal Comparison");
     }

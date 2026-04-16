@@ -1,96 +1,12 @@
-use memex_cli::{
-    auth, auto_detect,
-    config_file::{self, OperationKind},
-};
-
 use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
-use zeroclaw::agent::Agent;
-
-/// Run an interactive REPL loop with an agent, returning the last response.
-async fn interactive_loop(agent: &mut Agent, prompt_label: &str) -> Option<String> {
-    let mut last_response = None;
-    loop {
-        eprint!("\n{prompt_label}");
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err() {
-            break;
-        }
-        let input = input.trim();
-        if input.is_empty()
-            || input.eq_ignore_ascii_case("quit")
-            || input.eq_ignore_ascii_case("exit")
-            || input.eq_ignore_ascii_case("done")
-        {
-            break;
-        }
-        match agent.turn(input).await {
-            Ok(reply) => {
-                println!("{reply}");
-                last_response = Some(reply);
-            }
-            Err(e) => {
-                eprintln!("Agent error: {e}");
-                break;
-            }
-        }
-    }
-    last_response
-}
-
-fn memex_root() -> PathBuf {
-    if let Ok(root) = std::env::var("MEMEX_ROOT") {
-        return PathBuf::from(root);
-    }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".memex")
-}
-
-fn runtime_options(root: &Path) -> zeroclaw::providers::ProviderRuntimeOptions {
-    zeroclaw::providers::ProviderRuntimeOptions {
-        zeroclaw_dir: Some(root.join(".zeroclaw")),
-        secrets_encrypt: true,
-        ..Default::default()
-    }
-}
-
-fn create_provider(
-    root: &Path,
-    model_ref: &config_file::ModelRef,
-) -> anyhow::Result<Box<dyn zeroclaw::providers::Provider>> {
-    if model_ref.provider == "dry-run" {
-        Ok(Box::new(memex_agent::dry_run::DryRunProvider))
-    } else {
-        zeroclaw::providers::create_provider_with_options(
-            &model_ref.provider,
-            None,
-            &runtime_options(root),
-        )
-    }
-}
-
-fn create_llm_provider(
-    root: &Path,
-    model_ref: &config_file::ModelRef,
-) -> anyhow::Result<Box<dyn memex_core::LlmProvider>> {
-    Ok(Box::new(memex_agent::tools::ProviderLlmAdapter(
-        create_provider(root, model_ref)?,
-    )))
-}
-
-fn provider_defaults(provider: auth::AuthProvider) -> config_file::ProviderDefaults {
-    match provider {
-        auth::AuthProvider::Codex => config_file::ProviderDefaults::codex(),
-        auth::AuthProvider::Gemini => config_file::ProviderDefaults::gemini(),
-    }
-}
+use memex_core::Memex;
+use memex_core::search::{self, MIN_SCORE, SearchResult, WikiSearch};
+use memex_core::types::LintIssueKind;
+use std::io::Read as _;
+use std::path::Path;
 
 #[derive(Parser)]
-#[command(
-    name = "memex",
-    about = "Personal knowledge base with multi-LLM brainstorming"
-)]
+#[command(name = "memex", about = "Personal wiki storage and search engine")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -98,882 +14,1068 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new memex
-    Init,
-    /// Manage OAuth credentials for codex and gemini
-    Auth {
-        #[command(subcommand)]
-        sub: AuthSub,
-    },
-    /// Start a multi-LLM brainstorming session
-    Brainstorm {
-        #[command(subcommand)]
-        sub: BrainstormSub,
-    },
-    /// Ingest sources into memex (files, URLs, directories, ZIP exports)
-    Ingest {
-        /// Paths or URLs to ingest (auto-detects format: md, code, json, jsonl, zip, etc.)
-        sources: Vec<String>,
-        /// Show what would be ingested without writing anything
+    /// BM25 full-text search
+    Search {
+        /// Search query (full sentence or keywords)
+        query: String,
+        /// Keyword expansion terms (BM25 only, repeatable)
         #[arg(long)]
-        preview: bool,
+        lex: Vec<String>,
+        /// Semantic expansion terms (vector only, repeatable)
+        #[arg(long)]
+        vec: Vec<String>,
+        /// Hypothetical document expansion (vector only, repeatable)
+        #[arg(long)]
+        hyde: Vec<String>,
+        /// Legacy expansion terms for RRF fusion (repeatable)
+        #[arg(long)]
+        expand: Vec<String>,
     },
-    /// Query memex with a natural language question
-    Query {
-        /// The question to ask (omit for interactive agent mode)
-        question: Option<String>,
+    /// Read wiki pages by docid, stem, or title
+    Read {
+        /// Page references (docid, filename stem, or title)
+        refs: Vec<String>,
     },
-    /// Run wiki health checks (dangling links, orphans, contradictions)
+    /// Write a wiki page (opens $EDITOR or reads piped stdin)
+    Write {
+        /// Page name or title (normalized to kebab-case filename)
+        name: String,
+        /// Overwrite existing page instead of reporting conflict
+        #[arg(long)]
+        force: bool,
+        /// Reduced output (only written: and wiki_pages:)
+        #[arg(long)]
+        quiet: bool,
+        /// Source file paths to attach (repeatable)
+        #[arg(long = "source")]
+        sources: Vec<String>,
+    },
+    /// Delete a wiki page
+    Delete {
+        /// Page reference (docid, filename stem, or title)
+        page_ref: String,
+        /// Skip confirmation prompt (required when stdin is a TTY)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check wiki for dangling links and missing cross-references
     Lint {
-        /// Automatically apply fixable issues (create stub pages for missing links)
+        /// Auto-fix stale index entries by reindexing from disk
         #[arg(long)]
         fix: bool,
     },
-    /// Wiki management (reindex, show index, view log, stats)
-    Wiki {
-        #[command(subcommand)]
-        sub: WikiSub,
-    },
-    /// Check that all configured LLM providers are reachable
-    Doctor,
-    /// View or update memex configuration
-    Config {
-        #[command(subcommand)]
-        sub: ConfigSub,
-    },
 }
 
-#[derive(Subcommand)]
-enum BrainstormSub {
-    /// Start a new brainstorm session (omit task for interactive mode)
-    New {
-        /// What to brainstorm (e.g. "Design a rate-limiting API")
-        task: Option<String>,
-        /// Task type preset: software, general, research, article, book, strategy
-        #[arg(long = "type", value_name = "PRESET",
-              value_parser = clap::builder::PossibleValuesParser::new(memex_agent::preset::available_presets()))]
-        task_type: Option<String>,
-    },
-    /// Resume an interrupted brainstorm session
-    Resume {
-        /// Session ID (omit to resume latest)
-        session_id: Option<String>,
-    },
-    /// List all brainstorm sessions
-    List,
-    /// Show details of a brainstorm session
-    Show { session_id: String },
-    /// Export a brainstorm session to file
-    Export {
-        session_id: String,
-        /// Output file path (default: stdout)
-        #[arg(long, short = 'o')]
-        output: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum WikiSub {
-    /// Rebuild index.md from all wiki pages
-    Reindex,
-    /// Display the wiki index
-    Show,
-    /// Show recent operations log
-    Log,
-    /// Show wiki page count and source count
-    Stats,
-    /// BM25 full-text search (no LLM, instant)
-    Search {
-        /// The search query
-        query: String,
-        /// Number of results to return
-        #[arg(long, short = 'k', default_value = "10")]
-        top_k: usize,
-    },
-}
-
-#[derive(Subcommand)]
-enum ConfigSub {
-    /// Display current configuration
-    Show,
-    /// Set a configuration value (e.g. memex config set provider.model claude-opus-4-6)
-    Set { key: String, value: String },
-}
-
-#[derive(Subcommand)]
-enum AuthSub {
-    /// Login with OAuth (imports existing provider CLI cache when available)
-    Login {
-        /// Provider to login: codex or gemini
-        #[arg(long, value_parser = ["codex", "gemini"])]
-        provider: String,
-        /// Use OAuth device-code flow
-        #[arg(long)]
-        device_code: bool,
-        /// Also set this provider's global default model in config.toml
-        #[arg(long)]
-        make_default: bool,
-    },
-    /// Show memex-managed auth status
-    Status,
-    /// Remove provider auth state from memex
-    Logout {
-        /// Provider to logout: codex or gemini
-        #[arg(long, value_parser = ["codex", "gemini"])]
-        provider: String,
-    },
-}
-
-fn setup_tracing(root: &std::path::Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    if root.exists() {
-        let file_appender = tracing_appender::rolling::never(root, "memex.log");
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-        tracing_subscriber::fmt()
-            .with_writer(non_blocking)
-            .with_ansi(false)
-            .with_target(false)
-            .init();
-
-        Some(guard)
+/// Compute the display stem for a search result.
+///
+/// For wiki documents: filename basename without extension (e.g. "caching").
+/// For source documents: the absolute path (e.g. "/home/user/notes.txt").
+fn result_stem(result: &SearchResult) -> String {
+    if result.collection == "wiki" {
+        result
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string()
     } else {
-        // Before `memex init`: no logging (tracing events are silently dropped)
-        None
+        result.path.to_string_lossy().to_string()
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let root = memex_root();
-    let _tracing_guard = setup_tracing(&root);
-    let cli = Cli::parse();
-    match cli.command {
-        Commands::Init => {
-            let root = memex_root();
-            eprintln!("Initializing memex at {}", root.display());
+/// Convert vector search results to SearchResults by looking up document metadata.
+///
+/// For each `VectorResult` (keyed by content hash), looks up the document(s)
+/// referencing that hash. Uses the best chunk text as the snippet instead of
+/// the document summary.
+fn vector_search_as_results(
+    search: &memex_core::search::Bm25Search,
+    query_embedding: &[f32],
+) -> anyhow::Result<Vec<SearchResult>> {
+    let vec_results = search.with_connection(|conn| {
+        memex_core::vector::vector_search_collapsed(conn, query_embedding, 20)
+    })?;
 
-            let providers = auto_detect::detect_providers();
-            let provider_name = if providers.is_empty() {
-                eprintln!("No LLM providers detected. Defaulting to dry-run.");
-                eprintln!(
-                    "Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY to enable AI features."
-                );
-                "dry-run".to_string()
-            } else {
-                eprintln!(
-                    "Detected providers: {}",
-                    providers
-                        .iter()
-                        .map(|p| p.provider.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                providers[0].frontier_model.provider.clone()
-            };
+    let mut results = Vec::new();
+    for vr in &vec_results {
+        let docs = search.lookup_documents_by_hash(&vr.hash)?;
+        for doc in docs {
+            results.push(SearchResult {
+                path: std::path::PathBuf::from(&doc.path),
+                title: doc.title,
+                score: vr.score,
+                snippet: vr.chunk_text.clone(),
+                collection: doc.collection,
+                docid: doc.docid,
+            });
+        }
+    }
+    Ok(results)
+}
 
-            let model_name = if provider_name == "dry-run" {
-                "dry-run".to_string()
-            } else {
-                providers[0].midtier_model.model.clone()
-            };
+/// Check if the ONNX embedding model can actually be loaded.
+///
+/// Probes the real runtime by attempting to load the model file with
+/// `catch_unwind_silent`.  Returns `true` only if both the model file
+/// exists AND the ONNX Runtime shared library is available.
+fn onnx_model_available() -> bool {
+    let Some(mp) = dirs::home_dir().map(|h| h.join(".memex/models/embedding-gemma-300m.onnx"))
+    else {
+        return false;
+    };
+    if !mp.exists() {
+        return false;
+    }
+    let Some(path_str) = mp.to_str() else {
+        return false;
+    };
+    let path_owned = path_str.to_string();
+    catch_unwind_silent(|| memex_core::embed::load_model(&path_owned, "embedding-gemma-300m"))
+        .is_ok_and(|r| r.is_ok())
+}
 
-            let init_model_ref = if provider_name == "dry-run" {
-                config_file::ModelRef {
-                    provider: "dry-run".to_string(),
-                    model: "default".to_string(),
-                }
-            } else {
-                config_file::ModelRef {
-                    provider: providers[0].midtier_model.provider.clone(),
-                    model: providers[0].midtier_model.model.clone(),
-                }
-            };
-            memex_core::Memex::open(
-                root.clone(),
-                create_llm_provider(&root, &init_model_ref)?,
-                &model_name,
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+/// Run a closure with panic output silenced.
+///
+/// The `ort` crate panics (rather than returning an error) when the ONNX
+/// Runtime shared library cannot be loaded.  `catch_unwind` catches the
+/// panic, but the default hook still prints a noisy backtrace to stderr.
+/// This helper installs a no-op panic hook for the duration of the call,
+/// then restores the original hook afterwards.
+fn catch_unwind_silent<F: FnOnce() -> R + std::panic::UnwindSafe, R>(f: F) -> Result<R, ()> {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f).map_err(|_| ());
+    std::panic::set_hook(prev);
+    result
+}
 
-            memex_agent::identity::scaffold_identity_files(&root)?;
+/// Embed a query string using the ONNX model or hash_embedding fallback.
+fn embed_query(text: &str) -> Vec<f32> {
+    let model_path = dirs::home_dir().map(|h| h.join(".memex/models/embedding-gemma-300m.onnx"));
 
-            // Write config.toml matching spec's Configuration section
-            let config_content = config_file::build_config_toml(&providers);
-            std::fs::write(root.join("config.toml"), config_content)?;
+    if let Some(ref mp) = model_path
+        && mp.exists()
+        && let Some(path_str) = mp.to_str()
+        && let Ok(Ok(mut model)) =
+            catch_unwind_silent(|| memex_core::embed::load_model(path_str, "embedding-gemma-300m"))
+    {
+        memex_core::embed::embed_text(&mut model, text)
+            .unwrap_or_else(|_| memex_core::embed::hash_embedding(text))
+    } else {
+        memex_core::embed::hash_embedding(text)
+    }
+}
 
-            eprintln!("Memex initialized at {}", root.display());
-            eprintln!("  Wiki:    {}/wiki/", root.display());
-            eprintln!("  Sources: {}/sources/", root.display());
-            eprintln!("  Config:  {}/config.toml", root.display());
+fn run_search(
+    query: &str,
+    lex: &[String],
+    vec: &[String],
+    hyde: &[String],
+    expand: &[String],
+) -> anyhow::Result<()> {
+    let root = memex_cli::memex_root();
+    let memex = Memex::open(root)?;
+    let search = memex.search();
+
+    let has_typed_flags = !lex.is_empty() || !vec.is_empty() || !hyde.is_empty();
+
+    if has_typed_flags {
+        // Typed query mode: --lex/--vec/--hyde present.
+        // Signal detection is skipped.
+        let mut ranked_lists: Vec<Vec<SearchResult>> = Vec::new();
+        let mut wiki_indices: Vec<usize> = Vec::new();
+
+        // Primary query -> BM25 + vector (both).
+        let wiki_bm25 = search.search_collection(query, "wiki", 20)?;
+        let source_bm25 = search.search_collection(query, "source", 20)?;
+        wiki_indices.push(ranked_lists.len());
+        ranked_lists.push(wiki_bm25);
+        ranked_lists.push(source_bm25);
+
+        // Primary query -> vector search.
+        let query_emb = embed_query(query);
+        let vec_results = vector_search_as_results(search, &query_emb)?;
+        if !vec_results.is_empty() {
+            ranked_lists.push(vec_results);
         }
 
-        Commands::Auth { sub } => {
-            let root = memex_root();
-            match sub {
-                AuthSub::Login {
-                    provider,
-                    device_code,
-                    make_default,
-                } => {
-                    let provider = auth::normalize_provider(&provider)?;
-                    let result = auth::login(&root, provider, device_code).await?;
-                    config_file::apply_provider_defaults_and_persist(
-                        &root,
-                        &provider_defaults(provider),
-                        make_default,
-                    )?;
+        // --lex terms -> BM25 only (wiki 2x + source 1x per term).
+        for term in lex {
+            let lex_wiki = search.search_collection(term, "wiki", 20)?;
+            let lex_source = search.search_collection(term, "source", 20)?;
+            wiki_indices.push(ranked_lists.len());
+            ranked_lists.push(lex_wiki);
+            ranked_lists.push(lex_source);
+        }
 
-                    match result.source {
-                        auth::LoginSource::Imported(path) => {
-                            println!(
-                                "Imported {} credentials from {}",
-                                result.provider.cli_name(),
-                                path.display()
-                            );
-                        }
-                        auth::LoginSource::DeviceCode => {
-                            println!("OAuth login completed for {}", result.provider.cli_name());
-                        }
-                    }
-
-                    if let Some(account_id) = result.account_id {
-                        println!("Account: {account_id}");
-                    }
-                    println!("Auth state saved at {}", root.join("auth.json").display());
-                    println!("Config updated at {}", root.join("config.toml").display());
-                }
-                AuthSub::Status => {
-                    let entries = auth::status(&root).await?;
-                    if entries.is_empty() {
-                        println!("No memex auth credentials configured.");
-                    } else {
-                        println!("Memex auth profiles:");
-                        for entry in entries {
-                            let expires = match entry.expires_at {
-                                Some(ts) if ts <= chrono::Utc::now() => {
-                                    format!("expired ({})", ts.to_rfc3339())
-                                }
-                                Some(ts) => {
-                                    let mins = (ts - chrono::Utc::now()).num_minutes();
-                                    format!("expires in {mins}m ({})", ts.to_rfc3339())
-                                }
-                                None => "expires: n/a".to_string(),
-                            };
-                            let account = entry.account_id.unwrap_or_else(|| "unknown".to_string());
-                            println!(
-                                "  {}  account={}  {}",
-                                entry.provider.canonical(),
-                                account,
-                                expires
-                            );
-                        }
-                    }
-                }
-                AuthSub::Logout { provider } => {
-                    let provider = auth::normalize_provider(&provider)?;
-                    let removed = auth::logout(&root, provider).await?;
-                    if removed {
-                        println!("Removed auth for {}", provider.cli_name());
-                    } else {
-                        println!("No auth found for {}", provider.cli_name());
-                    }
-                }
+        // --vec terms -> vector search only.
+        for term in vec {
+            let term_emb = embed_query(term);
+            let vec_results = vector_search_as_results(search, &term_emb)?;
+            if !vec_results.is_empty() {
+                ranked_lists.push(vec_results);
             }
         }
 
-        Commands::Ingest { sources, preview } => {
-            use memex_core::types::Source;
-
-            let root = memex_root();
-
-            if sources.is_empty() {
-                eprintln!("No sources provided. Usage: memex ingest <path|url> [...]");
-                std::process::exit(1);
+        // --hyde terms -> vector search only (hypothetical document expansion).
+        for term in hyde {
+            let term_emb = embed_query(term);
+            let vec_results = vector_search_as_results(search, &term_emb)?;
+            if !vec_results.is_empty() {
+                ranked_lists.push(vec_results);
             }
+        }
 
-            if preview {
-                for source_str in &sources {
-                    println!("Would ingest: {source_str}");
-                }
-            } else if sources.len() == 1
-                && atty::is(atty::Stream::Stdin)
-                && !sources[0].ends_with(".zip")
-                && !sources[0].ends_with(".tgz")
-                && !sources[0].ends_with(".tar.gz")
-            {
-                // Single source on a tty: interactive agent mode (not for archives)
-                let cfg = config_file::load_memex_config(&root)?;
-                let model_ref = cfg.resolve_model(OperationKind::Ingest);
-                let memex = std::sync::Arc::new(
-                    memex_core::Memex::open(
-                        root.clone(),
-                        create_llm_provider(&root, &model_ref)?,
-                        &model_ref.model,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{}", e))?,
-                );
-                let threshold = memex_agent::config::parse_small_memex_threshold(&cfg.raw_content);
+        let fused = search::rrf_fuse(&ranked_lists, &wiki_indices, 60);
 
-                // Canonicalize and chdir to source's parent so file_read can access it
-                let source_path = std::fs::canonicalize(&sources[0])
-                    .unwrap_or_else(|_| PathBuf::from(&sources[0]));
-                let file_name = source_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                if let Some(parent) = source_path.parent() {
-                    let _ = std::env::set_current_dir(parent);
-                }
+        for result in &fused {
+            if result.score < MIN_SCORE {
+                continue;
+            }
+            let stem = result_stem(result);
+            println!(
+                "{}\t{}\t{:.3}\t{}\t{}",
+                result.docid, result.collection, result.score, stem, result.snippet
+            );
+        }
+    } else if !expand.is_empty() {
+        // Legacy --expand mode: BM25 probe + expansion terms.
+        let wiki_results = search.search_collection(query, "wiki", 20)?;
+        let source_results = search.search_collection(query, "source", 20)?;
 
-                let mut agent = memex_agent::copilot::build_copilot_agent(
-                    memex,
-                    create_provider(&root, &model_ref)?,
-                    &model_ref.model,
-                    threshold,
-                )?;
-                let prompt = memex_agent::copilot::format_copilot_prompt(
-                    memex_agent::copilot::CopilotMode::Ingest,
-                    &format!("Ingest: {file_name}"),
-                );
-                match agent.turn(&prompt).await {
-                    Ok(response) => {
-                        println!("{response}");
-                        interactive_loop(&mut agent, "> ").await;
-                    }
-                    Err(e) => {
-                        eprintln!("Agent error: {e}");
-                        std::process::exit(1);
-                    }
+        // Signal detection for legacy mode.
+        let s1 = wiki_results.first().map(|r| r.score as f64).unwrap_or(0.0);
+        let s2 = wiki_results.get(1).map(|r| r.score as f64).unwrap_or(0.0);
+        let signal = if search::is_strong_signal(s1, s2) {
+            "strong"
+        } else {
+            "weak"
+        };
+        println!("signal: {signal}");
+
+        let mut ranked_lists: Vec<Vec<SearchResult>> = vec![wiki_results, source_results];
+        let mut wiki_indices: Vec<usize> = vec![0];
+
+        for term in expand {
+            let exp_wiki = search.search_collection(term, "wiki", 20)?;
+            let exp_source = search.search_collection(term, "source", 20)?;
+            wiki_indices.push(ranked_lists.len());
+            ranked_lists.push(exp_wiki);
+            ranked_lists.push(exp_source);
+        }
+
+        let fused = search::rrf_fuse(&ranked_lists, &wiki_indices, 60);
+
+        for result in &fused {
+            if result.score < MIN_SCORE {
+                continue;
+            }
+            let stem = result_stem(result);
+            println!(
+                "{}\t{}\t{:.3}\t{}\t{}",
+                result.docid, result.collection, result.score, stem, result.snippet
+            );
+        }
+    } else {
+        // No flags: hybrid BM25 + vector search with signal detection.
+        let wiki_results = search.search_collection(query, "wiki", 20)?;
+        let source_results = search.search_collection(query, "source", 20)?;
+
+        // Signal detection from wiki BM25 scores (before RRF).
+        let s1 = wiki_results.first().map(|r| r.score as f64).unwrap_or(0.0);
+        let s2 = wiki_results.get(1).map(|r| r.score as f64).unwrap_or(0.0);
+        let signal = if search::is_strong_signal(s1, s2) {
+            "strong"
+        } else {
+            "weak"
+        };
+        println!("signal: {signal}");
+
+        // BM25 lists: wiki (2x via wiki_indices) + source (1x).
+        let mut lists: Vec<Vec<SearchResult>> = vec![wiki_results, source_results];
+        let wiki_indices: Vec<usize> = vec![0_usize];
+
+        // Vector search on the primary query (1x weight, not in wiki_indices).
+        let vec_results = vector_search_as_results(search, &embed_query(query))?;
+        if !vec_results.is_empty() {
+            lists.push(vec_results);
+        }
+
+        let fused = search::rrf_fuse(&lists, &wiki_indices, 60);
+
+        for result in &fused {
+            if result.score < MIN_SCORE {
+                continue;
+            }
+            let stem = result_stem(result);
+            println!(
+                "{}\t{}\t{:.3}\t{}\t{}",
+                result.docid, result.collection, result.score, stem, result.snippet
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn run_read(refs: &[String]) -> anyhow::Result<()> {
+    let root = memex_cli::memex_root();
+    let memex = Memex::open(root.clone())?;
+    let search = memex.search();
+
+    let wiki_dir = root.join("wiki");
+    let canonical_wiki = wiki_dir.canonicalize().unwrap_or(wiki_dir.clone());
+
+    for reference in refs {
+        let docs = search.resolve_ref_documents(reference)?;
+        if docs.is_empty() {
+            eprintln!("Not found: {reference}");
+            continue;
+        }
+        for doc in &docs {
+            // Derive stem: basename without extension.
+            let doc_path = Path::new(&doc.path);
+            let stem = doc_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+
+            // Read content: wiki pages from disk, source documents from content table.
+            let body = if doc.collection == "wiki" {
+                let full_path = root.join(&doc.path);
+                let canonical = full_path.canonicalize().unwrap_or(full_path.clone());
+                if !canonical.starts_with(&canonical_wiki) {
+                    eprintln!("Error: path traversal rejected: {}", doc.path);
+                    continue;
                 }
+                std::fs::read_to_string(&full_path)
+                    .unwrap_or_else(|e| format!("(error reading file: {e})"))
             } else {
-                // Batch mode: non-interactive pipeline
-                let cfg = config_file::load_memex_config(&root)?;
-                let model_ref = cfg.resolve_model(OperationKind::Ingest);
-                let mut memex = memex_core::Memex::open(
-                    root.clone(),
-                    create_llm_provider(&root, &model_ref)?,
-                    &model_ref.model,
-                )
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-                memex.set_progress(|msg| eprintln!("  {msg}"));
+                // Source documents: read from the content-addressable store.
+                search
+                    .get_content(&doc.hash)
+                    .unwrap_or_else(|e| format!("(error reading content: {e})"))
+            };
 
-                for source_str in &sources {
-                    let source = if source_str.starts_with("http://")
-                        || source_str.starts_with("https://")
-                    {
-                        Source::Url {
-                            url: source_str.clone(),
-                        }
-                    } else {
-                        let path = PathBuf::from(source_str);
-                        if path.is_dir() {
-                            Source::Directory { path }
-                        } else {
-                            Source::File { path }
-                        }
-                    };
+            println!("=== {} {} {} ===", doc.docid, doc.collection, stem);
+            print!("{body}");
+            if !body.ends_with('\n') {
+                println!();
+            }
+        }
+    }
+    Ok(())
+}
 
-                    eprintln!("Ingesting: {source_str}");
-                    match memex.ingest(&source).await {
-                        Ok(report) => {
-                            println!(
-                                "Ingested '{}': {} pages created, {} updated",
-                                source_str,
-                                report.pages_created.len(),
-                                report.pages_updated.len()
-                            );
-                            for page in &report.pages_created {
-                                println!("  + {}", page.display());
-                            }
-                            for page in &report.pages_updated {
-                                println!("  ~ {}", page.display());
-                            }
-                            for warning in &report.warnings {
-                                eprintln!("  Warning: {warning}");
-                            }
+/// Open $EDITOR with a frontmatter template. Returns the edited content.
+fn open_editor_for_page(name: &str) -> anyhow::Result<String> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let template =
+        format!("---\ntitle: {name}\ntags: []\ncreated_at: {now}\nupdated_at: {now}\n---\n\n");
+
+    let tmp = std::env::temp_dir().join(format!("memex-{}.md", std::process::id()));
+    std::fs::write(&tmp, &template)?;
+
+    let editor = std::env::var("EDITOR")
+        .or_else(|_| std::env::var("VISUAL"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    let status = std::process::Command::new(&editor)
+        .arg(&tmp)
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to open editor '{editor}': {e}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("Editor exited with non-zero status");
+    }
+
+    let content = std::fs::read_to_string(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+
+    if content.trim().is_empty() || content.trim() == template.trim() {
+        anyhow::bail!("Aborted: empty or unchanged content");
+    }
+
+    Ok(content)
+}
+
+/// Convert a human-readable name into a URL-safe filename stem.
+fn slugify(name: &str) -> String {
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    slug.split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Replace the body after frontmatter with `new_body`, preserving frontmatter verbatim.
+///
+/// Locates the closing `---` of the frontmatter block and searches for the body
+/// only *after* it, avoiding false matches where body text also appears in a
+/// frontmatter field (e.g. a short body like "TODO" matching `title: TODO`).
+fn reconstruct_page(original: &str, new_body: &str) -> String {
+    let trimmed = original.trim_start();
+    if !trimmed.starts_with("---") {
+        return original.to_string();
+    }
+    let after_open = &trimmed[3..];
+    let Some(close_idx) = after_open.find("---") else {
+        return original.to_string();
+    };
+    // Byte offset in `original` just past the closing ---
+    let trim_offset = original.len() - trimmed.len();
+    let body_region_start = trim_offset + 3 + close_idx + 3;
+
+    if let Ok((_, old_body)) = memex_core::validate::parse_frontmatter(original)
+        && !old_body.is_empty()
+        && let Some(rel) = original[body_region_start..].find(&old_body)
+    {
+        let abs = body_region_start + rel;
+        return format!("{}{}", &original[..abs], new_body);
+    }
+    // Body empty or not found: keep everything up to body region, append new body.
+    let prefix = original[..body_region_start].trim_end();
+    format!("{prefix}\n\n{new_body}")
+}
+
+/// Chunk a document body and store embeddings for each chunk.
+///
+/// Tries to load the ONNX embedding model from `~/.memex/models/`. If the model
+/// is unavailable or fails to load, falls back to deterministic hash-based
+/// embeddings so the chunks table is always populated and vector search still
+/// works (with lower quality).
+fn embed_document(search: &memex_core::search::Bm25Search, hash: &str, body: &str) {
+    let model_path = dirs::home_dir().map(|h| h.join(".memex/models/embedding-gemma-300m.onnx"));
+
+    let chunks = memex_core::embed::chunk_text(body, 900, 0.15);
+
+    // Try loading the real model; fall back to hash_embedding on failure.
+    let mut model_opt: Option<memex_core::embed::EmbeddingModel> = None;
+    if let Some(ref mp) = model_path
+        && mp.exists()
+        && let Some(path_str) = mp.to_str()
+        && let Ok(Ok(m)) =
+            catch_unwind_silent(|| memex_core::embed::load_model(path_str, "embedding-gemma-300m"))
+    {
+        model_opt = Some(m);
+    }
+
+    let model_name = if model_opt.is_some() {
+        "embedding-gemma-300m"
+    } else {
+        "hash-embedding"
+    };
+
+    let _ = search.with_connection(|conn| {
+        // Delete existing chunks for this hash before re-embedding.
+        memex_core::vector::delete_chunks(conn, hash)?;
+        for (seq, chunk) in chunks.iter().enumerate() {
+            let embedding = if let Some(ref mut model) = model_opt {
+                memex_core::embed::embed_text(model, &chunk.text)
+                    .unwrap_or_else(|_| memex_core::embed::hash_embedding(&chunk.text))
+            } else {
+                memex_core::embed::hash_embedding(&chunk.text)
+            };
+            let _ = memex_core::vector::store_chunk(
+                conn,
+                hash,
+                seq as i32,
+                &chunk.text,
+                chunk.pos,
+                chunk.len,
+                model_name,
+                &embedding,
+            );
+        }
+        Ok(())
+    });
+}
+
+fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow::Result<()> {
+    // 1. Get content: piped stdin or interactive $EDITOR (like git commit).
+    let content = if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        // Piped: read from stdin.
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    } else {
+        // Interactive terminal: open $EDITOR with a template.
+        open_editor_for_page(name)?
+    };
+
+    // 2. Normalize name to kebab-case.
+    let stem = slugify(name);
+    if stem.is_empty() {
+        anyhow::bail!("Name slugifies to empty string: {name:?}");
+    }
+
+    // 3. Validate frontmatter.
+    let (fm, body) =
+        memex_core::validate::parse_frontmatter(&content).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if fm.title.trim().is_empty() {
+        anyhow::bail!("Page title is empty");
+    }
+
+    // 4. Lazy init — Memex::open creates wiki/ and DB.
+    let root = memex_cli::memex_root();
+    let memex = Memex::open(root.clone())?;
+    let search = memex.search();
+
+    let wiki_dir = memex.wiki_dir();
+    let page_path = wiki_dir.join(format!("{stem}.md"));
+    let rel_path = Path::new("wiki").join(format!("{stem}.md"));
+    let rel_path_str = rel_path.to_string_lossy().to_string();
+
+    // 5. Conflict detection: if page exists and --force not set, show conflict and exit.
+    let is_overwrite = search.lookup_stem(&stem)?.is_some();
+    if is_overwrite && !force {
+        let existing_modified = search
+            .get_last_modified(&rel_path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "unknown".to_string());
+        let existing_title = memex_core::index::extract_title_and_summary(
+            &std::fs::read_to_string(&page_path).unwrap_or_default(),
+            120,
+        )
+        .map(|(t, _)| t)
+        .unwrap_or_default();
+        println!("conflict: {stem}");
+        println!("existing: \"{existing_title}\" (updated_at {existing_modified})");
+        return Ok(());
+    }
+
+    // 6. Capture old content hash before overwrite (for orphan cleanup).
+    let old_hash: Option<String> = if is_overwrite {
+        search.get_document_hash(&rel_path_str)?
+    } else {
+        None
+    };
+
+    // 7. Forward linking.
+    let existing_pages = search.all_stems_and_titles()?;
+    let (linked_body, linked_stems) =
+        memex_core::crosslink::forward_link(&body, &existing_pages, &stem);
+
+    // Detect suggest-create candidates: wiki links that don't match any existing stem.
+    let suggest_create: Vec<String> = memex_core::validate::extract_wiki_links(&linked_body)
+        .into_iter()
+        .filter(|link| link != &stem && !existing_pages.iter().any(|(s, _)| s == link))
+        .collect();
+
+    // 8. Reconstruct page content with linked body.
+    let final_content = reconstruct_page(&content, &linked_body);
+
+    // 9. Write file to disk.
+    memex_core::storage::atomic_write(&page_path, final_content.as_bytes())?;
+
+    // 10. Insert content into content-addressable store.
+    let hash = search.insert_content(&final_content)?;
+
+    // 11. Allocate docid.
+    //     On --force overwrite, reuse the existing docid so it stays stable.
+    let docid = if is_overwrite {
+        search.lookup_path_docid(&rel_path)?.unwrap_or_else(|| {
+            let existing = search.existing_docids().unwrap_or_default();
+            let existing_vec: Vec<String> = existing.into_iter().collect();
+            memex_core::docid::allocate_docid(&hash, "wiki", &rel_path_str, &existing_vec)
+        })
+    } else {
+        let existing = search.existing_docids()?;
+        let existing_vec: Vec<String> = existing.into_iter().collect();
+        memex_core::docid::allocate_docid(&hash, "wiki", &rel_path_str, &existing_vec)
+    };
+
+    // 12. Compute summary.
+    let summary = fm
+        .summary
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| memex_core::index::extract_summary(&linked_body, 120));
+
+    // 13. Insert/update documents row.
+    let tags = fm.tags.join(", ");
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let created_at = if is_overwrite {
+        fm.created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    } else {
+        now.clone()
+    };
+    search.upsert_document(
+        "wiki",
+        &rel_path_str,
+        &fm.title,
+        &hash,
+        &docid,
+        &tags,
+        &summary,
+        &created_at,
+        &now,
+    )?;
+
+    // 14. Chunk and embed the wiki page body (use linked body for consistency
+    //     with the stored content hash, which is for the linked content).
+    embed_document(search, &hash, &linked_body);
+
+    // 15. Orphan cleanup: if --force overwrite and hash changed, clean up old content.
+    // cleanup_orphaned_content already deletes associated chunks internally.
+    if let Some(ref old_h) = old_hash
+        && old_h != &hash
+    {
+        let _ = search.cleanup_orphaned_content(old_h);
+    }
+
+    // 16. Handle --source: ingest source files.
+    for source_path_str in sources {
+        let source_path = std::path::PathBuf::from(source_path_str);
+        if !source_path.exists() {
+            eprintln!("Warning: source not found: {source_path_str}");
+            continue;
+        }
+        let source_path = std::fs::canonicalize(&source_path)?;
+        let source_content = std::fs::read_to_string(&source_path)?;
+        let source_hash = search.insert_content(&source_content)?;
+        let source_abs = source_path.to_string_lossy().to_string();
+        let existing_docids = search.existing_docids()?;
+        let existing_vec: Vec<String> = existing_docids.into_iter().collect();
+        let source_docid =
+            memex_core::docid::allocate_docid(&source_hash, "source", &source_abs, &existing_vec);
+        let source_title = source_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let source_summary = memex_core::index::extract_summary(&source_content, 120);
+        search.upsert_document(
+            "source",
+            &source_abs,
+            &source_title,
+            &source_hash,
+            &source_docid,
+            "",
+            &source_summary,
+            &now,
+            &now,
+        )?;
+
+        // Chunk and embed source document.
+        embed_document(search, &source_hash, &source_content);
+    }
+
+    // 17. Get wiki page count.
+    let wiki_page_count = search.wiki_page_count()?;
+
+    // 18. Backward linking (always runs; --quiet only suppresses output).
+    let mut backlinked_stems: Vec<String> = Vec::new();
+    {
+        for entry in std::fs::read_dir(&wiki_dir)? {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let other_stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if other_stem == stem {
+                continue;
+            }
+            let other_content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let other_result = memex_core::validate::parse_frontmatter(&other_content);
+            let (_, other_body) = match other_result {
+                Ok(pair) => pair,
+                Err(_) => continue,
+            };
+            let (updated_body, was_linked) = memex_core::crosslink::backward_link_page(
+                &other_body,
+                &stem,
+                &fm.title,
+                &other_stem,
+            );
+            if was_linked {
+                // Rewrite the file with the updated body.
+                let updated_content = reconstruct_page(&other_content, &updated_body);
+                if memex_core::storage::atomic_write(&path, updated_content.as_bytes()).is_err() {
+                    continue;
+                }
+
+                // Re-index using the real file content hash (not a synthetic one)
+                // so that lint stale-index checks stay consistent.
+                let other_rel = Path::new("wiki").join(format!("{other_stem}.md"));
+                let other_rel_str = other_rel.to_string_lossy().to_string();
+                let old_other_hash = search
+                    .get_document_hash(&other_rel_str)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let _ = search.reindex_page_from_content(
+                    &other_rel_str,
+                    &updated_content,
+                    &old_other_hash,
+                );
+                backlinked_stems.push(other_stem);
+            }
+        }
+    }
+
+    // 19. Output.
+    println!("written: {docid}");
+    println!("wiki_pages: {wiki_page_count}");
+    if !quiet {
+        if !linked_stems.is_empty() {
+            println!("linked: {}", linked_stems.join(", "));
+        }
+        if !backlinked_stems.is_empty() {
+            println!("backlinked: {}", backlinked_stems.join(", "));
+        }
+        if !suggest_create.is_empty() {
+            println!("suggest-create: {}", suggest_create.join(", "));
+        }
+    }
+
+    Ok(())
+}
+
+fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
+    let root = memex_cli::memex_root();
+    let memex = Memex::open(root.clone())?;
+    let search = memex.search();
+
+    // 1. Resolve via three-tier resolution — must be exactly one wiki document.
+    let docs = search.resolve_ref_documents(page_ref)?;
+    if docs.is_empty() {
+        eprintln!("Not found: {page_ref}");
+        std::process::exit(1);
+    }
+    let wiki_docs: Vec<_> = docs.iter().filter(|d| d.collection == "wiki").collect();
+    if wiki_docs.is_empty() {
+        eprintln!("Error: {page_ref} resolves to a source document, not a wiki page");
+        std::process::exit(1);
+    }
+    if wiki_docs.len() > 1 {
+        eprintln!(
+            "Error: {page_ref} is ambiguous, matches {} documents",
+            wiki_docs.len()
+        );
+        std::process::exit(1);
+    }
+    let doc = wiki_docs[0];
+    let path = std::path::PathBuf::from(&doc.path);
+
+    // 2. Path traversal guard.
+    let full_path = root.join(&path);
+    let canonical = full_path.canonicalize().unwrap_or(full_path.clone());
+    {
+        let wiki_base = root.join("wiki");
+        let canonical_wiki = wiki_base.canonicalize().unwrap_or(wiki_base);
+        if !canonical.starts_with(&canonical_wiki) {
+            eprintln!("Error: path traversal rejected: {}", path.display());
+            return Ok(());
+        }
+    }
+
+    // 3. Derive stem.
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let docid = doc.docid.clone();
+    let title = doc.title.clone();
+
+    // 4. Confirm if TTY and --force not set. Agents (not a TTY) skip automatically.
+    if !force {
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        if is_tty {
+            eprint!("Delete {stem} \"{title}\"? [y/N] ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).ok();
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                eprintln!("Aborted.");
+                return Ok(());
+            }
+        }
+    }
+
+    // 5. Find pages with incoming links to this page (will become dangling).
+    let wiki_dir = memex.wiki_dir();
+    let mut dangling_pages: Vec<String> = Vec::new();
+    if wiki_dir.is_dir() {
+        for entry in std::fs::read_dir(&wiki_dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let other_stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if other_stem == stem {
+                continue;
+            }
+            let other_content = std::fs::read_to_string(&p).unwrap_or_default();
+            let links = memex_core::validate::extract_wiki_links(&other_content);
+            if links.iter().any(|l| l == &stem) {
+                dangling_pages.push(other_stem);
+            }
+        }
+    }
+
+    // 6. Delete file from disk.
+    std::fs::remove_file(&full_path)?;
+
+    // 7. Delete documents row with orphan cleanup (FTS trigger fires).
+    let path_str = path.to_string_lossy().to_string();
+    search.delete_document_with_cleanup(&path_str)?;
+
+    // 8. Output.
+    let wiki_count = search.wiki_page_count()?;
+    println!("deleted: {docid}");
+    println!("wiki_pages: {wiki_count}");
+    if !dangling_pages.is_empty() {
+        println!("dangling: {}", dangling_pages.join(", "));
+    }
+
+    Ok(())
+}
+
+fn run_lint(fix: bool) -> anyhow::Result<()> {
+    let root = memex_cli::memex_root();
+    let memex = Memex::open(root)?;
+    let report = memex.lint()?;
+
+    if report.issues.is_empty() && !fix {
+        println!("No issues found.");
+        return Ok(());
+    }
+
+    // If --fix, attempt to fix stale-index and outdated-embedding issues first,
+    // then report remaining.
+    let mut remaining_issues = Vec::new();
+    let mut fixed_count = 0;
+
+    for issue in &report.issues {
+        if fix && issue.kind == LintIssueKind::StaleIndex {
+            // Fix stale index: re-read file from disk, update content + documents row.
+            let search = memex.search();
+            let full_path = memex.root().join(&issue.target);
+            let rel_path = &issue.target;
+            match std::fs::read_to_string(&full_path) {
+                Ok(content) => {
+                    // Get old hash for orphan cleanup.
+                    let old_hash = search
+                        .get_document_hash(rel_path)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    match search.reindex_page_from_content(rel_path, &content, &old_hash) {
+                        Ok(()) => {
+                            // Re-embed after reindex so the page retains vector coverage.
+                            // Orphan cleanup deletes old chunks; we need fresh ones.
+                            let new_hash = search
+                                .get_document_hash(rel_path)
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
+                            let body = memex_core::validate::parse_frontmatter(&content)
+                                .map(|(_, b)| b)
+                                .unwrap_or_else(|_| content.clone());
+                            embed_document(search, &new_hash, &body);
+                            println!("fixed: {} (reindexed from disk)", issue.page);
+                            fixed_count += 1;
+                            continue;
                         }
                         Err(e) => {
-                            eprintln!("Error ingesting '{}': {}", source_str, e);
-                        }
-                    }
-                }
-            }
-        }
-
-        Commands::Query { question } => {
-            let root = memex_root();
-            let _ = std::env::set_current_dir(&root);
-
-            if let Some(question) = question {
-                // Single-shot mode: query and exit
-                let cfg = config_file::load_memex_config(&root)?;
-                let model_ref = cfg.resolve_model(OperationKind::Query);
-                let memex = memex_core::Memex::open(
-                    root.clone(),
-                    create_llm_provider(&root, &model_ref)?,
-                    &model_ref.model,
-                )
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-                eprintln!("Querying: {question}");
-                match memex.query(&question).await {
-                    Ok(result) => {
-                        println!("{}", result.answer);
-                        if !result.citations.is_empty() {
-                            println!("\nCitations:");
-                            for citation in &result.citations {
-                                println!("  - {} ({})", citation.title, citation.page.display());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Query error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                // Interactive agent mode
-                if !atty::is(atty::Stream::Stdin) {
-                    eprintln!("Interactive query mode requires a terminal.");
-                    eprintln!("Provide a question argument for non-interactive use.");
-                    std::process::exit(1);
-                }
-
-                let cfg = config_file::load_memex_config(&root)?;
-                let model_ref = cfg.resolve_model(OperationKind::Query);
-                let memex = std::sync::Arc::new(
-                    memex_core::Memex::open(
-                        root.clone(),
-                        create_llm_provider(&root, &model_ref)?,
-                        &model_ref.model,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{}", e))?,
-                );
-                let threshold = memex_agent::config::parse_small_memex_threshold(&cfg.raw_content);
-
-                let mut agent = memex_agent::copilot::build_copilot_agent(
-                    memex,
-                    create_provider(&root, &model_ref)?,
-                    &model_ref.model,
-                    threshold,
-                )?;
-
-                eprintln!("Memex query agent (type 'quit' to exit)\n");
-                eprint!("Query> ");
-                let mut first_input = String::new();
-                if std::io::stdin().read_line(&mut first_input).is_err()
-                    || first_input.trim().is_empty()
-                {
-                    return Ok(());
-                }
-                let prompt = memex_agent::copilot::format_copilot_prompt(
-                    memex_agent::copilot::CopilotMode::Query,
-                    first_input.trim(),
-                );
-                match agent.turn(&prompt).await {
-                    Ok(reply) => {
-                        println!("{reply}");
-                        interactive_loop(&mut agent, "Query> ").await;
-                    }
-                    Err(e) => eprintln!("Agent error: {e}"),
-                }
-            }
-        }
-
-        Commands::Lint { fix } => {
-            let root = memex_root();
-            let _ = std::env::set_current_dir(&root);
-            let cfg = config_file::load_memex_config(&root)?;
-            let model_ref = cfg.resolve_model(OperationKind::Lint);
-            let memex = memex_core::Memex::open(
-                root.clone(),
-                create_llm_provider(&root, &model_ref)?,
-                &model_ref.model,
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-            eprintln!("Running wiki health checks...");
-            match memex.lint().await {
-                Ok(report) => {
-                    if report.issues.is_empty() {
-                        println!("No issues found.");
-                    } else {
-                        let fixable: Vec<_> = report
-                            .issues
-                            .iter()
-                            .filter(|i| i.proposed_fix.is_some())
-                            .collect();
-                        println!(
-                            "{} issue(s) found ({} fixable):",
-                            report.issues.len(),
-                            fixable.len()
-                        );
-                        for issue in &report.issues {
-                            println!("  [{:?}] {}", issue.kind, issue.description);
-                            if let Some(ref f) = issue.proposed_fix {
-                                println!("    Fix: {}", f.description);
-                            }
-                        }
-
-                        if fix && !fixable.is_empty() {
-                            eprintln!("\nApplying {} fix(es)...", fixable.len());
-                            let mut applied = 0;
-                            for issue in &fixable {
-                                if let Some(ref f) = issue.proposed_fix {
-                                    match memex.apply_fix(f).await {
-                                        Ok(()) => applied += 1,
-                                        Err(e) => eprintln!("  Fix failed: {e}"),
-                                    }
-                                }
-                            }
-                            eprintln!("{applied} fix(es) applied.");
-                        } else if !fixable.is_empty() && !fix {
-                            eprintln!(
-                                "\nRun with --fix to apply {} fixable issue(s).",
-                                fixable.len()
-                            );
-                        }
-                    }
-                    if !report.suggested_questions.is_empty() {
-                        println!("\nSuggested questions:");
-                        for q in &report.suggested_questions {
-                            println!("  - {q}");
-                        }
-                    }
-                    if !report.suggested_sources.is_empty() {
-                        println!("\nSuggested sources:");
-                        for s in &report.suggested_sources {
-                            println!("  - {s}");
+                            eprintln!("Error fixing {}: {e}", issue.page);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Lint error: {e}");
-                    std::process::exit(1);
+                    eprintln!("Error reading {}: {e}", issue.target);
                 }
             }
         }
+        remaining_issues.push(issue);
+    }
 
-        Commands::Wiki { sub } => {
-            let root = memex_root();
-            match sub {
-                WikiSub::Reindex => {
-                    let cfg = config_file::load_memex_config(&root)?;
-                    let model_ref = cfg.resolve_model(OperationKind::Global);
-                    let memex = memex_core::Memex::open(
-                        root.clone(),
-                        create_llm_provider(&root, &model_ref)?,
-                        &model_ref.model,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    memex.reindex().map_err(|e| anyhow::anyhow!("{}", e))?;
-                    println!("Index rebuilt.");
-                }
-                WikiSub::Show => {
-                    let index_path = root.join("index.md");
-                    if index_path.exists() {
-                        println!("{}", std::fs::read_to_string(&index_path)?);
-                    } else {
-                        println!("No index found. Run `memex init` first.");
-                    }
-                }
-                WikiSub::Log => {
-                    let log_path = root.join("log.md");
-                    if log_path.exists() {
-                        let content = std::fs::read_to_string(&log_path)?;
-                        let lines: Vec<&str> = content.lines().collect();
-                        let start = lines.len().saturating_sub(20);
-                        for line in &lines[start..] {
-                            println!("{line}");
-                        }
-                    } else {
-                        println!("No log found.");
-                    }
-                }
-                WikiSub::Stats => {
-                    let wiki_dir = root.join("wiki");
-                    let sources_dir = root.join("sources");
-                    let page_count = if wiki_dir.exists() {
-                        std::fs::read_dir(&wiki_dir)?
-                            .filter_map(|e| e.ok())
-                            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-                            .count()
-                    } else {
-                        0
-                    };
-                    let source_count = if sources_dir.exists() {
-                        // Count non-meta files across all source subdirectories
-                        let mut count = 0;
-                        for sub_entry in std::fs::read_dir(&sources_dir)?
-                            .filter_map(|e| e.ok())
-                            .filter(|e| e.path().is_dir())
-                        {
-                            fn count_files(dir: &std::path::Path) -> usize {
-                                std::fs::read_dir(dir)
-                                    .ok()
-                                    .map(|entries| {
-                                        entries
-                                            .filter_map(|e| e.ok())
-                                            .map(|e| {
-                                                if e.path().is_dir() {
-                                                    count_files(&e.path())
-                                                } else if !e
-                                                    .file_name()
-                                                    .to_string_lossy()
-                                                    .ends_with(".meta.json")
-                                                {
-                                                    1
-                                                } else {
-                                                    0
-                                                }
-                                            })
-                                            .sum()
-                                    })
-                                    .unwrap_or(0)
-                            }
-                            count += count_files(&sub_entry.path());
-                        }
-                        count
-                    } else {
-                        0
-                    };
-                    println!("Memex Stats");
-                    println!("  Root:    {}", root.display());
-                    println!("  Pages:   {page_count}");
-                    println!("  Sources: {source_count}");
-                }
-                WikiSub::Search { query, top_k } => {
-                    use memex_core::search::WikiSearch;
-
-                    let db_path = root.join(memex_core::SEARCH_DB_NAME);
-                    let search = memex_core::search::Bm25Search::open(&db_path)
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
-                    let results = search
-                        .search(&query, top_k, None)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-                    if results.is_empty() {
-                        println!("No results.");
-                    } else {
-                        for r in &results {
-                            println!("{:.3}  {}  {}", r.score, r.path.display(), r.title);
-                        }
-                    }
-                }
-            }
-        }
-
-        Commands::Doctor => {
-            let root = memex_root();
-            match auth::auth_summary_line(&root).await {
-                Ok(summary) => println!("Memex auth: {summary}"),
-                Err(err) => println!("Memex auth: error — {err}"),
-            }
-
-            let providers = auto_detect::detect_providers();
-            if providers.is_empty() {
-                println!("No providers detected.");
-                println!("Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY.");
-            } else {
-                println!("Detected providers:");
-                for p in &providers {
-                    print!("  {} ({}): ", p.provider, p.env_var);
-                    match zeroclaw::providers::create_provider_with_options(
-                        &p.frontier_model.provider,
-                        None,
-                        &runtime_options(&root),
-                    ) {
-                        Ok(_) => println!("ok"),
-                        Err(e) => println!("error — {e}"),
-                    }
-                }
-            }
-        }
-
-        Commands::Config { sub } => match sub {
-            ConfigSub::Show => {
-                let root = memex_root();
-                let config_path = root.join("config.toml");
-                if config_path.exists() {
-                    println!("{}", std::fs::read_to_string(&config_path)?);
-                } else {
-                    println!("No config found. Run `memex init` first.");
-                }
-            }
-            ConfigSub::Set { key, value } => {
-                println!("(stub) Would set {key} = {value}");
-                println!("Config set is not yet implemented.");
-            }
-        },
-
-        Commands::Brainstorm { sub } => match sub {
-            BrainstormSub::New { task, task_type } => {
-                let root = memex_root();
-                let _ = std::env::set_current_dir(&root);
-
-                let cfg = config_file::load_memex_config(&root)?;
-                let model_ref = cfg.resolve_model(OperationKind::Global);
-                let memex = std::sync::Arc::new(
-                    memex_core::Memex::open(
-                        root.clone(),
-                        create_llm_provider(&root, &model_ref)?,
-                        &model_ref.model,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{}", e))?,
-                );
-
-                let brainstorm_config =
-                    memex_agent::config::parse_brainstorm_config(&cfg.raw_content);
-
-                // Build orchestrator provider wrapped with cost tracking
-                let cost_stats = std::sync::Arc::new(memex_agent::cost::CostStats::default());
-                let orch_ref =
-                    memex_agent::builder::ModelRef::parse(&brainstorm_config.orchestrator);
-                let raw_provider = zeroclaw::providers::create_provider_with_options(
-                    &orch_ref.provider,
-                    None,
-                    &runtime_options(&root),
-                )
-                .unwrap_or_else(|_| Box::new(memex_agent::dry_run::DryRunProvider));
-                let orchestrator_provider: Box<dyn zeroclaw::providers::Provider> =
-                    Box::new(memex_agent::cost::CostTrackingProvider::new(
-                        raw_provider,
-                        std::sync::Arc::clone(&cost_stats),
-                    ));
-
-                // Build agent with progress reporting
-                let mut agent = memex_agent::builder::MemexAgentBuilder::new(
-                    memex.clone(),
-                    brainstorm_config,
-                    orchestrator_provider,
-                )
-                .provider_runtime_options(runtime_options(&root))
-                .progress(true)
-                .build()?;
-
-                // Build task string with preset context if --type provided
-                let build_task_with_preset = |task_str: &str| -> String {
-                    if let Some(ref tt) = task_type
-                        && let Some(preset) = memex_agent::preset::get_preset(tt)
-                    {
-                        let ctx = memex_agent::preset::format_preset_context(&preset);
-                        return format!("{ctx}\n\n{task_str}");
-                    }
-                    task_str.to_string()
-                };
-
-                if let Some(task) = task {
-                    // Single-shot: run to completion and exit
-                    let (session_id, session_dir) =
-                        memex_agent::session::create_session(&root, &task)?;
-                    eprintln!("Starting brainstorm session: {session_id}");
-
-                    let task_with_preset = build_task_with_preset(&task);
-                    let prompt = memex_agent::copilot::format_copilot_prompt(
-                        memex_agent::copilot::CopilotMode::Brainstorm,
-                        &task_with_preset,
-                    );
-                    match agent.turn(&prompt).await {
-                        Ok(response) => {
-                            println!("{response}\n");
-                            memex_agent::session::complete_session(&session_dir, &response)?;
-                            eprintln!("Session saved to: {}", session_dir.display());
-                        }
-                        Err(e) => {
-                            eprintln!("Agent error: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                } else {
-                    // Interactive agent mode
-                    if !atty::is(atty::Stream::Stdin) {
-                        eprintln!("Interactive brainstorm mode requires a terminal.");
-                        eprintln!("Provide a task argument for non-interactive use.");
-                        std::process::exit(1);
-                    }
-
-                    eprintln!("Memex brainstorm agent (type 'quit' to exit)\n");
-                    eprint!("What would you like to brainstorm? ");
-                    let mut task_input = String::new();
-                    if std::io::stdin().read_line(&mut task_input).is_err()
-                        || task_input.trim().is_empty()
-                    {
-                        return Ok(());
-                    }
-                    let task_str = task_input.trim();
-
-                    let (session_id, session_dir) =
-                        memex_agent::session::create_session(&root, task_str)?;
-                    eprintln!("Starting brainstorm session: {session_id}");
-
-                    let task_with_preset = build_task_with_preset(task_str);
-                    let prompt = memex_agent::copilot::format_copilot_prompt(
-                        memex_agent::copilot::CopilotMode::Brainstorm,
-                        &task_with_preset,
-                    );
-                    match agent.turn(&prompt).await {
-                        Ok(response) => {
-                            println!("{response}\n");
-                            let last_response =
-                                interactive_loop(&mut agent, "> ").await.unwrap_or(response);
-                            memex_agent::session::complete_session(&session_dir, &last_response)?;
-                            eprintln!("Session saved to: {}", session_dir.display());
-                        }
-                        Err(e) => {
-                            eprintln!("Agent error: {e}");
-                            std::process::exit(1);
-                        }
-                    }
-                }
-                // Print cost summary
+    // If --fix, re-embed all chunks with outdated model — but only if the
+    // real ONNX model is available.  Without it, embed_document falls back to
+    // hash-embedding which would write the same "hash-embedding" model name,
+    // creating an infinite re-embed loop on every lint --fix.
+    if fix {
+        let onnx_available = onnx_model_available();
+        let search = memex.search();
+        let outdated_hashes =
+            search.outdated_chunk_hashes(memex_core::embed::CURRENT_MODEL_NAME)?;
+        if !outdated_hashes.is_empty() {
+            if !onnx_available {
                 eprintln!(
-                    "Session cost: {}",
-                    memex_agent::cost::format_cost_summary(&cost_stats)
+                    "note: {} documents have hash-based embeddings; \
+                     install the ONNX model to upgrade them",
+                    outdated_hashes.len()
                 );
-            }
-            BrainstormSub::Resume { session_id } => {
-                println!(
-                    "(stub) Resume session: {}",
-                    session_id.as_deref().unwrap_or("<latest>")
-                );
-                println!("Full resume support coming in Plan 2.");
-            }
-            BrainstormSub::List => {
-                let root = memex_root();
-                let sessions = memex_agent::session::list_sessions(&root);
-                if sessions.is_empty() {
-                    println!("No brainstorm sessions found.");
-                } else {
-                    for (id, meta) in &sessions {
-                        let status = meta
-                            .get("status")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let task_desc = meta.get("task").and_then(|v| v.as_str()).unwrap_or("");
-                        println!("{id}  [{status}]  {task_desc}");
-                    }
+            } else {
+                let mut re_embedded = 0usize;
+                for hash in &outdated_hashes {
+                    let full_content = match search.get_content(hash) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            eprintln!("Error reading content for hash {hash}: {e}");
+                            continue;
+                        }
+                    };
+                    let body = memex_core::validate::parse_frontmatter(&full_content)
+                        .map(|(_, b)| b)
+                        .unwrap_or(full_content);
+                    embed_document(search, hash, &body);
+                    re_embedded += 1;
+                }
+                if re_embedded > 0 {
+                    println!("re-embedded: {re_embedded} documents (model upgrade)");
+                    fixed_count += re_embedded;
+                    // Remove OutdatedEmbedding issues since they've been fixed.
+                    remaining_issues.retain(|i| i.kind != LintIssueKind::OutdatedEmbedding);
                 }
             }
-            BrainstormSub::Show { session_id } => {
-                let root = memex_root();
-                let session_dir = root.join("sources/brainstorms").join(&session_id);
-                let output_path = session_dir.join("final-output.md");
-                if output_path.exists() {
-                    println!("{}", std::fs::read_to_string(&output_path)?);
-                } else {
-                    eprintln!("Session {session_id} not found or has no output.");
-                }
-            }
-            BrainstormSub::Export { session_id, output } => {
+        }
+    }
+
+    if remaining_issues.is_empty() && fixed_count > 0 {
+        return Ok(());
+    }
+
+    if remaining_issues.is_empty() {
+        println!("No issues found.");
+        return Ok(());
+    }
+
+    for issue in &remaining_issues {
+        match issue.kind {
+            LintIssueKind::StaleIndex => {
                 println!(
-                    "(stub) Export session {} to {}",
-                    session_id,
-                    output.as_deref().unwrap_or("stdout")
+                    "stale-index: {} (file modified, index outdated)",
+                    issue.page
                 );
-                println!("Full export coming in Plan 2.");
             }
-        },
+            LintIssueKind::DanglingLink => {
+                println!("dangling: {} -> [[{}]]", issue.page, issue.target);
+            }
+            LintIssueKind::MissingLink => {
+                println!("missing-link: {} -> [[{}]]", issue.page, issue.target);
+            }
+            LintIssueKind::UntrackedFile => {
+                println!("untracked: {} (no DB row)", issue.target);
+            }
+            LintIssueKind::MissingFile => {
+                println!("missing-file: {} (DB row, no file)", issue.page);
+            }
+            LintIssueKind::OutdatedEmbedding => {
+                println!("outdated-embeddings: {} ({})", issue.page, issue.target);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Try to initialize the ONNX Runtime from known install locations.
+///
+/// With `load-dynamic`, `ort` needs to be pointed at the dylib before any
+/// session is created. We check `~/.memex/lib/` (our postinstall download)
+/// and common system paths. If none is found, ort falls back to its own
+/// search (ORT_DYLIB_PATH env, system library path) which may also fail —
+/// embed_document and embed_query handle that gracefully via catch_unwind.
+fn init_ort_runtime() {
+    let lib_name = if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".memex/lib").join(lib_name));
+    }
+    if cfg!(target_os = "macos") {
+        candidates.push(std::path::PathBuf::from("/opt/homebrew/lib").join(lib_name));
+        candidates.push(std::path::PathBuf::from("/usr/local/lib").join(lib_name));
+    } else if cfg!(target_os = "linux") {
+        candidates.push(std::path::PathBuf::from("/usr/lib").join(lib_name));
+        candidates.push(std::path::PathBuf::from("/usr/lib/x86_64-linux-gnu").join(lib_name));
+    } else if cfg!(target_os = "windows") {
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            candidates.push(
+                std::path::PathBuf::from(pf)
+                    .join("onnxruntime/lib")
+                    .join(lib_name),
+            );
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            candidates.push(
+                std::path::PathBuf::from(local)
+                    .join("onnxruntime/lib")
+                    .join(lib_name),
+            );
+        }
+    }
+
+    for path in &candidates {
+        if path.exists() {
+            let _ = catch_unwind_silent(|| memex_core::embed::init_runtime(path));
+            return;
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Search {
+            query,
+            lex,
+            vec,
+            hyde,
+            expand,
+        } => {
+            init_ort_runtime();
+            run_search(&query, &lex, &vec, &hyde, &expand)?;
+        }
+        Commands::Read { refs } => run_read(&refs)?,
+        Commands::Write {
+            name,
+            force,
+            quiet,
+            sources,
+        } => {
+            init_ort_runtime();
+            run_write(&name, force, quiet, &sources)?;
+        }
+        Commands::Delete { page_ref, force } => run_delete(&page_ref, force)?,
+        Commands::Lint { fix } => {
+            if fix {
+                init_ort_runtime();
+            }
+            run_lint(fix)?;
+        }
     }
 
     Ok(())

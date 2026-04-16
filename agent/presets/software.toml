@@ -1,3 +1,0 @@
-name = "software"
-dimensions = ["Feasibility", "Scalability", "Maintainability", "Security"]
-sections = ["Problem", "Architecture", "API", "Data Model", "Error Handling", "Testing"]

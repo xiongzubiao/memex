@@ -1,373 +1,489 @@
+use crate::Memex;
+use crate::embed::CURRENT_MODEL_NAME;
 use crate::error::Result;
-use crate::types::{LintIssue, LintIssueKind, LintReport, ProposedFix, WikiOperation};
-use crate::{Memex, log, validate};
-use std::path::PathBuf;
-use tracing::info;
+use crate::types::{LintIssue, LintIssueKind, LintReport};
+use crate::validate;
 
 impl Memex {
-    pub async fn lint(&self) -> Result<LintReport> {
-        let index_content = self.read_index().unwrap_or_default();
+    /// Run deterministic lint checks on the wiki.
+    ///
+    /// Checks performed:
+    /// - Stale index: wiki file on disk has different hash than documents.hash
+    /// - Untracked file: .md file in wiki/ directory with no matching documents row
+    /// - Missing file: wiki documents row with no .md file on disk
+    /// - Dangling wiki links: `[[page-stem]]` references to pages that don't exist
+    /// - Missing cross-references: body mentions an existing page title/stem without `[[link]]`
+    pub fn lint(&self) -> Result<LintReport> {
         let wiki_dir = self.wiki_dir();
+        let mut issues = Vec::new();
 
-        // Empty wiki: nothing to lint
-        if !wiki_dir.exists() || crate::index::is_empty_index(&index_content) {
-            return Ok(LintReport {
-                issues: vec![],
-                suggested_questions: vec![
-                    "Nothing to lint. Try ingesting some sources first.".to_string(),
-                ],
-                suggested_sources: vec![],
+        // Collect DB state: all wiki documents.
+        let db_docs = self.search.all_wiki_documents()?;
+        let db_paths: std::collections::HashSet<String> =
+            db_docs.iter().map(|d| d.path.clone()).collect();
+
+        // Collect disk state: all .md files in wiki/.
+        let mut disk_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if wiki_dir.exists() {
+            for entry in std::fs::read_dir(&wiki_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "md") {
+                    let rel = format!(
+                        "wiki/{}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    disk_files.insert(rel);
+                }
+            }
+        }
+
+        // Check: Stale index — file hash differs from documents.hash.
+        for doc in &db_docs {
+            let full_path = self.root.join(&doc.path);
+            if full_path.exists()
+                && let Ok(disk_hash) = crate::storage::file_hash(&full_path)
+                && disk_hash != doc.hash
+            {
+                let stem = std::path::Path::new(&doc.path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                issues.push(LintIssue {
+                    kind: LintIssueKind::StaleIndex,
+                    page: stem,
+                    target: doc.path.clone(),
+                });
+            }
+        }
+
+        // Check: Untracked file — on disk but no DB row.
+        for rel in &disk_files {
+            if !db_paths.contains(rel) {
+                issues.push(LintIssue {
+                    kind: LintIssueKind::UntrackedFile,
+                    page: String::new(),
+                    target: rel.clone(),
+                });
+            }
+        }
+
+        // Check: Missing file — DB row but no file on disk.
+        for doc in &db_docs {
+            if !disk_files.contains(&doc.path) {
+                let stem = std::path::Path::new(&doc.path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                issues.push(LintIssue {
+                    kind: LintIssueKind::MissingFile,
+                    page: stem,
+                    target: doc.path.clone(),
+                });
+            }
+        }
+
+        // Check: Outdated embeddings — chunks with a model name that differs
+        // from the current model constant.
+        let outdated_models = self.search.outdated_chunk_models(CURRENT_MODEL_NAME)?;
+        for (old_model, count) in &outdated_models {
+            issues.push(LintIssue {
+                kind: LintIssueKind::OutdatedEmbedding,
+                page: format!("{count} chunks"),
+                target: format!("model: {old_model}, current: {CURRENT_MODEL_NAME}"),
             });
         }
 
-        // Collect all wiki page paths and contents
-        let mut pages: Vec<(PathBuf, String)> = Vec::new();
+        // Parse all pages ONCE for link checks: (stem, title, body, title_lower)
+        if !wiki_dir.exists() {
+            return Ok(LintReport { issues });
+        }
+
+        let mut pages: Vec<(String, String, String, String)> = Vec::new();
         for entry in std::fs::read_dir(&wiki_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "md")
                 && let Ok(content) = std::fs::read_to_string(&path)
             {
-                let rel = format!("wiki/{}", path.file_name().unwrap().to_string_lossy());
-                pages.push((PathBuf::from(rel), content));
-            }
-        }
-
-        let mut issues = Vec::new();
-
-        // Deterministic: dangling wiki links
-        for (rel_path, content) in &pages {
-            let dangling = validate::find_dangling_links(content, &wiki_dir);
-            let now = chrono::Utc::now();
-            let ts = now.format("%Y-%m-%dT%H:%M:%SZ");
-            for link in dangling {
-                issues.push(LintIssue {
-                    kind: LintIssueKind::MissingLink,
-                    description: format!(
-                        "{} links to [[{}]] which doesn't exist",
-                        rel_path.display(),
-                        link
-                    ),
-                    affected_pages: vec![rel_path.clone()],
-                    proposed_fix: Some(ProposedFix {
-                        description: format!("Create stub page for {link}"),
-                        operations: vec![WikiOperation::CreatePage {
-                            path: PathBuf::from(format!("wiki/{link}.md")),
-                            content: format!(
-                                "---\ntitle: {}\ntags:\n  - entity\ncreated: {ts}\nlast_updated: {ts}\nsources: []\n---\n\nStub page. Needs content.\n",
-                                link.replace('-', " "),
-                            ),
-                        }],
-                    }),
-                });
-            }
-        }
-
-        // Deterministic: orphan pages (no incoming cross-refs, only when >1 pages)
-        if pages.len() > 1 {
-            // Build set of all referenced page names in a single pass (O(N*M) total)
-            let all_referenced: std::collections::HashSet<String> = pages
-                .iter()
-                .flat_map(|(_, content)| validate::extract_wiki_links(content))
-                .collect();
-            for (path, _) in &pages {
-                let page_name = path
+                let stem = path
                     .file_stem()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_string();
-                if !all_referenced.contains(&page_name) {
+                if let Ok((fm, body)) = validate::parse_frontmatter(&content) {
+                    let title_lower = fm.title.to_lowercase();
+                    pages.push((stem, fm.title, body, title_lower));
+                }
+            }
+        }
+
+        let stems: std::collections::HashSet<&str> =
+            pages.iter().map(|(s, _, _, _)| s.as_str()).collect();
+
+        for (stem, _title, body, _title_lower) in &pages {
+            // Check: Dangling wiki links — use stems set, not filesystem
+            let links = validate::extract_wiki_links(body);
+            for link in &links {
+                if !stems.contains(link.as_str()) {
                     issues.push(LintIssue {
-                        kind: LintIssueKind::Orphan,
-                        description: format!("{} has no incoming cross-references", path.display()),
-                        affected_pages: vec![path.clone()],
-                        proposed_fix: None,
+                        kind: LintIssueKind::DanglingLink,
+                        page: stem.clone(),
+                        target: link.clone(),
+                    });
+                }
+            }
+
+            // Check: Missing cross-references — word-boundary matching
+            for (other_stem, _other_title, _, other_title_lower) in &pages {
+                if other_stem == stem {
+                    continue;
+                }
+                if links.iter().any(|l| l == other_stem) {
+                    continue;
+                }
+                let stem_words = other_stem.replace('-', " ").to_lowercase();
+
+                // Use word boundaries to avoid false positives where short stems
+                // match inside longer words (e.g. "go" in "algorithm").
+                let stem_pattern = format!(r"\b{}\b", regex::escape(&stem_words));
+                let title_pattern = format!(r"\b{}\b", regex::escape(other_title_lower));
+
+                let stem_match = regex::RegexBuilder::new(&stem_pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .is_ok_and(|re| re.is_match(body));
+                let title_match = regex::RegexBuilder::new(&title_pattern)
+                    .case_insensitive(true)
+                    .build()
+                    .is_ok_and(|re| re.is_match(body));
+
+                if stem_match || title_match {
+                    issues.push(LintIssue {
+                        kind: LintIssueKind::MissingLink,
+                        page: stem.clone(),
+                        target: other_stem.clone(),
                     });
                 }
             }
         }
 
-        // LLM-powered checks + suggestions (batched by token budget)
-        let mut suggested_questions = Vec::new();
-        let mut suggested_sources = Vec::new();
-
-        let system_prompt_tokens = 200; // ~800 chars of system + format instructions
-        let index_tokens = self.index_token_count().unwrap_or(0);
-        let budget_bytes = crate::ingest::compute_batch_budget_bytes(
-            self.model(),
-            system_prompt_tokens,
-            index_tokens,
-        );
-
-        // Pack pages into batches that fit the context budget
-        let mut batches: Vec<String> = Vec::new();
-        let mut current_batch = String::new();
-        for (rel_path, content) in &pages {
-            let entry = format!("### {}\n{}\n\n", rel_path.display(), content);
-            if !current_batch.is_empty() && current_batch.len() + entry.len() > budget_bytes {
-                batches.push(std::mem::take(&mut current_batch));
-            }
-            current_batch.push_str(&entry);
-        }
-        if !current_batch.is_empty() {
-            batches.push(current_batch);
-        }
-
-        let batch_count = batches.len();
-        for (i, batch_content) in batches.iter().enumerate() {
-            self.report_progress(&format!("Linting batch {}/{batch_count}...", i + 1));
-            let lint_prompt = format!(
-                "You are auditing a wiki. Check for:\n1. Contradictions between pages\n2. Duplicate coverage\n3. Stale or incomplete pages\n\nThen suggest:\n- Questions the wiki cannot answer well\n- Sources to look for\n\nWiki pages:\n{batch_content}\n\nRespond in this format:\nISSUES:\n- [contradiction|duplicate|stale|incomplete] description\n\nSUGGESTED_QUESTIONS:\n- question\n\nSUGGESTED_SOURCES:\n- source"
-            );
-
-            if let Ok(llm_result) = self
-                .provider
-                .chat(
-                    Some("You are a wiki auditor."),
-                    &lint_prompt,
-                    self.model(),
-                    0.3,
-                )
-                .await
-            {
-                parse_lint_response(
-                    &llm_result,
-                    &mut issues,
-                    &mut suggested_questions,
-                    &mut suggested_sources,
-                );
-            }
-        }
-
-        // Cross-batch check: if multiple batches, send page summaries + per-batch
-        // findings to the LLM to catch contradictions across batches.
-        if batch_count > 1 {
-            self.report_progress("Cross-checking findings across batches...");
-            let mut summary = String::new();
-            for (rel_path, content) in &pages {
-                let page_summary = crate::index::extract_summary(content, 200);
-                summary.push_str(&format!("- {} -- {}\n", rel_path.display(), page_summary));
-            }
-
-            let batch_findings: String = issues
-                .iter()
-                .filter(|i| {
-                    matches!(
-                        i.kind,
-                        LintIssueKind::Contradiction
-                            | LintIssueKind::DuplicateCoverage
-                            | LintIssueKind::Stale
-                            | LintIssueKind::IncompletePage
-                    )
-                })
-                .map(|i| format!("- [{:?}] {}\n", i.kind, i.description))
-                .collect();
-
-            let cross_prompt = format!(
-                "A wiki was audited in {batch_count} batches. Below are all page titles and the issues found per batch.\n\n\
-                 Page index:\n{summary}\n\
-                 Issues found so far:\n{batch_findings}\n\
-                 Check for contradictions or duplicate coverage ACROSS pages that were in different batches. \
-                 Only report NEW issues not already listed above.\n\n\
-                 Respond in this format:\nISSUES:\n- [contradiction|duplicate] description\n\nSUGGESTED_QUESTIONS:\n- question"
-            );
-
-            if let Ok(cross_result) = self
-                .provider
-                .chat(
-                    Some("You are a wiki auditor doing a cross-batch review."),
-                    &cross_prompt,
-                    self.model(),
-                    0.3,
-                )
-                .await
-            {
-                let mut extra_questions = Vec::new();
-                let mut extra_sources = Vec::new();
-                parse_lint_response(
-                    &cross_result,
-                    &mut issues,
-                    &mut extra_questions,
-                    &mut extra_sources,
-                );
-                suggested_questions.extend(extra_questions);
-                suggested_sources.extend(extra_sources);
-            }
-        }
-
-        let fixable_count = issues.iter().filter(|i| i.proposed_fix.is_some()).count();
-        log::append_log(
-            self.root(),
-            "lint",
-            &format!("{} issues", issues.len()),
-            &format!("{fixable_count} fixable"),
-        )?;
-        Ok(LintReport {
-            issues,
-            suggested_questions,
-            suggested_sources,
-        })
-    }
-
-    /// Apply a proposed fix from lint (create/update/delete pages).
-    pub async fn apply_fix(&self, fix: &crate::types::ProposedFix) -> crate::error::Result<()> {
-        let lock_file = crate::storage::try_acquire_lock_async(&self.lock_path(), 30)
-            .await
-            .map_err(|_| crate::error::MemexError::StaleLock {
-                lock_path: self.lock_path(),
-            })?;
-
-        let wiki_dir = self.wiki_dir();
-        for op in &fix.operations {
-            let op_path = match op {
-                crate::types::WikiOperation::CreatePage { path, .. }
-                | crate::types::WikiOperation::UpdatePage { path, .. }
-                | crate::types::WikiOperation::DeletePage { path } => path,
-            };
-            // Path traversal guard: ensure operation stays inside wiki/
-            let normalized =
-                crate::storage::normalize_path(self.root(), &op_path.to_string_lossy());
-            if !normalized.starts_with(&wiki_dir) {
-                tracing::warn!(
-                    path = %op_path.display(),
-                    "apply_fix: path traversal rejected"
-                );
-                continue;
-            }
-            match op {
-                crate::types::WikiOperation::CreatePage { content, .. } => {
-                    let abs_path = self.root().join(op_path);
-                    if let Some(parent) = abs_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    crate::storage::atomic_write(&abs_path, content.as_bytes())?;
-                    info!(path = %op_path.display(), "created page via lint fix");
-                }
-                crate::types::WikiOperation::UpdatePage { content, .. } => {
-                    let abs_path = self.root().join(op_path);
-                    crate::storage::atomic_write(&abs_path, content.as_bytes())?;
-                    info!(path = %op_path.display(), "updated page via lint fix");
-                }
-                crate::types::WikiOperation::DeletePage { .. } => {
-                    let abs_path = self.root().join(op_path);
-                    if abs_path.exists() {
-                        std::fs::remove_file(&abs_path)?;
-                        info!(path = %op_path.display(), "deleted page via lint fix");
-                    }
-                }
-            }
-        }
-
-        // Rebuild index after fixes
-        let index_content = crate::index::rebuild_index(self.root())?;
-        crate::storage::atomic_write(&self.root().join("index.md"), index_content.as_bytes())?;
-
-        crate::storage::release_lock(lock_file);
-
-        log::append_log(
-            self.root(),
-            "lint-fix",
-            &fix.description,
-            &format!("{} operations", fix.operations.len()),
-        )?;
-
-        Ok(())
-    }
-}
-
-fn parse_lint_response(
-    llm_result: &str,
-    issues: &mut Vec<LintIssue>,
-    suggested_questions: &mut Vec<String>,
-    suggested_sources: &mut Vec<String>,
-) {
-    #[derive(PartialEq)]
-    enum Section {
-        None,
-        Issues,
-        Questions,
-        Sources,
-    }
-    let mut section = Section::None;
-    for line in llm_result.lines() {
-        let line = line.trim();
-        if line.starts_with("ISSUES:") {
-            section = Section::Issues;
-            continue;
-        }
-        if line.starts_with("SUGGESTED_QUESTIONS:") {
-            section = Section::Questions;
-            continue;
-        }
-        if line.starts_with("SUGGESTED_SOURCES:") {
-            section = Section::Sources;
-            continue;
-        }
-
-        if let Some(item) = line.strip_prefix("- ") {
-            match section {
-                Section::Issues => {
-                    if let Some((kind_str, desc)) = item.split_once(']') {
-                        let kind_str = kind_str.trim_start_matches('[');
-                        let kind = match kind_str {
-                            "contradiction" => LintIssueKind::Contradiction,
-                            "duplicate" => LintIssueKind::DuplicateCoverage,
-                            "stale" => LintIssueKind::Stale,
-                            "incomplete" => LintIssueKind::IncompletePage,
-                            _ => continue,
-                        };
-                        issues.push(LintIssue {
-                            kind,
-                            description: desc.trim().to_string(),
-                            affected_pages: vec![],
-                            proposed_fix: None,
-                        });
-                    }
-                }
-                Section::Questions => suggested_questions.push(item.to_string()),
-                Section::Sources => suggested_sources.push(item.to_string()),
-                Section::None => {}
-            }
-        }
+        Ok(LintReport { issues })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn apply_fix_creates_page() {
-        let dir = tempfile::TempDir::new().unwrap();
+    /// Write a page to disk AND reindex so the DB is in sync.
+    fn write_and_index(root: &std::path::Path, filename: &str, content: &str) {
+        std::fs::write(root.join("wiki").join(filename), content).unwrap();
+    }
+
+    /// Open a memex, write files, and reindex to sync DB with disk.
+    fn open_and_reindex(root: &std::path::Path) -> crate::Memex {
+        let memex = crate::Memex::open(root.to_path_buf()).unwrap();
+        memex.reindex().unwrap();
+        memex
+    }
+
+    #[test]
+    fn lint_detects_dangling_link() {
+        let dir = TempDir::new().unwrap();
         let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
 
-        struct StubProvider;
-        #[async_trait::async_trait]
-        impl crate::LlmProvider for StubProvider {
-            async fn chat(
-                &self,
-                _: Option<&str>,
-                _: &str,
-                _: &str,
-                _: f64,
-            ) -> anyhow::Result<String> {
-                Ok("stub".to_string())
-            }
-        }
+        write_and_index(
+            &root,
+            "page-a.md",
+            "---\ntitle: Page A\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSee [[nonexistent-page]] for details.\n",
+        );
 
-        let memex = crate::Memex::open(root.clone(), Box::new(StubProvider), "test").unwrap();
+        let memex = open_and_reindex(&root);
+        let report = memex.lint().unwrap();
+        let dangling: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == crate::types::LintIssueKind::DanglingLink)
+            .collect();
+        assert_eq!(dangling.len(), 1);
+        assert_eq!(dangling[0].page, "page-a");
+        assert_eq!(dangling[0].target, "nonexistent-page");
+    }
 
-        let fix = crate::types::ProposedFix {
-            description: "Create stub page".to_string(),
-            operations: vec![crate::types::WikiOperation::CreatePage {
-                path: std::path::PathBuf::from("wiki/test-stub.md"),
-                content: "---\ntitle: Test Stub\ntags:\n  - entity\ncreated: 2026-04-06T00:00:00Z\nlast_updated: 2026-04-06T00:00:00Z\nsources: []\n---\n\nStub page.\n".to_string(),
-            }],
-        };
+    #[test]
+    fn lint_detects_missing_link() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
 
-        memex.apply_fix(&fix).await.unwrap();
-        assert!(root.join("wiki/test-stub.md").exists());
-        // Index should be rebuilt
-        let index = std::fs::read_to_string(root.join("index.md")).unwrap();
-        assert!(index.contains("Test Stub"), "index should contain new page");
+        write_and_index(
+            &root,
+            "caching.md",
+            "---\ntitle: Caching Strategies\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nCaching is important.\n",
+        );
+
+        write_and_index(
+            &root,
+            "performance.md",
+            "---\ntitle: Performance\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nImprove performance with caching strategies and other techniques.\n",
+        );
+
+        let memex = open_and_reindex(&root);
+        let report = memex.lint().unwrap();
+        let missing: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| {
+                i.kind == crate::types::LintIssueKind::MissingLink
+                    && i.page == "performance"
+                    && i.target == "caching"
+            })
+            .collect();
+        assert!(
+            !missing.is_empty(),
+            "should detect that performance mentions caching strategies without linking"
+        );
+    }
+
+    #[test]
+    fn lint_empty_wiki() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        let memex = crate::Memex::open(root.clone()).unwrap();
+
+        let report = memex.lint().unwrap();
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn lint_no_false_positives_when_linked() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+
+        write_and_index(
+            &root,
+            "caching.md",
+            "---\ntitle: Caching\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nCaching info.\n",
+        );
+
+        write_and_index(
+            &root,
+            "performance.md",
+            "---\ntitle: Performance\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nImprove performance with [[caching]] and other techniques.\n",
+        );
+
+        let memex = open_and_reindex(&root);
+        let report = memex.lint().unwrap();
+        let missing: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| {
+                i.kind == crate::types::LintIssueKind::MissingLink
+                    && i.page == "performance"
+                    && i.target == "caching"
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "should not flag missing link when already linked via [[caching]]"
+        );
+    }
+
+    #[test]
+    fn lint_detects_stale_index() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+
+        // Write and index a page.
+        write_and_index(
+            &root,
+            "stale-page.md",
+            "---\ntitle: Stale Page\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nOriginal content.\n",
+        );
+        let memex = open_and_reindex(&root);
+
+        // Modify the file on disk without reindexing.
+        std::fs::write(
+            root.join("wiki/stale-page.md"),
+            "---\ntitle: Stale Page\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nModified content that is different.\n",
+        )
+        .unwrap();
+
+        let report = memex.lint().unwrap();
+        let stale: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == crate::types::LintIssueKind::StaleIndex)
+            .collect();
+        assert_eq!(stale.len(), 1, "should detect one stale-index issue");
+        assert_eq!(stale[0].page, "stale-page");
+    }
+
+    #[test]
+    fn lint_detects_untracked_file() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        let memex = crate::Memex::open(root.clone()).unwrap();
+
+        // Write a file to disk without indexing it.
+        std::fs::write(
+            root.join("wiki/untracked.md"),
+            "---\ntitle: Untracked\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nNot indexed.\n",
+        )
+        .unwrap();
+
+        let report = memex.lint().unwrap();
+        let untracked: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == crate::types::LintIssueKind::UntrackedFile)
+            .collect();
+        assert_eq!(untracked.len(), 1, "should detect one untracked file");
+        assert!(untracked[0].target.contains("untracked.md"));
+    }
+
+    #[test]
+    fn lint_detects_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+
+        // Write and index, then delete the file.
+        write_and_index(
+            &root,
+            "will-delete.md",
+            "---\ntitle: Will Delete\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nContent.\n",
+        );
+        let memex = open_and_reindex(&root);
+
+        // Remove file from disk but leave DB row.
+        std::fs::remove_file(root.join("wiki/will-delete.md")).unwrap();
+
+        let report = memex.lint().unwrap();
+        let missing: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == crate::types::LintIssueKind::MissingFile)
+            .collect();
+        assert_eq!(missing.len(), 1, "should detect one missing file");
+        assert_eq!(missing[0].page, "will-delete");
+    }
+
+    #[test]
+    fn lint_detects_outdated_embeddings() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+
+        write_and_index(
+            &root,
+            "embed-page.md",
+            "---\ntitle: Embed Page\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSome content for embedding.\n",
+        );
+        let memex = open_and_reindex(&root);
+
+        // Insert a chunk with an outdated model name directly via the DB.
+        let search = memex.search();
+        let hash = search
+            .get_document_hash("wiki/embed-page.md")
+            .unwrap()
+            .expect("document should have a hash");
+
+        // Insert a content row so the FK is satisfied, then insert a chunk
+        // with model="old-model".
+        let embedding = crate::embed::hash_embedding("Some content for embedding.");
+        search
+            .with_connection(|conn| {
+                crate::vector::store_chunk(
+                    conn,
+                    &hash,
+                    99, // unique seq to avoid overwriting real chunks
+                    "test chunk",
+                    0,
+                    10,
+                    "old-model",
+                    &embedding,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let report = memex.lint().unwrap();
+        let outdated: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == crate::types::LintIssueKind::OutdatedEmbedding)
+            .collect();
+        assert!(
+            !outdated.is_empty(),
+            "should detect outdated embedding issues"
+        );
+        assert!(
+            outdated[0].target.contains("old-model"),
+            "issue target should mention the old model name, got: {}",
+            outdated[0].target
+        );
+        assert!(
+            outdated[0]
+                .target
+                .contains(crate::embed::CURRENT_MODEL_NAME),
+            "issue target should mention the current model name, got: {}",
+            outdated[0].target
+        );
+    }
+
+    #[test]
+    fn lint_no_outdated_when_model_matches() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+
+        write_and_index(
+            &root,
+            "current-page.md",
+            "---\ntitle: Current Page\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nContent.\n",
+        );
+        let memex = open_and_reindex(&root);
+
+        // Insert a chunk with the current model name.
+        let search = memex.search();
+        let hash = search
+            .get_document_hash("wiki/current-page.md")
+            .unwrap()
+            .expect("document should have a hash");
+
+        let embedding = crate::embed::hash_embedding("Content.");
+        search
+            .with_connection(|conn| {
+                crate::vector::store_chunk(
+                    conn,
+                    &hash,
+                    0,
+                    "test chunk",
+                    0,
+                    10,
+                    crate::embed::CURRENT_MODEL_NAME,
+                    &embedding,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let report = memex.lint().unwrap();
+        let outdated: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == crate::types::LintIssueKind::OutdatedEmbedding)
+            .collect();
+        assert!(
+            outdated.is_empty(),
+            "should not detect outdated embeddings when model matches"
+        );
     }
 }

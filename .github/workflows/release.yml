@@ -1,0 +1,54 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary: memex-darwin-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary: memex-darwin-x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: memex-linux-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: memex-windows-x64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }} -p memex-cli
+      - name: Rename binary
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/memex"
+          [[ "${{ matrix.os }}" == "windows-latest" ]] && src="${src}.exe"
+          cp "$src" "${{ matrix.binary }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: ${{ matrix.binary }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            memex-darwin-arm64/memex-darwin-arm64
+            memex-darwin-x64/memex-darwin-x64
+            memex-linux-x64/memex-linux-x64
+            memex-windows-x64.exe/memex-windows-x64.exe

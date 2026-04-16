@@ -1,0 +1,9 @@
+{
+  "name": "memverge",
+  "owner": { "name": "MemVerge" },
+  "plugins": [{
+    "name": "memex",
+    "source": { "source": "npm", "package": "@memverge/memex" },
+    "description": "Personal wiki storage and search engine for AI agents"
+  }]
+}

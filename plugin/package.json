@@ -1,0 +1,31 @@
+{
+  "name": "@memverge/memex",
+  "version": "0.1.0",
+  "description": "Personal wiki storage and search engine for AI agents",
+  "bin": {
+    "memex": "./bin/memex-wrapper.js"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "skills/",
+    "postinstall.js",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    ".claude-plugin/",
+    ".codex-plugin/",
+    ".cursor-plugin/",
+    ".codex/",
+    "gemini-extension.json"
+  ],
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/memverge/memex"
+  },
+  "author": "MemVerge"
+}

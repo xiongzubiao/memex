@@ -3,8 +3,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Atomic write: write to temp file, then rename to final path.
+///
+/// The temp file includes the PID in its name so that concurrent writes from
+/// different processes do not collide on the same temp path.
 pub fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let temp = path.with_extension("tmp");
+    let temp_name = format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    );
+    let temp = path.with_file_name(temp_name);
     fs::write(&temp, content)?;
     fs::rename(&temp, path)?;
     Ok(())
@@ -35,10 +43,8 @@ pub fn try_acquire_lock(lock_path: &Path, timeout_secs: u64) -> std::io::Result<
     }
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(timeout_secs);
-    // TODO: this is a sync function called from async contexts; `std::thread::sleep`
-    // blocks the tokio runtime thread. A proper fix would make this async and use
-    // `tokio::time::sleep`, but that requires changing all callers. Using a short
-    // sleep (10ms) reduces the blocking window in the meantime.
+    // Sync polling loop — callers from async contexts should use
+    // `try_acquire_lock_async` which wraps this in `spawn_blocking`.
     while start.elapsed() < timeout {
         std::thread::sleep(std::time::Duration::from_millis(10));
         match file.try_lock_exclusive() {
@@ -123,7 +129,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.txt");
         atomic_write(&path, b"hello").unwrap();
-        assert!(!path.with_extension("tmp").exists());
+        let temp_name = format!(".test.txt.{}.tmp", std::process::id());
+        assert!(!dir.path().join(temp_name).exists());
     }
 
     #[test]

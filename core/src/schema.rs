@@ -1,93 +1,131 @@
-pub const SCHEMA_VERSION: u32 = 1;
+use crate::error::Result;
+use rusqlite::Connection;
 
-pub const DEFAULT_SCHEMA: &str = r#"---
-version: 1
----
+fn register_strip_frontmatter(conn: &Connection) -> Result<()> {
+    conn.create_scalar_function(
+        "strip_frontmatter",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let doc: String = ctx.get(0)?;
+            let trimmed = doc.trim();
+            if !trimmed.starts_with("---") {
+                return Ok(doc);
+            }
+            let after_first = &trimmed[3..];
+            match after_first.find("---") {
+                Some(end) => Ok(after_first[end + 3..].trim().to_string()),
+                None => Ok(doc),
+            }
+        },
+    )?;
+    Ok(())
+}
 
-# Memex Wiki Schema
+const SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS content (
+    hash       TEXT PRIMARY KEY,
+    doc        TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 
-## Page Naming
-- Use lowercase-kebab-case (e.g., `caching-strategies.md`)
-- Source summaries: `{source-name}.md` (e.g., `notes-md.md`)
-- Brainstorms: `{date}-{topic}.md` (e.g., `2026-04-05-api-gateway.md`)
+CREATE TABLE IF NOT EXISTS documents (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection  TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    hash        TEXT NOT NULL REFERENCES content(hash),
+    docid       TEXT NOT NULL,
+    tags        TEXT NOT NULL DEFAULT '',
+    summary     TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE(collection, path)
+);
 
-## Required Frontmatter
-```yaml
-title: Human-readable title
-tags:
-  - entity
-created: ISO-8601 timestamp
-last_updated: ISO-8601 timestamp
-sources:
-  - sources/documents/abc123-notes.md
-```
+CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_docid ON documents(docid) WHERE docid != '';
 
-## Tags
-Free-form tags describing page content. Common tags:
-- **entity**: A specific thing (technology, pattern, tool)
-- **concept**: An abstract idea or principle
+CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+    path, title, tags, body,
+    content='',
+    tokenize='porter unicode61'
+);
 
-Reserved tags (set automatically):
-- **brainstorm**: Results of a brainstorming session
-- **contradiction**: Conflicting claims from different sources
+CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
+    INSERT INTO documents_fts(rowid, path, title, tags, body)
+    VALUES (
+        new.id, new.path, new.title, new.tags,
+        (SELECT strip_frontmatter(doc) FROM content WHERE hash = new.hash)
+    );
+END;
 
-## Cross-References
-- Use `[[wiki links]]` to reference other pages
-- Link when pages share a meaningful relationship
+CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+    INSERT INTO documents_fts(documents_fts, rowid, path, title, tags, body)
+    VALUES ('delete', old.id, old.path, old.title, old.tags,
+        (SELECT strip_frontmatter(doc) FROM content WHERE hash = old.hash)
+    );
+END;
 
-## When to Create vs Update
-- Create: new topic not covered by existing pages
-- Update: new information about an existing topic
-- Contradiction: when new info conflicts with existing page
+CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
+    INSERT INTO documents_fts(documents_fts, rowid, path, title, tags, body)
+    VALUES ('delete', old.id, old.path, old.title, old.tags,
+        (SELECT strip_frontmatter(doc) FROM content WHERE hash = old.hash)
+    );
+    INSERT INTO documents_fts(rowid, path, title, tags, body)
+    VALUES (
+        new.id, new.path, new.title, new.tags,
+        (SELECT strip_frontmatter(doc) FROM content WHERE hash = new.hash)
+    );
+END;
+
+CREATE TABLE IF NOT EXISTS chunks (
+    hash        TEXT NOT NULL REFERENCES content(hash),
+    seq         INTEGER NOT NULL,
+    chunk_text  TEXT NOT NULL,
+    pos         INTEGER NOT NULL,
+    len         INTEGER NOT NULL,
+    model       TEXT NOT NULL,
+    embedded_at TEXT NOT NULL,
+    embedding   BLOB,
+    PRIMARY KEY(hash, seq)
+);
 "#;
 
-/// Parse the schema version from schema.md content.
-pub fn parse_schema_version(content: &str) -> Option<u32> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with("---") {
-        return None;
-    }
-    let after_first = &trimmed[3..];
-    let end = after_first.find("---")?;
-    let yaml_block = &after_first[..end];
-    for line in yaml_block.lines() {
-        let line = line.trim();
-        if let Some(value) = line.strip_prefix("version:") {
-            return value.trim().parse().ok();
-        }
-    }
-    None
+pub fn init_schema(conn: &Connection) -> Result<()> {
+    register_strip_frontmatter(conn)?;
+    conn.execute_batch(SCHEMA_SQL)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[test]
-    fn default_schema_has_correct_version() {
-        assert_eq!(parse_schema_version(DEFAULT_SCHEMA), Some(SCHEMA_VERSION));
+    fn strip_frontmatter_removes_yaml() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let result: String = conn
+            .query_row(
+                "SELECT strip_frontmatter('---\ntitle: Test\n---\nBody here')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(result, "Body here");
     }
 
     #[test]
-    fn parse_version_from_valid_schema() {
-        let content = "---\nversion: 3\n---\n# Schema\n";
-        assert_eq!(parse_schema_version(content), Some(3));
-    }
-
-    #[test]
-    fn parse_version_missing_frontmatter() {
-        assert_eq!(parse_schema_version("# No frontmatter"), None);
-    }
-
-    #[test]
-    fn parse_version_missing_version_field() {
-        let content = "---\ntitle: foo\n---\n";
-        assert_eq!(parse_schema_version(content), None);
-    }
-
-    #[test]
-    fn parse_version_invalid_number() {
-        let content = "---\nversion: abc\n---\n";
-        assert_eq!(parse_schema_version(content), None);
+    fn strip_frontmatter_no_frontmatter_passthrough() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let result: String = conn
+            .query_row("SELECT strip_frontmatter('No frontmatter here')", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(result, "No frontmatter here");
     }
 }
