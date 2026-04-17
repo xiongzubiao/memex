@@ -92,7 +92,7 @@ impl Memex {
             issues.push(LintIssue {
                 kind: LintIssueKind::OutdatedEmbedding,
                 page: format!("{count} chunks"),
-                target: format!("model: {old_model}, current: {CURRENT_MODEL_NAME}"),
+                target: format!("{old_model} => {CURRENT_MODEL_NAME}"),
             });
         }
 
@@ -174,6 +174,130 @@ impl Memex {
     }
 }
 
+use crate::search::Bm25Search;
+
+/// Re-verify that the issue still describes the current committed state.
+/// Uses the provided `&Bm25Search` connection — caller is responsible for
+/// having the right snapshot (reader's stale snapshot if the connection is
+/// long-lived; fresh snapshot if the connection was just opened under lock).
+pub(crate) fn is_issue_still_present(
+    search: &Bm25Search,
+    root: &std::path::Path,
+    issue: &LintIssue,
+) -> crate::error::Result<bool> {
+    match issue.kind {
+        LintIssueKind::StaleIndex => {
+            // Stale means on-disk hash != stored hash. Re-read both.
+            let full_path = root.join(&issue.target);
+            let Ok(content) = std::fs::read_to_string(&full_path) else {
+                return Ok(false);  // file gone; nothing to fix
+            };
+            let actual = crate::storage::content_hash(content.as_bytes());
+            let stored = search.get_document_hash(&issue.target)?.unwrap_or_default();
+            Ok(actual != stored)
+        }
+        LintIssueKind::OutdatedEmbedding => {
+            // OutdatedEmbedding is a DB-level issue: the index has chunks using an
+            // older embedding model. If any outdated chunks remain, the issue is
+            // still present. `issue.target` is human-readable model-name context
+            // (not a path/hash), so we don't use it in this check.
+            let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
+            Ok(!outdated.is_empty())
+        }
+        // Report-only kinds: always "present" (no auto-fix path).
+        LintIssueKind::DanglingLink
+        | LintIssueKind::MissingLink
+        | LintIssueKind::UntrackedFile
+        | LintIssueKind::MissingFile => Ok(true),
+    }
+}
+
+/// Apply a single lint fix to the provided `&Bm25Search`.
+///
+/// Currently only StaleIndex and OutdatedEmbedding have auto-fix semantics —
+/// other kinds are report-only per the original spec.
+pub(crate) fn apply_fix_inner(
+    search: &Bm25Search,
+    root: &std::path::Path,
+    issue: &LintIssue,
+) -> crate::error::Result<()> {
+    match issue.kind {
+        LintIssueKind::StaleIndex => {
+            let full_path = root.join(&issue.target);
+            let content = std::fs::read_to_string(&full_path)?;
+            let old_hash = search.get_document_hash(&issue.target)?.unwrap_or_default();
+            search.reindex_page_from_content(&issue.target, &content, &old_hash)?;
+            // Re-embed the new content. Uses hash_embedding fallback if ONNX unavailable.
+            let new_hash = search.get_document_hash(&issue.target)?.unwrap_or_default();
+            let body = crate::validate::parse_frontmatter(&content)
+                .map(|(_, b)| b)
+                .unwrap_or_else(|_| content.clone());
+            apply_embedding(search, &new_hash, &body);
+            Ok(())
+        }
+        LintIssueKind::OutdatedEmbedding => {
+            // Pull the actual hash (issue.target contains "old-model => current")
+            // Fix by reading content and re-embedding.
+            let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
+            for hash in &outdated {
+                let full_content = search.get_content(hash)?;
+                let body = crate::validate::parse_frontmatter(&full_content)
+                    .map(|(_, b)| b)
+                    .unwrap_or(full_content);
+                apply_embedding(search, hash, &body);
+            }
+            Ok(())
+        }
+        _ => Ok(()),  // report-only kinds
+    }
+}
+
+/// Embed and persist chunks for a content hash. Uses hash_embedding fallback
+/// if ONNX model isn't available — keeps chunks populated so vector search
+/// works (with lower quality) even without the model installed.
+///
+/// Wraps `load_model` in `catch_unwind` because the `ort` crate panics
+/// (rather than returning Result::Err) when the ONNX Runtime shared library
+/// cannot be loaded. Without the panic guard, a missing libonnxruntime
+/// would crash the whole `lint --fix` process.
+fn apply_embedding(search: &Bm25Search, hash: &str, body: &str) {
+    let model_path = dirs::home_dir().map(|h| h.join(".memex/models/embedding-gemma-300m.onnx"));
+
+    let chunks = crate::embed::chunk_text(body, 900, 0.15);
+
+    let mut model_opt: Option<crate::embed::EmbeddingModel> = None;
+    if let Some(ref mp) = model_path
+        && mp.exists()
+        && let Some(path_str) = mp.to_str()
+    {
+        let path_owned = path_str.to_string();
+        if let Some(Ok(m)) = crate::embed::catch_unwind_silent(move || {
+            crate::embed::load_model(&path_owned, "embedding-gemma-300m")
+        }) {
+            model_opt = Some(m);
+        }
+    }
+    let model_name = if model_opt.is_some() { "embedding-gemma-300m" } else { "hash-embedding" };
+
+    let _ = search.with_connection(|conn| {
+        crate::vector::delete_chunks(conn, hash)?;
+        for (seq, chunk) in chunks.iter().enumerate() {
+            let embedding = if let Some(ref mut model) = model_opt {
+                crate::embed::embed_text(model, &chunk.text)
+                    .unwrap_or_else(|_| crate::embed::hash_embedding(&chunk.text))
+            } else {
+                crate::embed::hash_embedding(&chunk.text)
+            };
+            let _ = crate::vector::store_chunk(
+                conn, hash, seq as i32, &chunk.text,
+                chunk.pos, chunk.len, model_name, &embedding,
+            );
+        }
+        Ok(())
+    });
+}
+
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -183,9 +307,9 @@ mod tests {
         std::fs::write(root.join("wiki").join(filename), content).unwrap();
     }
 
-    /// Open a memex, write files, and reindex to sync DB with disk.
+    /// Open a memex as writer, write files, and reindex to sync DB with disk.
     fn open_and_reindex(root: &std::path::Path) -> crate::Memex {
-        let memex = crate::Memex::open(root.to_path_buf()).unwrap();
+        let memex = crate::Memex::open_writer(root.to_path_buf()).unwrap();
         memex.reindex().unwrap();
         memex
     }
@@ -436,6 +560,58 @@ mod tests {
             "issue target should mention the current model name, got: {}",
             outdated[0].target
         );
+    }
+
+    #[test]
+    fn is_issue_still_present_outdated_embedding_reflects_db_state() {
+        use crate::types::{LintIssue, LintIssueKind};
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+
+        write_and_index(
+            &root,
+            "embed-test.md",
+            "---\ntitle: Embed Test\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSome content.\n",
+        );
+        let memex = open_and_reindex(&root);
+        let search = memex.search();
+        let hash = search
+            .get_document_hash("wiki/embed-test.md")
+            .unwrap()
+            .expect("document should have a hash");
+
+        // No outdated chunks yet — issue should NOT be present.
+        let issue = LintIssue {
+            kind: LintIssueKind::OutdatedEmbedding,
+            page: "1 chunks".to_string(),
+            target: format!("old-model => {}", crate::embed::CURRENT_MODEL_NAME),
+        };
+        let result = crate::lint::is_issue_still_present(search, &root, &issue).unwrap();
+        assert!(!result, "no outdated chunks => issue not present");
+
+        // Insert a chunk with an outdated model name.
+        let embedding = crate::embed::hash_embedding("Some content.");
+        search
+            .with_connection(|conn| {
+                crate::vector::store_chunk(
+                    conn,
+                    &hash,
+                    99,
+                    "test chunk",
+                    0,
+                    12,
+                    "old-model",
+                    &embedding,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Now the issue SHOULD be present.
+        let result = crate::lint::is_issue_still_present(search, &root, &issue).unwrap();
+        assert!(result, "outdated chunk exists => issue present");
     }
 
     #[test]

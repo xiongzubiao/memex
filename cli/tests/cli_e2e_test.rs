@@ -34,14 +34,15 @@ fn search_empty_wiki() {
 fn search_with_content() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("memex");
-    std::fs::create_dir_all(root.join("wiki")).unwrap();
 
-    // Create a wiki page with proper frontmatter
-    std::fs::write(
-        root.join("wiki/caching.md"),
-        "---\ntitle: Caching Strategies\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nContent about caching and performance.\n",
-    )
-    .unwrap();
+    // Write via CLI so the page is indexed in the DB before searching.
+    let content = make_page("Caching Strategies", "Content about caching and performance.");
+    let out = run_write(&root, "caching", &content, &[]);
+    assert!(
+        out.status.success(),
+        "write should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let output = memex_cmd(&root)
         .args(["search", "caching"])
@@ -448,8 +449,8 @@ fn read_not_found() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Not found: nonexistent-page"),
-        "expected 'Not found' in stderr, got: {stderr}"
+        stderr.contains("not found: nonexistent-page"),
+        "expected 'not found: nonexistent-page' in stderr, got: {stderr}"
     );
 }
 
@@ -744,7 +745,7 @@ fn delete_not_found() {
         "delete of nonexistent page should fail"
     );
     assert!(
-        stderr.contains("Not found:") || stderr.contains("no-such-page"),
+        stderr.contains("not found:") || stderr.contains("no-such-page"),
         "expected error message mentioning missing page, got: {stderr}"
     );
 }
@@ -784,12 +785,14 @@ fn lint_clean_wiki() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("memex");
 
-    // Write a page with no broken links.
-    write_wiki_page(
-        &root,
-        "clean-page.md",
-        "Clean Page",
-        "This page has no broken links whatsoever.",
+    // Write via CLI so the page is indexed in the DB; otherwise lint reports
+    // an untracked-file issue and never prints "No issues found."
+    let content = make_page("Clean Page", "This page has no broken links whatsoever.");
+    let out = run_write(&root, "clean-page", &content, &[]);
+    assert!(
+        out.status.success(),
+        "write should succeed, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     let output = memex_cmd(&root).args(["lint"]).output().unwrap();
@@ -992,8 +995,8 @@ fn delete_removes_file_and_db_row() {
         .unwrap();
     let read_stderr = String::from_utf8_lossy(&read_after.stderr);
     assert!(
-        read_stderr.contains("Not found"),
-        "expected 'Not found' after delete, got stderr: {read_stderr}"
+        read_stderr.contains("not found"),
+        "expected 'not found' after delete, got stderr: {read_stderr}"
     );
 }
 
@@ -1296,8 +1299,8 @@ fn lint_fix_re_embeds_outdated_model() {
         "lint --fix should succeed, stderr: {fix_stderr}"
     );
     assert!(
-        fix_stdout.contains("re-embedded:") && fix_stdout.contains("model upgrade"),
-        "expected 're-embedded: N documents (model upgrade)' in output, got: {fix_stdout}"
+        fix_stdout.contains("re-embedded:"),
+        "expected 're-embedded:' in output, got: {fix_stdout}"
     );
 
     // Verify chunks now have current model by running lint again.

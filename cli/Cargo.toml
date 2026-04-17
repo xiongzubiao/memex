@@ -17,3 +17,5 @@ chrono = { version = "0.4", features = ["serde"] }
 [dev-dependencies]
 tempfile = "3"
 rusqlite = { version = "0.37", features = ["bundled"] }
+memex-core = { path = "../core", features = ["test-utils"] }
+fs2 = "0.4"

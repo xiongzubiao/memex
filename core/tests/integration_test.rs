@@ -42,7 +42,7 @@ fn lint_detects_dangling_link() {
 fn reindex_populates_search() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("memex");
-    let memex = memex_core::Memex::open(root.clone()).unwrap();
+    let memex = memex_core::Memex::open_writer(root.clone()).unwrap();
 
     std::fs::write(
         root.join("wiki/test-topic.md"),

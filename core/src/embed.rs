@@ -11,6 +11,24 @@ pub fn init_runtime(dylib_path: &std::path::Path) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// Run a closure with panic output silenced, returning `Some(R)` on success
+/// or `None` if the closure panicked.
+///
+/// The `ort` crate panics (rather than returning an error) when the ONNX
+/// Runtime shared library cannot be loaded. `catch_unwind` catches the panic,
+/// but the default hook still prints a noisy backtrace to stderr. This helper
+/// installs a no-op panic hook for the duration of the call, then restores
+/// the original hook afterwards. The panic payload is discarded.
+pub fn catch_unwind_silent<F: FnOnce() -> R + std::panic::UnwindSafe, R>(
+    f: F,
+) -> Option<R> {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(f).ok();
+    std::panic::set_hook(prev);
+    result
+}
+
 /// Expected embedding dimensionality for embedding-gemma-300m.
 pub const EMBEDDING_DIM: usize = 768;
 

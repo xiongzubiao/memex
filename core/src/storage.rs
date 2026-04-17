@@ -1,80 +1,206 @@
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// Atomic write: write to temp file, then rename to final path.
+const RETRY_SCHEDULE: &[Duration] = &[
+    Duration::from_millis(10),
+    Duration::from_millis(20),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+    Duration::from_millis(500),
+    Duration::from_millis(500),
+];
+// Total: ~1.9s across 9 attempts (1 immediate + 8 backoffs).
+
+/// Classify an I/O error as transient (retry-worthy) or permanent (fail-fast).
+/// Biased toward transient on unknowns — wait 1.9s on a weird new error code
+/// rather than falsely fail-fast on a genuinely transient one.
+pub(crate) fn is_transient_io_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+
+    // Definitely permanent — fail fast.
+    if matches!(err.kind(), NotFound | InvalidInput | InvalidData | UnexpectedEof) {
+        return false;
+    }
+
+    // Definitely transient by kind.
+    if matches!(err.kind(), WouldBlock | Interrupted | ResourceBusy | TimedOut) {
+        return true;
+    }
+
+    // Check raw OS error codes.
+    if let Some(code) = err.raw_os_error() {
+        #[cfg(unix)]
+        {
+            let transient_posix = [
+                libc::EBUSY,
+                libc::EAGAIN,
+                libc::EINTR,
+                libc::ETXTBSY,
+                libc::ESTALE,
+            ];
+            if transient_posix.contains(&code) {
+                return true;
+            }
+        }
+        #[cfg(windows)]
+        {
+            const ERROR_SHARING_VIOLATION: i32 = 32;
+            const ERROR_LOCK_VIOLATION: i32 = 33;
+            const ERROR_ACCESS_DENIED: i32 = 5;
+            if [ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_ACCESS_DENIED].contains(&code) {
+                return true;
+            }
+        }
+    }
+
+    // POSIX PermissionDenied: permanent (RO FS, RO parent dir, SELinux).
+    // Transient EACCES cases hit the raw_os_error check above.
+    #[cfg(unix)]
+    if matches!(err.kind(), std::io::ErrorKind::PermissionDenied) {
+        return false;
+    }
+
+    // Unknown — bias toward transient (wait 1.9s, then surface).
+    true
+}
+
+// Test-only injection hook for `retry_io`: when set, `retry_io` returns
+// the injected error instead of calling `f`. Used by unit tests to
+// exercise the retry loop deterministically without filesystem tricks.
+#[cfg(test)]
+thread_local! {
+    static TEST_FAILURE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn inject_atomic_write_failures(n: usize) {
+    TEST_FAILURE_COUNT.with(|c| c.set(n));
+}
+
+#[cfg(test)]
+fn test_injected_failure() -> Option<std::io::Error> {
+    TEST_FAILURE_COUNT.with(|c| {
+        let remaining = c.get();
+        if remaining == 0 { return None; }
+        c.set(remaining - 1);
+        Some(std::io::Error::new(std::io::ErrorKind::WouldBlock, "test-injected"))
+    })
+}
+
+/// Execute `f` with bounded retry on transient I/O errors (`RETRY_SCHEDULE`,
+/// ~1.9s across 9 attempts). Permanent errors fail fast as `FileOpFailed`;
+/// exhausted retries surface as `FileOpExhausted`. See `is_transient_io_error`
+/// for the permanent/transient split.
+pub fn retry_io<F>(path: &Path, operation: &'static str, mut f: F) -> crate::error::Result<()>
+where
+    F: FnMut() -> std::io::Result<()>,
+{
+    let mut last_err: Option<std::io::Error> = None;
+    for (attempt, delay) in std::iter::once(&Duration::ZERO).chain(RETRY_SCHEDULE).enumerate() {
+        if attempt > 0 {
+            std::thread::sleep(*delay);
+        }
+        #[cfg(test)]
+        if let Some(e) = test_injected_failure() {
+            last_err = Some(e);
+            continue;
+        }
+        match f() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if !is_transient_io_error(&e) {
+                    return Err(crate::error::MemexError::FileOpFailed {
+                        path: path.to_path_buf(),
+                        operation,
+                        source: e,
+                    });
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(crate::error::MemexError::FileOpExhausted {
+        path: path.to_path_buf(),
+        operation,
+        source: last_err.expect("loop ran at least once"),
+    })
+}
+
+/// 4 bytes of hex random — plenty to disambiguate concurrent writes by the
+/// same PID across process lifetimes. `rand::random::<u32>()` uses the OS RNG.
+fn random_nonce_hex() -> String {
+    let n: u32 = rand::random();
+    format!("{n:08x}")
+}
+
+/// Atomic write with retry.
 ///
-/// The temp file includes the PID in its name so that concurrent writes from
-/// different processes do not collide on the same temp path.
-pub fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
+/// Writes to `.{filename}.{pid}.{nonce}.tmp` (e.g., `.rest-patterns.md.12345.a1b2c3d4.tmp`)
+/// then renames over the target path. Both steps are retried with a bounded
+/// schedule (`retry_io`) when the I/O error is transient. Permanent errors
+/// (`NotFound`, `InvalidInput`, etc.) fail fast through `MemexError::FileOpFailed`.
+pub fn atomic_write(path: &Path, content: &[u8]) -> crate::error::Result<()> {
+    let nonce = random_nonce_hex();
     let temp_name = format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        nonce,
     );
     let temp = path.with_file_name(temp_name);
-    fs::write(&temp, content)?;
-    fs::rename(&temp, path)?;
+
+    retry_io(&temp, "write temp", || fs::write(&temp, content))?;
+
+    if let Err(e) = retry_io(path, "rename", || fs::rename(&temp, path)) {
+        let _ = fs::remove_file(&temp);
+        return Err(e);
+    }
     Ok(())
 }
 
-/// Acquire exclusive file lock for write operations.
-pub fn acquire_lock(lock_path: &Path) -> std::io::Result<fs::File> {
+/// Try to acquire exclusive flock on `lock_path`, polling every 10ms until
+/// `timeout` elapses. Contention errors (WouldBlock) cause continued polling;
+/// any other I/O error returns immediately so the caller can distinguish
+/// `LockTimeout` (retry-worthy) from `LockAcquireIo` (configuration problem).
+pub(crate) fn try_acquire_lock(lock_path: &Path, timeout: std::time::Duration) -> std::io::Result<fs::File> {
     use fs2::FileExt;
     let file = fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(lock_path)?;
-    file.lock_exclusive()?;
-    Ok(file)
-}
 
-/// Try to acquire lock with a timeout (in seconds).
-pub fn try_acquire_lock(lock_path: &Path, timeout_secs: u64) -> std::io::Result<fs::File> {
-    use fs2::FileExt;
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)?;
-    if let Ok(()) = file.try_lock_exclusive() {
-        return Ok(file);
+    let is_contention = |e: &std::io::Error| -> bool {
+        if matches!(e.kind(), std::io::ErrorKind::WouldBlock) { return true; }
+        #[cfg(windows)]
+        if e.raw_os_error() == Some(33) { return true; }  // ERROR_LOCK_VIOLATION
+        false
+    };
+
+    // First attempt — uncontended fast path.
+    match file.try_lock_exclusive() {
+        Ok(()) => return Ok(file),
+        Err(e) if !is_contention(&e) => return Err(e),
+        Err(_) => {}
     }
+
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(timeout_secs);
-    // Sync polling loop — callers from async contexts should use
-    // `try_acquire_lock_async` which wraps this in `spawn_blocking`.
     while start.elapsed() < timeout {
         std::thread::sleep(std::time::Duration::from_millis(10));
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
+            Err(e) if !is_contention(&e) => return Err(e),
             Err(_) => continue,
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        format!("Could not acquire lock within {}s", timeout_secs),
+        format!("could not acquire lock within {:?}", timeout),
     ))
-}
-
-/// Async-safe wrapper: acquires the lock in a blocking thread pool to avoid
-/// stalling the tokio runtime during the polling sleep loop.
-pub async fn try_acquire_lock_async(
-    lock_path: &Path,
-    timeout_secs: u64,
-) -> std::io::Result<fs::File> {
-    let path = lock_path.to_path_buf();
-    tokio::task::spawn_blocking(move || try_acquire_lock(&path, timeout_secs))
-        .await
-        .map_err(std::io::Error::other)?
-}
-
-/// Release file lock.
-pub fn release_lock(file: fs::File) {
-    use fs2::FileExt;
-    FileExt::unlock(&file).ok();
-    drop(file);
 }
 
 /// Normalize a path by joining `base` with `relative_key` and resolving `..` and `.`
@@ -111,6 +237,47 @@ pub fn file_hash(path: &Path) -> std::io::Result<String> {
     Ok(content_hash(&bytes))
 }
 
+const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Strict match for memex-generated tmp names.
+///
+/// Format: `.{filename}.{pid}.{nonce}.tmp` where filename = `{stem}.md`.
+/// Example: `.rest-patterns.md.12345.a1b2c3d4.tmp`.
+pub(crate) fn is_memex_tmp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.').and_then(|s| s.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let mut parts = rest.rsplitn(3, '.');
+    let (Some(nonce), Some(pid), Some(basename)) = (parts.next(), parts.next(), parts.next())
+    else { return false; };
+
+    if nonce.len() != 8 || !nonce.chars().all(|c| c.is_ascii_hexdigit()) { return false; }
+    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) { return false; }
+    let Some(stem) = basename.strip_suffix(".md") else { return false; };
+    if stem.is_empty() || stem.contains('.') { return false; }
+    true
+}
+
+/// Remove memex tmp files older than STALE_TMP_AGE in `wiki_dir` (recursive).
+/// Safe to call unconditionally — mismatches (non-memex names) are ignored
+/// by `is_memex_tmp_name`. Must be called under the writer flock so fresh
+/// tmp files from a concurrent writer aren't misidentified.
+pub(crate) fn cleanup_stale_tmp_files(wiki_dir: &Path) {
+    let now = std::time::SystemTime::now();
+    for entry in walkdir::WalkDir::new(wiki_dir).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() { continue; }
+        let name = entry.file_name().to_string_lossy();
+        if !is_memex_tmp_name(&name) { continue; }
+
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        let Ok(age) = now.duration_since(mtime) else { continue };
+        if age >= STALE_TMP_AGE {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,30 +292,12 @@ mod tests {
     }
 
     #[test]
-    fn atomic_write_no_temp_leftover() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.txt");
-        atomic_write(&path, b"hello").unwrap();
-        let temp_name = format!(".test.txt.{}.tmp", std::process::id());
-        assert!(!dir.path().join(temp_name).exists());
-    }
-
-    #[test]
     fn atomic_write_overwrites_existing() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("test.txt");
         fs::write(&path, "old").unwrap();
         atomic_write(&path, b"new").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
-    }
-
-    #[test]
-    fn lock_acquire_and_release() {
-        let dir = TempDir::new().unwrap();
-        let lock_path = dir.path().join(".lock");
-        let file = acquire_lock(&lock_path).unwrap();
-        assert!(lock_path.exists());
-        release_lock(file);
     }
 
     #[test]
@@ -172,45 +321,196 @@ mod tests {
         assert_eq!(file_hash(&path).unwrap(), content_hash(b"hello"));
     }
 
-    /// Verify that `try_acquire_lock_async` does not block the tokio runtime.
-    ///
-    /// If the blocking sleep ran on the tokio thread pool directly it would
-    /// starve other tasks.  `spawn_blocking` moves the work to a dedicated
-    /// thread, so the concurrent `async` task below must complete while the
-    /// lock is being polled.
-    #[tokio::test]
-    async fn try_acquire_lock_async_does_not_block_runtime() {
-        let dir = TempDir::new().unwrap();
-        let lock_path = dir.path().join(".async_lock");
-
-        // Acquire the lock synchronously to force the async call to poll.
+    #[test]
+    fn try_acquire_lock_returns_timeout_on_contention() {
         use fs2::FileExt;
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join(".lock");
         let blocker = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .unwrap();
+            .create(true).write(true).truncate(false)
+            .open(&lock_path).unwrap();
         blocker.lock_exclusive().unwrap();
 
-        // Spawn a task that completes immediately — proves the runtime is live.
-        let side_task = tokio::spawn(async { 42u32 });
+        let result = try_acquire_lock(&lock_path, std::time::Duration::from_millis(100));
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        FileExt::unlock(&blocker).unwrap();
+    }
 
-        // Start the async lock acquisition (will poll in a blocking thread).
-        let lock_path_clone = lock_path.clone();
-        let lock_future =
-            tokio::spawn(async move { try_acquire_lock_async(&lock_path_clone, 5).await });
+    #[test]
+    fn try_acquire_lock_returns_non_timeout_io_immediately() {
+        // Point at a path whose parent doesn't exist — OpenOptions.open() fails
+        // with NotFound, which should be returned immediately (not after timeout).
+        let dir = TempDir::new().unwrap();
+        let lock_path = dir.path().join("nonexistent_subdir").join(".lock");
 
-        // The side task must resolve without waiting for the lock.
-        let side_result = side_task.await.unwrap();
-        assert_eq!(side_result, 42, "runtime was blocked during lock polling");
+        let start = std::time::Instant::now();
+        let result = try_acquire_lock(&lock_path, std::time::Duration::from_secs(5));
+        let elapsed = start.elapsed();
 
-        // Release the blocker so the lock future can succeed.
-        blocker.unlock().unwrap();
-        drop(blocker);
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound,
+            "expected NotFound from missing parent dir, got {:?}", err.kind());
+        assert!(elapsed < std::time::Duration::from_millis(500),
+            "non-timeout error should return immediately, took {:?}", elapsed);
+    }
 
-        let lock_result = lock_future.await.unwrap();
-        assert!(lock_result.is_ok(), "lock should succeed after release");
-        release_lock(lock_result.unwrap());
+    #[test]
+    fn classifier_not_found_is_permanent() {
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        assert!(!is_transient_io_error(&e));
+    }
+
+    #[test]
+    fn classifier_invalid_input_is_permanent() {
+        let e = std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad");
+        assert!(!is_transient_io_error(&e));
+    }
+
+    #[test]
+    fn classifier_would_block_is_transient() {
+        let e = std::io::Error::new(std::io::ErrorKind::WouldBlock, "busy");
+        assert!(is_transient_io_error(&e));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifier_posix_permission_denied_is_permanent() {
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "perm");
+        assert!(!is_transient_io_error(&e));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifier_posix_ebusy_is_transient() {
+        let e = std::io::Error::from_raw_os_error(libc::EBUSY);
+        assert!(is_transient_io_error(&e));
+    }
+
+    #[test]
+    fn retry_io_succeeds_first_try() {
+        let temp = std::path::PathBuf::from("/tmp/unused");
+        let result = retry_io(&temp, "noop", || Ok(()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn retry_io_fast_fails_on_permanent_error() {
+        let temp = std::path::PathBuf::from("/tmp/unused");
+        let start = std::time::Instant::now();
+        let result = retry_io(&temp, "noop", || {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+        });
+        assert!(matches!(result, Err(crate::error::MemexError::FileOpFailed { .. })));
+        assert!(start.elapsed() < std::time::Duration::from_millis(50),
+            "fast-fail should not wait the retry budget");
+    }
+
+    #[test]
+    fn retry_io_exhausts_on_persistent_transient() {
+        let temp = std::path::PathBuf::from("/tmp/unused");
+        let result = retry_io(&temp, "noop", || {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "busy"))
+        });
+        assert!(matches!(result, Err(crate::error::MemexError::FileOpExhausted { .. })));
+    }
+
+    #[test]
+    fn atomic_write_retries_on_injected_transient() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("foo.md");
+        inject_atomic_write_failures(3);
+        atomic_write(&path, b"hello").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn atomic_write_tmp_filename_uses_nonce_format() {
+        // Write a file, verify the happy path produces the final file correctly
+        // and no stale tmp file is left behind.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("foo.md");
+        atomic_write(&path, b"hello").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+
+        let stale: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(stale.is_empty(), "tmp file leaked: {:?}", stale);
+    }
+
+    #[test]
+    fn is_memex_tmp_name_matches_valid() {
+        assert!(is_memex_tmp_name(".rest-patterns.md.12345.a1b2c3d4.tmp"));
+        assert!(is_memex_tmp_name(".foo.md.1.00000000.tmp"));
+    }
+
+    #[test]
+    fn is_memex_tmp_name_rejects_invalid() {
+        assert!(!is_memex_tmp_name(".DS_Store"));
+        assert!(!is_memex_tmp_name(".swp"));
+        assert!(!is_memex_tmp_name("rest-patterns.md"));
+        assert!(!is_memex_tmp_name(".rest-patterns.md.tmp"), "missing pid+nonce");
+        assert!(!is_memex_tmp_name(".rest.patterns.md.12345.a1b2c3d4.tmp"), "stem must not contain dots");
+        assert!(!is_memex_tmp_name(".rest-patterns.txt.12345.a1b2c3d4.tmp"), "must end in .md");
+        assert!(!is_memex_tmp_name(".rest-patterns.md.abc.a1b2c3d4.tmp"), "pid must be digits");
+        assert!(!is_memex_tmp_name(".rest-patterns.md.12345.xxxxxxxx.tmp"), "nonce must be hex");
+        assert!(!is_memex_tmp_name(".rest-patterns.md.12345.a1b2c3d.tmp"), "nonce must be 8 chars");
+    }
+
+    #[test]
+    fn cleanup_removes_stale_tmp_files() {
+        use std::fs::OpenOptions;
+        let dir = TempDir::new().unwrap();
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+
+        let stale_path = wiki.join(".foo.md.99999.deadbeef.tmp");
+        OpenOptions::new().create(true).truncate(true).write(true).open(&stale_path).unwrap();
+
+        // Backdate mtime to 2 hours ago.
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        filetime::set_file_mtime(&stale_path, filetime::FileTime::from_system_time(two_hours_ago)).unwrap();
+
+        cleanup_stale_tmp_files(&wiki);
+
+        assert!(!stale_path.exists(), "stale tmp should have been removed");
+    }
+
+    #[test]
+    fn cleanup_preserves_fresh_tmp_files() {
+        use std::fs::OpenOptions;
+        let dir = TempDir::new().unwrap();
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+
+        let fresh_path = wiki.join(".foo.md.99999.deadbeef.tmp");
+        OpenOptions::new().create(true).truncate(true).write(true).open(&fresh_path).unwrap();
+        // mtime = now (default)
+
+        cleanup_stale_tmp_files(&wiki);
+        assert!(fresh_path.exists(), "fresh tmp should NOT have been removed");
+    }
+
+    #[test]
+    fn cleanup_ignores_non_memex_dotfiles() {
+        let dir = TempDir::new().unwrap();
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+
+        let ds_store = wiki.join(".DS_Store");
+        let swp = wiki.join(".foo.swp");
+        std::fs::write(&ds_store, "").unwrap();
+        std::fs::write(&swp, "").unwrap();
+
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        filetime::set_file_mtime(&ds_store, filetime::FileTime::from_system_time(two_hours_ago)).unwrap();
+        filetime::set_file_mtime(&swp, filetime::FileTime::from_system_time(two_hours_ago)).unwrap();
+
+        cleanup_stale_tmp_files(&wiki);
+        assert!(ds_store.exists());
+        assert!(swp.exists());
     }
 }

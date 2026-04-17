@@ -491,6 +491,11 @@ impl Bm25Search {
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(sqlite_err)?;
 
+        // SQLite-level busy_timeout — belt-and-suspenders for transient contention.
+        // Must be set before init_schema runs DDL so first-open DDL is covered too.
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .map_err(sqlite_err)?;
+
         // Initialize new content-addressable schema (includes strip_frontmatter UDF)
         crate::schema::init_schema(&conn)?;
 
@@ -2185,5 +2190,26 @@ mod tests {
 
         let missing = search.lookup_title("nonexistent").unwrap();
         assert_eq!(missing, None);
+    }
+}
+
+#[cfg(test)]
+mod parallel_access_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn bm25_search_open_sets_busy_timeout() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join(".search.db");
+        let search = Bm25Search::open(&db_path).unwrap();
+
+        // Query the pragma — SQLite exposes current busy_timeout in ms.
+        let timeout_ms: i64 = search.with_connection(|conn| {
+            Ok(conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap())
+        }).unwrap();
+
+        assert_eq!(timeout_ms, 5000);
     }
 }

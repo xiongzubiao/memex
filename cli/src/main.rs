@@ -1,7 +1,6 @@
 use clap::{Parser, Subcommand};
 use memex_core::Memex;
 use memex_core::search::{self, MIN_SCORE, SearchResult, WikiSearch};
-use memex_core::types::LintIssueKind;
 use std::io::Read as _;
 use std::path::Path;
 
@@ -113,41 +112,7 @@ fn vector_search_as_results(
     Ok(results)
 }
 
-/// Check if the ONNX embedding model can actually be loaded.
-///
-/// Probes the real runtime by attempting to load the model file with
-/// `catch_unwind_silent`.  Returns `true` only if both the model file
-/// exists AND the ONNX Runtime shared library is available.
-fn onnx_model_available() -> bool {
-    let Some(mp) = dirs::home_dir().map(|h| h.join(".memex/models/embedding-gemma-300m.onnx"))
-    else {
-        return false;
-    };
-    if !mp.exists() {
-        return false;
-    }
-    let Some(path_str) = mp.to_str() else {
-        return false;
-    };
-    let path_owned = path_str.to_string();
-    catch_unwind_silent(|| memex_core::embed::load_model(&path_owned, "embedding-gemma-300m"))
-        .is_ok_and(|r| r.is_ok())
-}
 
-/// Run a closure with panic output silenced.
-///
-/// The `ort` crate panics (rather than returning an error) when the ONNX
-/// Runtime shared library cannot be loaded.  `catch_unwind` catches the
-/// panic, but the default hook still prints a noisy backtrace to stderr.
-/// This helper installs a no-op panic hook for the duration of the call,
-/// then restores the original hook afterwards.
-fn catch_unwind_silent<F: FnOnce() -> R + std::panic::UnwindSafe, R>(f: F) -> Result<R, ()> {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(f).map_err(|_| ());
-    std::panic::set_hook(prev);
-    result
-}
 
 /// Embed a query string using the ONNX model or hash_embedding fallback.
 fn embed_query(text: &str) -> Vec<f32> {
@@ -156,8 +121,8 @@ fn embed_query(text: &str) -> Vec<f32> {
     if let Some(ref mp) = model_path
         && mp.exists()
         && let Some(path_str) = mp.to_str()
-        && let Ok(Ok(mut model)) =
-            catch_unwind_silent(|| memex_core::embed::load_model(path_str, "embedding-gemma-300m"))
+        && let Some(Ok(mut model)) =
+            memex_core::embed::catch_unwind_silent(|| memex_core::embed::load_model(path_str, "embedding-gemma-300m"))
     {
         memex_core::embed::embed_text(&mut model, text)
             .unwrap_or_else(|_| memex_core::embed::hash_embedding(text))
@@ -329,7 +294,7 @@ fn run_read(refs: &[String]) -> anyhow::Result<()> {
     for reference in refs {
         let docs = search.resolve_ref_documents(reference)?;
         if docs.is_empty() {
-            eprintln!("Not found: {reference}");
+            eprintln!("not found: {reference}");
             continue;
         }
         for doc in &docs {
@@ -459,8 +424,8 @@ fn embed_document(search: &memex_core::search::Bm25Search, hash: &str, body: &st
     if let Some(ref mp) = model_path
         && mp.exists()
         && let Some(path_str) = mp.to_str()
-        && let Ok(Ok(m)) =
-            catch_unwind_silent(|| memex_core::embed::load_model(path_str, "embedding-gemma-300m"))
+        && let Some(Ok(m)) =
+            memex_core::embed::catch_unwind_silent(|| memex_core::embed::load_model(path_str, "embedding-gemma-300m"))
     {
         model_opt = Some(m);
     }
@@ -497,33 +462,29 @@ fn embed_document(search: &memex_core::search::Bm25Search, hash: &str, body: &st
 }
 
 fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow::Result<()> {
-    // 1. Get content: piped stdin or interactive $EDITOR (like git commit).
+    // Phase 1 — input (no lock).
     let content = if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        // Piped: read from stdin.
         let mut buf = String::new();
         std::io::stdin().read_to_string(&mut buf)?;
         buf
     } else {
-        // Interactive terminal: open $EDITOR with a template.
         open_editor_for_page(name)?
     };
 
-    // 2. Normalize name to kebab-case.
     let stem = slugify(name);
     if stem.is_empty() {
         anyhow::bail!("Name slugifies to empty string: {name:?}");
     }
 
-    // 3. Validate frontmatter.
-    let (fm, body) =
-        memex_core::validate::parse_frontmatter(&content).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (fm, body) = memex_core::validate::parse_frontmatter(&content)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     if fm.title.trim().is_empty() {
         anyhow::bail!("Page title is empty");
     }
 
-    // 4. Lazy init — Memex::open creates wiki/ and DB.
+    // Phase 2 — acquire writer lock.
     let root = memex_cli::memex_root();
-    let memex = Memex::open(root.clone())?;
+    let memex = memex_core::Memex::open_writer(root.clone())?;
     let search = memex.search();
 
     let wiki_dir = memex.wiki_dir();
@@ -531,54 +492,40 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
     let rel_path = Path::new("wiki").join(format!("{stem}.md"));
     let rel_path_str = rel_path.to_string_lossy().to_string();
 
-    // 5. Conflict detection: if page exists and --force not set, show conflict and exit.
     let is_overwrite = search.lookup_stem(&stem)?.is_some();
     if is_overwrite && !force {
         let existing_modified = search
             .get_last_modified(&rel_path)
-            .ok()
-            .flatten()
+            .ok().flatten()
             .unwrap_or_else(|| "unknown".to_string());
         let existing_title = memex_core::index::extract_title_and_summary(
             &std::fs::read_to_string(&page_path).unwrap_or_default(),
             120,
-        )
-        .map(|(t, _)| t)
-        .unwrap_or_default();
+        ).map(|(t, _)| t).unwrap_or_default();
         println!("conflict: {stem}");
         println!("existing: \"{existing_title}\" (updated_at {existing_modified})");
         return Ok(());
     }
 
-    // 6. Capture old content hash before overwrite (for orphan cleanup).
     let old_hash: Option<String> = if is_overwrite {
         search.get_document_hash(&rel_path_str)?
-    } else {
-        None
-    };
+    } else { None };
 
-    // 7. Forward linking.
+    // Forward linking
     let existing_pages = search.all_stems_and_titles()?;
     let (linked_body, linked_stems) =
         memex_core::crosslink::forward_link(&body, &existing_pages, &stem);
 
-    // Detect suggest-create candidates: wiki links that don't match any existing stem.
     let suggest_create: Vec<String> = memex_core::validate::extract_wiki_links(&linked_body)
         .into_iter()
         .filter(|link| link != &stem && !existing_pages.iter().any(|(s, _)| s == link))
         .collect();
 
-    // 8. Reconstruct page content with linked body.
     let final_content = reconstruct_page(&content, &linked_body);
-
-    // 9. Write file to disk.
     memex_core::storage::atomic_write(&page_path, final_content.as_bytes())?;
 
-    // 10. Insert content into content-addressable store.
     let hash = search.insert_content(&final_content)?;
 
-    // 11. Allocate docid.
-    //     On --force overwrite, reuse the existing docid so it stays stable.
     let docid = if is_overwrite {
         search.lookup_path_docid(&rel_path)?.unwrap_or_else(|| {
             let existing = search.existing_docids().unwrap_or_default();
@@ -591,51 +538,31 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
         memex_core::docid::allocate_docid(&hash, "wiki", &rel_path_str, &existing_vec)
     };
 
-    // 12. Compute summary.
-    let summary = fm
-        .summary
-        .clone()
+    let summary = fm.summary.clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| memex_core::index::extract_summary(&linked_body, 120));
-
-    // 13. Insert/update documents row.
     let tags = fm.tags.join(", ");
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let created_at = if is_overwrite {
-        fm.created_at
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    } else {
-        now.clone()
-    };
+        fm.created_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    } else { now.clone() };
     search.upsert_document(
-        "wiki",
-        &rel_path_str,
-        &fm.title,
-        &hash,
-        &docid,
-        &tags,
-        &summary,
-        &created_at,
-        &now,
+        "wiki", &rel_path_str, &fm.title, &hash, &docid, &tags, &summary, &created_at, &now,
     )?;
 
-    // 14. Chunk and embed the wiki page body (use linked body for consistency
-    //     with the stored content hash, which is for the linked content).
     embed_document(search, &hash, &linked_body);
 
-    // 15. Orphan cleanup: if --force overwrite and hash changed, clean up old content.
-    // cleanup_orphaned_content already deletes associated chunks internally.
     if let Some(ref old_h) = old_hash
         && old_h != &hash
     {
         let _ = search.cleanup_orphaned_content(old_h);
     }
 
-    // 16. Handle --source: ingest source files.
+    // Source ingestion
     for source_path_str in sources {
         let source_path = std::path::PathBuf::from(source_path_str);
         if !source_path.exists() {
-            eprintln!("Warning: source not found: {source_path_str}");
+            eprintln!("warning: source not found: {source_path_str} (skipping)");
             continue;
         }
         let source_path = std::fs::canonicalize(&source_path)?;
@@ -646,93 +573,63 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
         let existing_vec: Vec<String> = existing_docids.into_iter().collect();
         let source_docid =
             memex_core::docid::allocate_docid(&source_hash, "source", &source_abs, &existing_vec);
-        let source_title = source_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let source_title = source_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
         let source_summary = memex_core::index::extract_summary(&source_content, 120);
         search.upsert_document(
-            "source",
-            &source_abs,
-            &source_title,
-            &source_hash,
-            &source_docid,
-            "",
-            &source_summary,
-            &now,
-            &now,
+            "source", &source_abs, &source_title, &source_hash,
+            &source_docid, "", &source_summary, &now, &now,
         )?;
-
-        // Chunk and embed source document.
         embed_document(search, &source_hash, &source_content);
     }
 
-    // 17. Get wiki page count.
     let wiki_page_count = search.wiki_page_count()?;
 
-    // 18. Backward linking (always runs; --quiet only suppresses output).
+    // Backward linking with failure reporting
     let mut backlinked_stems: Vec<String> = Vec::new();
-    {
-        for entry in std::fs::read_dir(&wiki_dir)? {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let other_stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            if other_stem == stem {
-                continue;
-            }
-            let other_content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let other_result = memex_core::validate::parse_frontmatter(&other_content);
-            let (_, other_body) = match other_result {
-                Ok(pair) => pair,
-                Err(_) => continue,
-            };
-            let (updated_body, was_linked) = memex_core::crosslink::backward_link_page(
-                &other_body,
-                &stem,
-                &fm.title,
-                &other_stem,
-            );
-            if was_linked {
-                // Rewrite the file with the updated body.
-                let updated_content = reconstruct_page(&other_content, &updated_body);
-                if memex_core::storage::atomic_write(&path, updated_content.as_bytes()).is_err() {
-                    continue;
-                }
+    let mut backlink_failed: Vec<(String, String)> = Vec::new();
 
-                // Re-index using the real file content hash (not a synthetic one)
-                // so that lint stale-index checks stay consistent.
-                let other_rel = Path::new("wiki").join(format!("{other_stem}.md"));
-                let other_rel_str = other_rel.to_string_lossy().to_string();
-                let old_other_hash = search
-                    .get_document_hash(&other_rel_str)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                let _ = search.reindex_page_from_content(
-                    &other_rel_str,
-                    &updated_content,
-                    &old_other_hash,
+    match std::fs::read_dir(&wiki_dir) {
+        Ok(iter) => {
+            for entry in iter {
+                let entry = match entry { Ok(e) => e, Err(_) => continue };
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
+                let other_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+                if other_stem == stem { continue; }
+                let other_content = match std::fs::read_to_string(&path) { Ok(c) => c, Err(_) => continue };
+                let (_, other_body) = match memex_core::validate::parse_frontmatter(&other_content) {
+                    Ok(pair) => pair, Err(_) => continue,
+                };
+                let (updated_body, was_linked) = memex_core::crosslink::backward_link_page(
+                    &other_body, &stem, &fm.title, &other_stem,
                 );
-                backlinked_stems.push(other_stem);
+                if !was_linked { continue; }
+
+                let updated_content = reconstruct_page(&other_content, &updated_body);
+                match memex_core::storage::atomic_write(&path, updated_content.as_bytes()) {
+                    Ok(()) => {
+                        let other_rel = Path::new("wiki").join(format!("{other_stem}.md"));
+                        let other_rel_str = other_rel.to_string_lossy().to_string();
+                        let old_other_hash = search.get_document_hash(&other_rel_str).ok().flatten().unwrap_or_default();
+                        let _ = search.reindex_page_from_content(&other_rel_str, &updated_content, &old_other_hash);
+                        backlinked_stems.push(other_stem);
+                    }
+                    Err(e) => {
+                        let reason = match &e {
+                            memex_core::error::MemexError::FileOpExhausted { .. } => "file busy after retry".to_string(),
+                            other => format!("{other}"),
+                        };
+                        backlink_failed.push((other_stem, reason));
+                    }
+                }
             }
+        }
+        Err(e) => {
+            backlink_failed.push(("(scan)".into(), format!("could not scan wiki dir: {e}")));
         }
     }
 
-    // 19. Output.
+    // Output
     println!("written: {docid}");
     println!("wiki_pages: {wiki_page_count}");
     if !quiet {
@@ -746,37 +643,73 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
             println!("suggest-create: {}", suggest_create.join(", "));
         }
     }
+    if !backlink_failed.is_empty() {
+        for (stem, reason) in &backlink_failed {
+            println!("backlink-failed: {stem} ({reason})");
+        }
+        println!("backlink-failed-count: {}", backlink_failed.len());
+    }
 
     Ok(())
 }
 
 fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
     let root = memex_cli::memex_root();
-    let memex = Memex::open(root.clone())?;
-    let search = memex.search();
 
-    // 1. Resolve via three-tier resolution — must be exactly one wiki document.
-    let docs = search.resolve_ref_documents(page_ref)?;
+    // Phase 1: resolve + confirm (reader, no lock).
+    let reader = memex_core::Memex::open(root.clone())?;
+    let rs = reader.search();
+    let docs = rs.resolve_ref_documents(page_ref)?;
     if docs.is_empty() {
-        eprintln!("Not found: {page_ref}");
-        std::process::exit(1);
+        die(format!("not found: {page_ref}"));
     }
     let wiki_docs: Vec<_> = docs.iter().filter(|d| d.collection == "wiki").collect();
     if wiki_docs.is_empty() {
-        eprintln!("Error: {page_ref} resolves to a source document, not a wiki page");
-        std::process::exit(1);
+        die(format!("Error: {page_ref} resolves to a source document, not a wiki page"));
     }
     if wiki_docs.len() > 1 {
-        eprintln!(
-            "Error: {page_ref} is ambiguous, matches {} documents",
-            wiki_docs.len()
-        );
-        std::process::exit(1);
+        die(format!("Error: {page_ref} is ambiguous, matches {} documents", wiki_docs.len()));
     }
-    let doc = wiki_docs[0];
-    let path = std::path::PathBuf::from(&doc.path);
+    let doc_pre = wiki_docs[0];
+    let confirmed_docid = doc_pre.docid.clone();
+    let confirmed_title = doc_pre.title.clone();
 
-    // 2. Path traversal guard.
+    if !force {
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        if is_tty {
+            let path = std::path::PathBuf::from(&doc_pre.path);
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            eprint!("Delete {stem} \"{confirmed_title}\"? [y/N] ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).ok();
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                eprintln!("Aborted.");
+                return Ok(());
+            }
+        }
+    }
+    drop(reader);  // release SQLite conn before taking writer lock
+
+    // Phase 2: acquire writer lock + re-resolve by docid.
+    let memex = memex_core::Memex::open_writer(root.clone())?;
+    let search = memex.search();
+    let docs2 = search.resolve_ref_documents(page_ref)?;
+    let wiki_docs2: Vec<_> = docs2.iter().filter(|d| d.collection == "wiki").collect();
+    let doc = match wiki_docs2.first() {
+        Some(d) if d.docid == confirmed_docid => *d,
+        Some(d) => {
+            die(format!(
+                "Error: {page_ref} changed between confirmation and delete \
+                 (confirmed: docid={confirmed_docid}, now: docid={}). Re-run to verify.",
+                d.docid
+            ));
+        }
+        None => {
+            die(format!("Error: {page_ref} no longer exists (another process deleted it)."));
+        }
+    };
+
+    let path = std::path::PathBuf::from(&doc.path);
     let full_path = root.join(&path);
     let canonical = full_path.canonicalize().unwrap_or(full_path.clone());
     {
@@ -788,47 +721,19 @@ fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
         }
     }
 
-    // 3. Derive stem.
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default()
-        .to_string();
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
     let docid = doc.docid.clone();
-    let title = doc.title.clone();
 
-    // 4. Confirm if TTY and --force not set. Agents (not a TTY) skip automatically.
-    if !force {
-        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
-        if is_tty {
-            eprint!("Delete {stem} \"{title}\"? [y/N] ");
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer).ok();
-            if !answer.trim().eq_ignore_ascii_case("y") {
-                eprintln!("Aborted.");
-                return Ok(());
-            }
-        }
-    }
-
-    // 5. Find pages with incoming links to this page (will become dangling).
+    // Phase 3 (under lock): find dangling, remove file, delete row.
     let wiki_dir = memex.wiki_dir();
     let mut dangling_pages: Vec<String> = Vec::new();
     if wiki_dir.is_dir() {
         for entry in std::fs::read_dir(&wiki_dir)? {
             let entry = entry?;
             let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
-            }
-            let other_stem = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            if other_stem == stem {
-                continue;
-            }
+            if p.extension().and_then(|e| e.to_str()) != Some("md") { continue; }
+            let other_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+            if other_stem == stem { continue; }
             let other_content = std::fs::read_to_string(&p).unwrap_or_default();
             let links = memex_core::validate::extract_wiki_links(&other_content);
             if links.iter().any(|l| l == &stem) {
@@ -837,14 +742,10 @@ fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
         }
     }
 
-    // 6. Delete file from disk.
-    std::fs::remove_file(&full_path)?;
-
-    // 7. Delete documents row with orphan cleanup (FTS trigger fires).
+    memex_core::storage::retry_io(&full_path, "remove wiki file", || std::fs::remove_file(&full_path))?;
     let path_str = path.to_string_lossy().to_string();
     search.delete_document_with_cleanup(&path_str)?;
 
-    // 8. Output.
     let wiki_count = search.wiki_page_count()?;
     println!("deleted: {docid}");
     println!("wiki_pages: {wiki_count}");
@@ -857,140 +758,85 @@ fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
 
 fn run_lint(fix: bool) -> anyhow::Result<()> {
     let root = memex_cli::memex_root();
-    let memex = Memex::open(root)?;
+    let memex = memex_core::Memex::open(root)?;
     let report = memex.lint()?;
 
-    if report.issues.is_empty() && !fix {
-        println!("No issues found.");
+    if !fix {
+        if report.issues.is_empty() {
+            println!("No issues found.");
+            return Ok(());
+        }
+        for issue in &report.issues {
+            match issue.kind {
+                memex_core::types::LintIssueKind::StaleIndex =>
+                    println!("stale-index: {} (file modified, index outdated)", issue.page),
+                memex_core::types::LintIssueKind::DanglingLink =>
+                    println!("dangling: {} -> [[{}]]", issue.page, issue.target),
+                memex_core::types::LintIssueKind::MissingLink =>
+                    println!("missing-link: {} -> [[{}]]", issue.page, issue.target),
+                memex_core::types::LintIssueKind::UntrackedFile =>
+                    println!("untracked: {} (no DB row)", issue.target),
+                memex_core::types::LintIssueKind::MissingFile =>
+                    println!("missing-file: {} (DB row, no file)", issue.page),
+                memex_core::types::LintIssueKind::OutdatedEmbedding =>
+                    println!("outdated-embeddings: {} ({})", issue.page, issue.target),
+            }
+        }
         return Ok(());
     }
 
-    // If --fix, attempt to fix stale-index and outdated-embedding issues first,
-    // then report remaining.
-    let mut remaining_issues = Vec::new();
-    let mut fixed_count = 0;
+    // --fix path: per-fix lock with re-verify via apply_fix_locked.
+    let mut applied = 0usize;
+    let mut stale = 0usize;
+    let mut remaining: Vec<&memex_core::types::LintIssue> = Vec::new();
 
     for issue in &report.issues {
-        if fix && issue.kind == LintIssueKind::StaleIndex {
-            // Fix stale index: re-read file from disk, update content + documents row.
-            let search = memex.search();
-            let full_path = memex.root().join(&issue.target);
-            let rel_path = &issue.target;
-            match std::fs::read_to_string(&full_path) {
-                Ok(content) => {
-                    // Get old hash for orphan cleanup.
-                    let old_hash = search
-                        .get_document_hash(rel_path)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
-                    match search.reindex_page_from_content(rel_path, &content, &old_hash) {
-                        Ok(()) => {
-                            // Re-embed after reindex so the page retains vector coverage.
-                            // Orphan cleanup deletes old chunks; we need fresh ones.
-                            let new_hash = search
-                                .get_document_hash(rel_path)
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
-                            let body = memex_core::validate::parse_frontmatter(&content)
-                                .map(|(_, b)| b)
-                                .unwrap_or_else(|_| content.clone());
-                            embed_document(search, &new_hash, &body);
-                            println!("fixed: {} (reindexed from disk)", issue.page);
-                            fixed_count += 1;
-                            continue;
+        // Only StaleIndex and OutdatedEmbedding have auto-fix paths.
+        match issue.kind {
+            memex_core::types::LintIssueKind::StaleIndex
+            | memex_core::types::LintIssueKind::OutdatedEmbedding => {
+                match memex.apply_fix_locked(issue) {
+                    Ok(memex_core::FixOutcome::Applied) => {
+                        match issue.kind {
+                            memex_core::types::LintIssueKind::StaleIndex =>
+                                println!("fixed: {} (reindexed from disk)", issue.page),
+                            memex_core::types::LintIssueKind::OutdatedEmbedding =>
+                                println!("re-embedded: {}", issue.page),
+                            _ => unreachable!(),
                         }
-                        Err(e) => {
-                            eprintln!("Error fixing {}: {e}", issue.page);
-                        }
+                        applied += 1;
+                    }
+                    Ok(memex_core::FixOutcome::Stale) => {
+                        println!("already-fixed: {}", issue.page);
+                        stale += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Error: failed to fix {}", issue.page);
+                        eprintln!("  caused by: {e}");
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error reading {}: {e}", issue.target);
-                }
             }
-        }
-        remaining_issues.push(issue);
-    }
-
-    // If --fix, re-embed all chunks with outdated model — but only if the
-    // real ONNX model is available.  Without it, embed_document falls back to
-    // hash-embedding which would write the same "hash-embedding" model name,
-    // creating an infinite re-embed loop on every lint --fix.
-    if fix {
-        let onnx_available = onnx_model_available();
-        let search = memex.search();
-        let outdated_hashes =
-            search.outdated_chunk_hashes(memex_core::embed::CURRENT_MODEL_NAME)?;
-        if !outdated_hashes.is_empty() {
-            if !onnx_available {
-                eprintln!(
-                    "note: {} documents have hash-based embeddings; \
-                     install the ONNX model to upgrade them",
-                    outdated_hashes.len()
-                );
-            } else {
-                let mut re_embedded = 0usize;
-                for hash in &outdated_hashes {
-                    let full_content = match search.get_content(hash) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            eprintln!("Error reading content for hash {hash}: {e}");
-                            continue;
-                        }
-                    };
-                    let body = memex_core::validate::parse_frontmatter(&full_content)
-                        .map(|(_, b)| b)
-                        .unwrap_or(full_content);
-                    embed_document(search, hash, &body);
-                    re_embedded += 1;
-                }
-                if re_embedded > 0 {
-                    println!("re-embedded: {re_embedded} documents (model upgrade)");
-                    fixed_count += re_embedded;
-                    // Remove OutdatedEmbedding issues since they've been fixed.
-                    remaining_issues.retain(|i| i.kind != LintIssueKind::OutdatedEmbedding);
-                }
-            }
+            _ => remaining.push(issue),
         }
     }
 
-    if remaining_issues.is_empty() && fixed_count > 0 {
-        return Ok(());
-    }
-
-    if remaining_issues.is_empty() {
-        println!("No issues found.");
-        return Ok(());
-    }
-
-    for issue in &remaining_issues {
+    for issue in remaining {
         match issue.kind {
-            LintIssueKind::StaleIndex => {
-                println!(
-                    "stale-index: {} (file modified, index outdated)",
-                    issue.page
-                );
-            }
-            LintIssueKind::DanglingLink => {
-                println!("dangling: {} -> [[{}]]", issue.page, issue.target);
-            }
-            LintIssueKind::MissingLink => {
-                println!("missing-link: {} -> [[{}]]", issue.page, issue.target);
-            }
-            LintIssueKind::UntrackedFile => {
-                println!("untracked: {} (no DB row)", issue.target);
-            }
-            LintIssueKind::MissingFile => {
-                println!("missing-file: {} (DB row, no file)", issue.page);
-            }
-            LintIssueKind::OutdatedEmbedding => {
-                println!("outdated-embeddings: {} ({})", issue.page, issue.target);
-            }
+            memex_core::types::LintIssueKind::DanglingLink =>
+                println!("dangling: {} -> [[{}]]", issue.page, issue.target),
+            memex_core::types::LintIssueKind::MissingLink =>
+                println!("missing-link: {} -> [[{}]]", issue.page, issue.target),
+            memex_core::types::LintIssueKind::UntrackedFile =>
+                println!("untracked: {} (no DB row)", issue.target),
+            memex_core::types::LintIssueKind::MissingFile =>
+                println!("missing-file: {} (DB row, no file)", issue.page),
+            _ => {}
         }
     }
 
+    if applied + stale > 0 {
+        println!("lint-fix-summary: applied={applied} stale={stale}");
+    }
     Ok(())
 }
 
@@ -1039,44 +885,122 @@ fn init_ort_runtime() {
 
     for path in &candidates {
         if path.exists() {
-            let _ = catch_unwind_silent(|| memex_core::embed::init_runtime(path));
+            let _ = memex_core::embed::catch_unwind_silent(|| memex_core::embed::init_runtime(path));
             return;
         }
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+/// Print an error message and exit with code 1. Used for `run_delete`'s
+/// hard-fail paths (ref not found, ambiguous, wrong collection, TOCTOU
+/// detection). These bypass `main()`'s `actionable_hint` pipeline on purpose
+/// — the messages are complete diagnostic output, and there's no `MemexError`
+/// variant that would add a useful hint.
+fn die(msg: impl std::fmt::Display) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(1);
+}
 
-    match cli.command {
-        Commands::Search {
-            query,
-            lex,
-            vec,
-            hyde,
-            expand,
-        } => {
-            init_ort_runtime();
-            run_search(&query, &lex, &vec, &hyde, &expand)?;
-        }
-        Commands::Read { refs } => run_read(&refs)?,
-        Commands::Write {
-            name,
-            force,
-            quiet,
-            sources,
-        } => {
-            init_ort_runtime();
-            run_write(&name, force, quiet, &sources)?;
-        }
-        Commands::Delete { page_ref, force } => run_delete(&page_ref, force)?,
-        Commands::Lint { fix } => {
-            if fix {
-                init_ort_runtime();
+fn main() {
+    let cli = Cli::parse();
+    let result = dispatch(cli);
+    let exit_code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            let mut src = e.source();
+            while let Some(s) = src {
+                eprintln!("  caused by: {s}");
+                src = s.source();
             }
-            run_lint(fix)?;
+            if let Some(hint) = actionable_hint(&e) {
+                eprintln!("{hint}");
+            }
+            exit_code_for(&e)
+        }
+    };
+    std::process::exit(exit_code);
+}
+
+fn dispatch(cli: Cli) -> anyhow::Result<()> {
+    match cli.command {
+        Commands::Search { query, lex, vec, hyde, expand } => {
+            init_ort_runtime();
+            run_search(&query, &lex, &vec, &hyde, &expand)
+        }
+        Commands::Read { refs } => run_read(&refs),
+        Commands::Write { name, force, quiet, sources } => {
+            init_ort_runtime();
+            run_write(&name, force, quiet, &sources)
+        }
+        Commands::Delete { page_ref, force } => run_delete(&page_ref, force),
+        Commands::Lint { fix } => {
+            if fix { init_ort_runtime(); }
+            run_lint(fix)
         }
     }
+}
 
-    Ok(())
+fn exit_code_for(err: &anyhow::Error) -> i32 {
+    for cause in err.chain() {
+        if let Some(me) = cause.downcast_ref::<memex_core::error::MemexError>() {
+            return match me {
+                memex_core::error::MemexError::LockTimeout { .. } => 2,
+                memex_core::error::MemexError::FileOpExhausted { .. } => 3,
+                _ => 1,
+            };
+        }
+    }
+    1
+}
+
+fn actionable_hint(err: &anyhow::Error) -> Option<String> {
+    use memex_core::error::MemexError;
+    let me = err.chain().find_map(|c| c.downcast_ref::<MemexError>())?;
+    use std::io::ErrorKind as K;
+    Some(match me {
+        MemexError::LockTimeout { lock_path, .. } => format!(
+            "To see the holder: `lsof {}` (macOS/Linux) or SysInternals `handle.exe` (Windows).\n\
+             If your workload legitimately needs longer, raise MEMEX_LOCK_TIMEOUT_SECONDS.",
+            lock_path.display()
+        ),
+        MemexError::LockAcquireIo { lock_path, source } => {
+            let parent = lock_path.parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "its parent directory".into());
+            match source.kind() {
+                K::PermissionDenied => format!(
+                    "Check permissions on {} (is {} writable by your user?).",
+                    lock_path.display(), parent
+                ),
+                K::NotFound => format!(
+                    "Parent directory of {} is missing. Create {} or check your MEMEX_ROOT.",
+                    lock_path.display(), parent
+                ),
+                _ => format!("Underlying I/O: check {}'s path and permissions.", lock_path.display()),
+            }
+        },
+        MemexError::FileOpExhausted { .. } => String::from(
+            "A process likely has the file open (editor, cloud sync, antivirus, backup).\n\
+             Close any programs using that file, then retry."
+        ),
+        MemexError::FileOpFailed { path, source, .. } => match source.kind() {
+            K::NotFound => format!("Check that the parent directory of {} exists.", path.display()),
+            K::PermissionDenied => format!(
+                "Check write permission on the parent directory of {}.", path.display()
+            ),
+            K::InvalidInput | K::InvalidData => format!(
+                "The path {} is invalid or contains unsupported characters.", path.display()
+            ),
+            _ => return None,
+        },
+        MemexError::MalformedConfig { path, .. } => format!(
+            "Edit {} to fix the issue, or delete it to fall back to defaults.",
+            path.display()
+        ),
+        MemexError::InvalidEnvVar { var, .. } => format!(
+            "Set {var} to a number between 1 and 3600 (seconds), e.g. `export {var}=60`."
+        ),
+        _ => return None,
+    })
 }
