@@ -36,7 +36,10 @@ fn search_with_content() {
     let root = dir.path().join("memex");
 
     // Write via CLI so the page is indexed in the DB before searching.
-    let content = make_page("Caching Strategies", "Content about caching and performance.");
+    let content = make_page(
+        "Caching Strategies",
+        "Content about caching and performance.",
+    );
     let out = run_write(&root, "caching", &content, &[]);
     assert!(
         out.status.success(),

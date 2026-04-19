@@ -31,21 +31,24 @@ pub enum MemexError {
     #[error("cannot acquire writer lock at {}: {source}", lock_path.display())]
     LockAcquireIo {
         lock_path: std::path::PathBuf,
-        #[source] source: std::io::Error,
+        #[source]
+        source: std::io::Error,
     },
 
     #[error("file operation failed after retries: {operation} on {}", path.display())]
     FileOpExhausted {
         path: std::path::PathBuf,
         operation: &'static str,
-        #[source] source: std::io::Error,
+        #[source]
+        source: std::io::Error,
     },
 
     #[error("file operation failed: {operation} on {}", path.display())]
     FileOpFailed {
         path: std::path::PathBuf,
         operation: &'static str,
-        #[source] source: std::io::Error,
+        #[source]
+        source: std::io::Error,
     },
 
     #[error("malformed config file at {}: {reason}", path.display())]
@@ -102,8 +105,14 @@ mod parallel_access_tests {
             lock_path: PathBuf::from("/tmp/.lock"),
         };
         let msg = format!("{err}");
-        assert!(msg.contains("120s"), "expected timeout in message, got: {msg}");
-        assert!(msg.contains("/tmp/.lock"), "expected path in message, got: {msg}");
+        assert!(
+            msg.contains("120s"),
+            "expected timeout in message, got: {msg}"
+        );
+        assert!(
+            msg.contains("/tmp/.lock"),
+            "expected path in message, got: {msg}"
+        );
     }
 
     #[test]

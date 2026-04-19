@@ -39,7 +39,11 @@ fn cleanup_ignores_non_memex_dotfiles() {
     std::fs::write(&ds_store, "").unwrap();
     std::fs::write(&swp, "").unwrap();
     let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
-    filetime::set_file_mtime(&ds_store, filetime::FileTime::from_system_time(two_hours_ago)).unwrap();
+    filetime::set_file_mtime(
+        &ds_store,
+        filetime::FileTime::from_system_time(two_hours_ago),
+    )
+    .unwrap();
     filetime::set_file_mtime(&swp, filetime::FileTime::from_system_time(two_hours_ago)).unwrap();
 
     let _m = Memex::open_writer(root).unwrap();
@@ -57,7 +61,13 @@ fn sigkilled_writer_releases_lock_via_os() {
     let lock_path = root.join(".lock");
     std::fs::write(&lock_path, "").unwrap();
 
-    let has_flock = Command::new("flock").arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    let has_flock = Command::new("flock")
+        .arg("--help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
     if !has_flock {
         eprintln!("flock(1) not available; skipping sigkill test");
         return;
@@ -68,16 +78,23 @@ fn sigkilled_writer_releases_lock_via_os() {
         .arg(&lock_path)
         .arg("--command")
         .arg("sleep 10")
-        .stdout(Stdio::null()).stderr(Stdio::null())
-        .spawn().unwrap();
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
 
-    std::thread::sleep(Duration::from_millis(100));  // let child grab lock
+    std::thread::sleep(Duration::from_millis(100)); // let child grab lock
 
-    unsafe { libc::kill(child.id() as i32, libc::SIGKILL); }
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGKILL);
+    }
     let _ = child.wait();
 
     let start = std::time::Instant::now();
     let result = Memex::open_writer_with_timeout(root, Duration::from_millis(500));
-    assert!(result.is_ok(), "open_writer after SIGKILL failed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "open_writer after SIGKILL failed: {result:?}"
+    );
     assert!(start.elapsed() < Duration::from_millis(500));
 }

@@ -2205,10 +2205,13 @@ mod parallel_access_tests {
         let search = Bm25Search::open(&db_path).unwrap();
 
         // Query the pragma — SQLite exposes current busy_timeout in ms.
-        let timeout_ms: i64 = search.with_connection(|conn| {
-            Ok(conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))
-                .unwrap())
-        }).unwrap();
+        let timeout_ms: i64 = search
+            .with_connection(|conn| {
+                Ok(conn
+                    .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                    .unwrap())
+            })
+            .unwrap();
 
         assert_eq!(timeout_ms, 5000);
     }

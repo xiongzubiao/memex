@@ -6,6 +6,8 @@ pub mod embed;
 pub mod error;
 pub mod index;
 pub mod lint;
+pub mod model;
+pub mod retrieval;
 pub mod schema;
 pub mod search;
 pub mod storage;
@@ -116,16 +118,18 @@ impl Memex {
         }
 
         let lock_path = root.join(".lock");
-        let lock_file = storage::try_acquire_lock(&lock_path, config.lock_timeout)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::TimedOut => error::MemexError::LockTimeout {
-                    timeout_secs: config.lock_timeout.as_secs(),
-                    lock_path: lock_path.clone(),
-                },
-                _ => error::MemexError::LockAcquireIo {
-                    lock_path: lock_path.clone(),
-                    source: e,
-                },
+        let lock_file =
+            storage::try_acquire_lock(&lock_path, config.lock_timeout).map_err(|e| {
+                match e.kind() {
+                    std::io::ErrorKind::TimedOut => error::MemexError::LockTimeout {
+                        timeout_secs: config.lock_timeout.as_secs(),
+                        lock_path: lock_path.clone(),
+                    },
+                    _ => error::MemexError::LockAcquireIo {
+                        lock_path: lock_path.clone(),
+                        source: e,
+                    },
+                }
             })?;
         let writer_lock = WriterLock { file: lock_file };
 
@@ -213,8 +217,10 @@ impl Memex {
         }
 
         let lock_path = self.root.join(".lock");
-        let lock_file = storage::try_acquire_lock(&lock_path, self.config.lock_timeout)
-            .map_err(|e| match e.kind() {
+        let lock_file =
+            storage::try_acquire_lock(&lock_path, self.config.lock_timeout).map_err(|e| match e
+                .kind()
+            {
                 std::io::ErrorKind::TimedOut => error::MemexError::LockTimeout {
                     timeout_secs: self.config.lock_timeout.as_secs(),
                     lock_path: lock_path.clone(),
@@ -246,7 +252,12 @@ impl Memex {
         root: PathBuf,
         timeout: std::time::Duration,
     ) -> error::Result<Self> {
-        Self::open_writer_with_config(root, Config { lock_timeout: timeout })
+        Self::open_writer_with_config(
+            root,
+            Config {
+                lock_timeout: timeout,
+            },
+        )
     }
 }
 
@@ -351,10 +362,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("memex");
         let _holder = Memex::open_writer(root.clone()).unwrap();
-        let result = Memex::open_writer_with_timeout(
-            root,
-            std::time::Duration::from_millis(100),
-        );
+        let result = Memex::open_writer_with_timeout(root, std::time::Duration::from_millis(100));
         assert!(matches!(result, Err(error::MemexError::LockTimeout { .. })));
     }
 

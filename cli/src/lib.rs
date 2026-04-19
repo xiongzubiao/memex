@@ -1,3 +1,5 @@
+pub mod daemon;
+
 use std::path::PathBuf;
 
 pub fn memex_root() -> PathBuf {

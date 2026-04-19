@@ -22,12 +22,18 @@ pub(crate) fn is_transient_io_error(err: &std::io::Error) -> bool {
     use std::io::ErrorKind::*;
 
     // Definitely permanent — fail fast.
-    if matches!(err.kind(), NotFound | InvalidInput | InvalidData | UnexpectedEof) {
+    if matches!(
+        err.kind(),
+        NotFound | InvalidInput | InvalidData | UnexpectedEof
+    ) {
         return false;
     }
 
     // Definitely transient by kind.
-    if matches!(err.kind(), WouldBlock | Interrupted | ResourceBusy | TimedOut) {
+    if matches!(
+        err.kind(),
+        WouldBlock | Interrupted | ResourceBusy | TimedOut
+    ) {
         return true;
     }
 
@@ -51,7 +57,13 @@ pub(crate) fn is_transient_io_error(err: &std::io::Error) -> bool {
             const ERROR_SHARING_VIOLATION: i32 = 32;
             const ERROR_LOCK_VIOLATION: i32 = 33;
             const ERROR_ACCESS_DENIED: i32 = 5;
-            if [ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, ERROR_ACCESS_DENIED].contains(&code) {
+            if [
+                ERROR_SHARING_VIOLATION,
+                ERROR_LOCK_VIOLATION,
+                ERROR_ACCESS_DENIED,
+            ]
+            .contains(&code)
+            {
                 return true;
             }
         }
@@ -85,9 +97,14 @@ pub fn inject_atomic_write_failures(n: usize) {
 fn test_injected_failure() -> Option<std::io::Error> {
     TEST_FAILURE_COUNT.with(|c| {
         let remaining = c.get();
-        if remaining == 0 { return None; }
+        if remaining == 0 {
+            return None;
+        }
         c.set(remaining - 1);
-        Some(std::io::Error::new(std::io::ErrorKind::WouldBlock, "test-injected"))
+        Some(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "test-injected",
+        ))
     })
 }
 
@@ -100,7 +117,10 @@ where
     F: FnMut() -> std::io::Result<()>,
 {
     let mut last_err: Option<std::io::Error> = None;
-    for (attempt, delay) in std::iter::once(&Duration::ZERO).chain(RETRY_SCHEDULE).enumerate() {
+    for (attempt, delay) in std::iter::once(&Duration::ZERO)
+        .chain(RETRY_SCHEDULE)
+        .enumerate()
+    {
         if attempt > 0 {
             std::thread::sleep(*delay);
         }
@@ -166,7 +186,10 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> crate::error::Result<()> {
 /// `timeout` elapses. Contention errors (WouldBlock) cause continued polling;
 /// any other I/O error returns immediately so the caller can distinguish
 /// `LockTimeout` (retry-worthy) from `LockAcquireIo` (configuration problem).
-pub(crate) fn try_acquire_lock(lock_path: &Path, timeout: std::time::Duration) -> std::io::Result<fs::File> {
+pub(crate) fn try_acquire_lock(
+    lock_path: &Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<fs::File> {
     use fs2::FileExt;
     let file = fs::OpenOptions::new()
         .create(true)
@@ -175,9 +198,13 @@ pub(crate) fn try_acquire_lock(lock_path: &Path, timeout: std::time::Duration) -
         .open(lock_path)?;
 
     let is_contention = |e: &std::io::Error| -> bool {
-        if matches!(e.kind(), std::io::ErrorKind::WouldBlock) { return true; }
+        if matches!(e.kind(), std::io::ErrorKind::WouldBlock) {
+            return true;
+        }
         #[cfg(windows)]
-        if e.raw_os_error() == Some(33) { return true; }  // ERROR_LOCK_VIOLATION
+        if e.raw_os_error() == Some(33) {
+            return true;
+        } // ERROR_LOCK_VIOLATION
         false
     };
 
@@ -249,12 +276,22 @@ pub(crate) fn is_memex_tmp_name(name: &str) -> bool {
     };
     let mut parts = rest.rsplitn(3, '.');
     let (Some(nonce), Some(pid), Some(basename)) = (parts.next(), parts.next(), parts.next())
-    else { return false; };
+    else {
+        return false;
+    };
 
-    if nonce.len() != 8 || !nonce.chars().all(|c| c.is_ascii_hexdigit()) { return false; }
-    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) { return false; }
-    let Some(stem) = basename.strip_suffix(".md") else { return false; };
-    if stem.is_empty() || stem.contains('.') { return false; }
+    if nonce.len() != 8 || !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    let Some(stem) = basename.strip_suffix(".md") else {
+        return false;
+    };
+    if stem.is_empty() || stem.contains('.') {
+        return false;
+    }
     true
 }
 
@@ -264,14 +301,23 @@ pub(crate) fn is_memex_tmp_name(name: &str) -> bool {
 /// tmp files from a concurrent writer aren't misidentified.
 pub(crate) fn cleanup_stale_tmp_files(wiki_dir: &Path) {
     let now = std::time::SystemTime::now();
-    for entry in walkdir::WalkDir::new(wiki_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() { continue; }
+    for entry in walkdir::WalkDir::new(wiki_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy();
-        if !is_memex_tmp_name(&name) { continue; }
+        if !is_memex_tmp_name(&name) {
+            continue;
+        }
 
         let Ok(meta) = entry.metadata() else { continue };
         let Ok(mtime) = meta.modified() else { continue };
-        let Ok(age) = now.duration_since(mtime) else { continue };
+        let Ok(age) = now.duration_since(mtime) else {
+            continue;
+        };
         if age >= STALE_TMP_AGE {
             let _ = fs::remove_file(entry.path());
         }
@@ -327,8 +373,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let lock_path = dir.path().join(".lock");
         let blocker = fs::OpenOptions::new()
-            .create(true).write(true).truncate(false)
-            .open(&lock_path).unwrap();
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
         blocker.lock_exclusive().unwrap();
 
         let result = try_acquire_lock(&lock_path, std::time::Duration::from_millis(100));
@@ -349,10 +398,17 @@ mod tests {
         let elapsed = start.elapsed();
 
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::NotFound,
-            "expected NotFound from missing parent dir, got {:?}", err.kind());
-        assert!(elapsed < std::time::Duration::from_millis(500),
-            "non-timeout error should return immediately, took {:?}", elapsed);
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "expected NotFound from missing parent dir, got {:?}",
+            err.kind()
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "non-timeout error should return immediately, took {:?}",
+            elapsed
+        );
     }
 
     #[test]
@@ -401,9 +457,14 @@ mod tests {
         let result = retry_io(&temp, "noop", || {
             Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
         });
-        assert!(matches!(result, Err(crate::error::MemexError::FileOpFailed { .. })));
-        assert!(start.elapsed() < std::time::Duration::from_millis(50),
-            "fast-fail should not wait the retry budget");
+        assert!(matches!(
+            result,
+            Err(crate::error::MemexError::FileOpFailed { .. })
+        ));
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(50),
+            "fast-fail should not wait the retry budget"
+        );
     }
 
     #[test]
@@ -412,7 +473,10 @@ mod tests {
         let result = retry_io(&temp, "noop", || {
             Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "busy"))
         });
-        assert!(matches!(result, Err(crate::error::MemexError::FileOpExhausted { .. })));
+        assert!(matches!(
+            result,
+            Err(crate::error::MemexError::FileOpExhausted { .. })
+        ));
     }
 
     #[test]
@@ -452,12 +516,30 @@ mod tests {
         assert!(!is_memex_tmp_name(".DS_Store"));
         assert!(!is_memex_tmp_name(".swp"));
         assert!(!is_memex_tmp_name("rest-patterns.md"));
-        assert!(!is_memex_tmp_name(".rest-patterns.md.tmp"), "missing pid+nonce");
-        assert!(!is_memex_tmp_name(".rest.patterns.md.12345.a1b2c3d4.tmp"), "stem must not contain dots");
-        assert!(!is_memex_tmp_name(".rest-patterns.txt.12345.a1b2c3d4.tmp"), "must end in .md");
-        assert!(!is_memex_tmp_name(".rest-patterns.md.abc.a1b2c3d4.tmp"), "pid must be digits");
-        assert!(!is_memex_tmp_name(".rest-patterns.md.12345.xxxxxxxx.tmp"), "nonce must be hex");
-        assert!(!is_memex_tmp_name(".rest-patterns.md.12345.a1b2c3d.tmp"), "nonce must be 8 chars");
+        assert!(
+            !is_memex_tmp_name(".rest-patterns.md.tmp"),
+            "missing pid+nonce"
+        );
+        assert!(
+            !is_memex_tmp_name(".rest.patterns.md.12345.a1b2c3d4.tmp"),
+            "stem must not contain dots"
+        );
+        assert!(
+            !is_memex_tmp_name(".rest-patterns.txt.12345.a1b2c3d4.tmp"),
+            "must end in .md"
+        );
+        assert!(
+            !is_memex_tmp_name(".rest-patterns.md.abc.a1b2c3d4.tmp"),
+            "pid must be digits"
+        );
+        assert!(
+            !is_memex_tmp_name(".rest-patterns.md.12345.xxxxxxxx.tmp"),
+            "nonce must be hex"
+        );
+        assert!(
+            !is_memex_tmp_name(".rest-patterns.md.12345.a1b2c3d.tmp"),
+            "nonce must be 8 chars"
+        );
     }
 
     #[test]
@@ -468,11 +550,20 @@ mod tests {
         std::fs::create_dir_all(&wiki).unwrap();
 
         let stale_path = wiki.join(".foo.md.99999.deadbeef.tmp");
-        OpenOptions::new().create(true).truncate(true).write(true).open(&stale_path).unwrap();
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&stale_path)
+            .unwrap();
 
         // Backdate mtime to 2 hours ago.
         let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-        filetime::set_file_mtime(&stale_path, filetime::FileTime::from_system_time(two_hours_ago)).unwrap();
+        filetime::set_file_mtime(
+            &stale_path,
+            filetime::FileTime::from_system_time(two_hours_ago),
+        )
+        .unwrap();
 
         cleanup_stale_tmp_files(&wiki);
 
@@ -487,11 +578,19 @@ mod tests {
         std::fs::create_dir_all(&wiki).unwrap();
 
         let fresh_path = wiki.join(".foo.md.99999.deadbeef.tmp");
-        OpenOptions::new().create(true).truncate(true).write(true).open(&fresh_path).unwrap();
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&fresh_path)
+            .unwrap();
         // mtime = now (default)
 
         cleanup_stale_tmp_files(&wiki);
-        assert!(fresh_path.exists(), "fresh tmp should NOT have been removed");
+        assert!(
+            fresh_path.exists(),
+            "fresh tmp should NOT have been removed"
+        );
     }
 
     #[test]
@@ -506,8 +605,13 @@ mod tests {
         std::fs::write(&swp, "").unwrap();
 
         let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-        filetime::set_file_mtime(&ds_store, filetime::FileTime::from_system_time(two_hours_ago)).unwrap();
-        filetime::set_file_mtime(&swp, filetime::FileTime::from_system_time(two_hours_ago)).unwrap();
+        filetime::set_file_mtime(
+            &ds_store,
+            filetime::FileTime::from_system_time(two_hours_ago),
+        )
+        .unwrap();
+        filetime::set_file_mtime(&swp, filetime::FileTime::from_system_time(two_hours_ago))
+            .unwrap();
 
         cleanup_stale_tmp_files(&wiki);
         assert!(ds_store.exists());

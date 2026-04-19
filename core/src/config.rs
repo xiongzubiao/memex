@@ -39,8 +39,8 @@ impl Config {
                 });
             }
             let raw = std::fs::read_to_string(&path)?;
-            let parsed: TomlConfig = toml::from_str(&raw)
-                .map_err(|e| MemexError::MalformedConfig {
+            let parsed: TomlConfig =
+                toml::from_str(&raw).map_err(|e| MemexError::MalformedConfig {
                     path: path.clone(),
                     reason: e.to_string(),
                 })?;
@@ -104,15 +104,21 @@ mod tests {
     impl ScopedEnv {
         fn set(key: &'static str, value: &str) -> Self {
             let prior = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value); }
+            unsafe {
+                std::env::set_var(key, value);
+            }
             Self { key, prior }
         }
     }
     impl Drop for ScopedEnv {
         fn drop(&mut self) {
             match &self.prior {
-                Some(v) => unsafe { std::env::set_var(self.key, v); },
-                None => unsafe { std::env::remove_var(self.key); },
+                Some(v) => unsafe {
+                    std::env::set_var(self.key, v);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
             }
         }
     }
@@ -137,7 +143,8 @@ mod tests {
         std::fs::write(
             dir.path().join("config.toml"),
             "[locking]\ntimeout_seconds = 60\n",
-        ).unwrap();
+        )
+        .unwrap();
         let cfg = Config::load(dir.path()).unwrap();
         assert_eq!(cfg.lock_timeout, Duration::from_secs(60));
     }
@@ -174,7 +181,8 @@ mod tests {
         std::fs::write(
             dir.path().join("config.toml"),
             "[locking]\ntimeout_seconds = 0\n",
-        ).unwrap();
+        )
+        .unwrap();
         match Config::load(dir.path()) {
             Err(MemexError::MalformedConfig { reason, .. }) => {
                 assert!(reason.contains("outside allowed range"));
@@ -185,7 +193,8 @@ mod tests {
         std::fs::write(
             dir.path().join("config.toml"),
             "[locking]\ntimeout_seconds = 99999999\n",
-        ).unwrap();
+        )
+        .unwrap();
         match Config::load(dir.path()) {
             Err(MemexError::MalformedConfig { .. }) => {}
             other => panic!("expected range MalformedConfig, got {other:?}"),
@@ -199,7 +208,8 @@ mod tests {
         std::fs::write(
             dir.path().join("config.toml"),
             "[locking]\ntimeout_seconds = 30\nfuture_knob = \"ok\"\n\n[unknown_section]\nx = 1\n",
-        ).unwrap();
+        )
+        .unwrap();
         let cfg = Config::load(dir.path()).unwrap();
         assert_eq!(cfg.lock_timeout, Duration::from_secs(30));
     }
@@ -215,7 +225,8 @@ mod tests {
         std::fs::write(
             dir.path().join("config.toml"),
             "[locking]\ntimeout_seconds = 60\n",
-        ).unwrap();
+        )
+        .unwrap();
         let _env = ScopedEnv::set("MEMEX_LOCK_TIMEOUT_SECONDS", "30");
         let cfg = Config::load(dir.path()).unwrap();
         assert_eq!(cfg.lock_timeout, Duration::from_secs(30));
@@ -253,6 +264,6 @@ mod tests {
         let mut contents = vec![0xEF, 0xBB, 0xBF];
         contents.extend_from_slice(b"[locking]\ntimeout_seconds = 30\n");
         std::fs::write(dir.path().join("config.toml"), contents).unwrap();
-        let _ = Config::load(dir.path());  // either Ok or Err MalformedConfig; no panic
+        let _ = Config::load(dir.path()); // either Ok or Err MalformedConfig; no panic
     }
 }
