@@ -1,14 +1,84 @@
 use ort::session::Session;
 use ort::value::Tensor;
 
-/// Initialize the ONNX Runtime from a specific dylib path.
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Keep the dylib Library handle alive for the process lifetime so the
+/// subsequent `ort::Session::builder` dlopen is a refcount bump, not a
+/// second full load.
+static LOADED_DYLIB: OnceLock<libloading::Library> = OnceLock::new();
+
+/// Candidate dylib paths, in priority order. First `~/.memex/lib/` (where
+/// the postinstall places it), then platform-standard install locations.
+fn candidate_dylib_paths() -> Vec<PathBuf> {
+    let lib_name = if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".memex/lib").join(lib_name));
+    }
+    if cfg!(target_os = "macos") {
+        candidates.push(PathBuf::from("/opt/homebrew/lib").join(lib_name));
+        candidates.push(PathBuf::from("/usr/local/lib").join(lib_name));
+    } else if cfg!(target_os = "linux") {
+        candidates.push(PathBuf::from("/usr/lib").join(lib_name));
+        candidates.push(PathBuf::from("/usr/lib/x86_64-linux-gnu").join(lib_name));
+    } else if cfg!(target_os = "windows") {
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            candidates.push(PathBuf::from(pf).join("onnxruntime/lib").join(lib_name));
+        }
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local).join("onnxruntime/lib").join(lib_name));
+        }
+    }
+    candidates
+}
+
+/// Discover and initialize the ONNX Runtime dylib from known install
+/// locations. `ort::init_from` alone is lazy and stores the path without
+/// loading, so bad or missing dylibs surface much later as a deadlock
+/// inside `Session::builder`. We pre-validate via a real `dlopen` and
+/// keep the Library handle alive for the process so ort's subsequent
+/// dlopen is a refcount bump rather than a second full load.
 ///
-/// Must be called before any `load_model` / `Session::builder` call when using
-/// the `load-dynamic` feature. Returns an error if the dylib cannot be loaded.
-/// Safe to call multiple times (subsequent calls are no-ops).
-pub fn init_runtime(dylib_path: &std::path::Path) -> crate::error::Result<()> {
-    ort::init_from(dylib_path)?.commit();
-    Ok(())
+/// Returns `Err` listing checked paths if no dylib is found.
+pub fn init_runtime() -> crate::error::Result<()> {
+    if LOADED_DYLIB.get().is_some() {
+        return Ok(());
+    }
+    let candidates = candidate_dylib_paths();
+    for path in &candidates {
+        if !path.exists() {
+            continue;
+        }
+        let lib = unsafe { libloading::Library::new(path) }.map_err(|e| {
+            crate::error::MemexError::Io(std::io::Error::other(format!("dlopen failed: {e}")))
+        })?;
+        let _ = LOADED_DYLIB.set(lib);
+        ort::init_from(path)?.commit();
+        return Ok(());
+    }
+    let checked = candidates
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    Err(crate::error::MemexError::Io(std::io::Error::other(
+        format!(
+            "libonnxruntime not found. Checked:\n  {checked}\n\
+             Install via `brew install onnxruntime` (macOS), your distro's \
+             package manager (Linux), or download from \
+             https://github.com/microsoft/onnxruntime/releases and place \
+             the dylib at ~/.memex/lib/."
+        ),
+    )))
 }
 
 /// Run a closure with panic output silenced, returning `Some(R)` on success
@@ -19,9 +89,7 @@ pub fn init_runtime(dylib_path: &std::path::Path) -> crate::error::Result<()> {
 /// but the default hook still prints a noisy backtrace to stderr. This helper
 /// installs a no-op panic hook for the duration of the call, then restores
 /// the original hook afterwards. The panic payload is discarded.
-pub fn catch_unwind_silent<F: FnOnce() -> R + std::panic::UnwindSafe, R>(
-    f: F,
-) -> Option<R> {
+pub fn catch_unwind_silent<F: FnOnce() -> R + std::panic::UnwindSafe, R>(f: F) -> Option<R> {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let result = std::panic::catch_unwind(f).ok();

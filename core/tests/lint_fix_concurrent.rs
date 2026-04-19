@@ -29,7 +29,9 @@ fn lint_fix_reverify_skips_already_fixed() {
     // Reader opens — its connection is created here.
     let reader = Memex::open(root.clone()).unwrap();
     let report = reader.lint().unwrap();
-    let stale: Vec<_> = report.issues.iter()
+    let stale: Vec<_> = report
+        .issues
+        .iter()
         .filter(|i| i.kind == memex_core::types::LintIssueKind::StaleIndex)
         .collect();
     assert_eq!(stale.len(), 1);
@@ -39,13 +41,16 @@ fn lint_fix_reverify_skips_already_fixed() {
     // sees auto-committed reads per statement and the regression (apply_fix_locked
     // using self.search instead of a fresh connection) would NOT manifest — the
     // test would false-pass.
-    reader.search().with_connection(|conn| {
-        conn.execute_batch("BEGIN DEFERRED").unwrap();
-        let _: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM documents", [], |r| r.get(0)
-        ).unwrap();
-        Ok(())
-    }).unwrap();
+    reader
+        .search()
+        .with_connection(|conn| {
+            conn.execute_batch("BEGIN DEFERRED").unwrap();
+            let _: i64 = conn
+                .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
 
     // Concurrent writer fixes the issue.
     {
@@ -54,7 +59,9 @@ fn lint_fix_reverify_skips_already_fixed() {
         std::thread::spawn(move || {
             let w = Memex::open_writer(r2).unwrap();
             w.apply_fix(&issue).unwrap();
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
     }
 
     // Reader's apply_fix_locked MUST use a FRESH connection to see the fixed
@@ -62,14 +69,19 @@ fn lint_fix_reverify_skips_already_fixed() {
     // pinned snapshot where disk=v2, DB=v1 (still stale), and attempt to
     // re-apply the fix.
     let outcome = reader.apply_fix_locked(stale[0]).unwrap();
-    assert!(matches!(outcome, FixOutcome::Stale),
-        "reader must see committed state via fresh connection, got {outcome:?}");
+    assert!(
+        matches!(outcome, FixOutcome::Stale),
+        "reader must see committed state via fresh connection, got {outcome:?}"
+    );
 
     // Release the reader's pinned transaction so TempDir can clean up.
-    reader.search().with_connection(|conn| {
-        conn.execute_batch("ROLLBACK").ok();  // ok if already rolled back
-        Ok(())
-    }).unwrap();
+    reader
+        .search()
+        .with_connection(|conn| {
+            conn.execute_batch("ROLLBACK").ok(); // ok if already rolled back
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]
@@ -93,7 +105,9 @@ fn apply_fix_locked_releases_lock_on_return() {
 
     let reader = Memex::open(root.clone()).unwrap();
     let report = reader.lint().unwrap();
-    let stale: Vec<_> = report.issues.iter()
+    let stale: Vec<_> = report
+        .issues
+        .iter()
         .filter(|i| i.kind == memex_core::types::LintIssueKind::StaleIndex)
         .collect();
     assert_eq!(stale.len(), 1);
@@ -108,8 +122,12 @@ fn apply_fix_locked_releases_lock_on_return() {
     let start = std::time::Instant::now();
     let second_writer = Memex::open_writer_with_timeout(root.clone(), Duration::from_millis(500));
     let elapsed = start.elapsed();
-    assert!(second_writer.is_ok(),
-        "expected immediate lock acquire after apply_fix_locked returned, got {second_writer:?} (elapsed {elapsed:?})");
-    assert!(elapsed < Duration::from_millis(200),
-        "lock was released but acquire took {elapsed:?} — slow?");
+    assert!(
+        second_writer.is_ok(),
+        "expected immediate lock acquire after apply_fix_locked returned, got {second_writer:?} (elapsed {elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "lock was released but acquire took {elapsed:?} — slow?"
+    );
 }

@@ -190,7 +190,7 @@ pub(crate) fn is_issue_still_present(
             // Stale means on-disk hash != stored hash. Re-read both.
             let full_path = root.join(&issue.target);
             let Ok(content) = std::fs::read_to_string(&full_path) else {
-                return Ok(false);  // file gone; nothing to fix
+                return Ok(false); // file gone; nothing to fix
             };
             let actual = crate::storage::content_hash(content.as_bytes());
             let stored = search.get_document_hash(&issue.target)?.unwrap_or_default();
@@ -248,7 +248,7 @@ pub(crate) fn apply_fix_inner(
             }
             Ok(())
         }
-        _ => Ok(()),  // report-only kinds
+        _ => Ok(()), // report-only kinds
     }
 }
 
@@ -277,7 +277,11 @@ fn apply_embedding(search: &Bm25Search, hash: &str, body: &str) {
             model_opt = Some(m);
         }
     }
-    let model_name = if model_opt.is_some() { "embedding-gemma-300m" } else { "hash-embedding" };
+    let model_name = if model_opt.is_some() {
+        "embedding-gemma-300m"
+    } else {
+        "hash-embedding"
+    };
 
     let _ = search.with_connection(|conn| {
         crate::vector::delete_chunks(conn, hash)?;
@@ -289,14 +293,19 @@ fn apply_embedding(search: &Bm25Search, hash: &str, body: &str) {
                 crate::embed::hash_embedding(&chunk.text)
             };
             let _ = crate::vector::store_chunk(
-                conn, hash, seq as i32, &chunk.text,
-                chunk.pos, chunk.len, model_name, &embedding,
+                conn,
+                hash,
+                seq as i32,
+                &chunk.text,
+                chunk.pos,
+                chunk.len,
+                model_name,
+                &embedding,
             );
         }
         Ok(())
     });
 }
-
 
 #[cfg(test)]
 mod tests {

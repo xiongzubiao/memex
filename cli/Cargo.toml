@@ -2,17 +2,33 @@
 name = "memex-cli"
 version = "0.1.0"
 edition = "2024"
+description = "CLI + query daemon for memex — personal wiki with agent-synthesized Q&A"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/memverge/memex"
+keywords = ["wiki", "search", "cli", "llm", "agent"]
+categories = ["command-line-utilities", "text-processing"]
 
 [[bin]]
 name = "memex"
 path = "src/main.rs"
 
 [dependencies]
-memex-core = { path = "../core" }
+memex-core = { path = "../core", version = "0.1" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
+async-channel = "2"
 dirs = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time", "fs", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+config = { version = "0.15", default-features = false, features = ["toml"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+fs2 = "0.4"
+libc = "0.2"
+thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
