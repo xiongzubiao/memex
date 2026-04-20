@@ -5,15 +5,8 @@
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-/// Reply from a worker for a synthesis job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SynthReply {
-    pub answer: String,
-    pub citations: Vec<String>,
-}
-
-/// Outcome of a worker's attempt to synthesize. Error variants are typed
-/// so the handler can map them to the right `DaemonError` code.
+/// Outcome of a worker's attempt. Error variants are typed so the handler
+/// can map them to the right `DaemonError` code.
 #[derive(Debug)]
 pub enum WorkerError {
     /// Subprocess crashed (EOF before terminal result, non-zero exit with
@@ -29,19 +22,6 @@ pub enum WorkerError {
     /// assistant text didn't parse as our expected JSON reply. Raw text
     /// is surfaced so the user can see what Claude said.
     AgentError(String),
-}
-
-pub type SynthResult = Result<SynthReply, WorkerError>;
-
-/// Synthesis job: context block + question → synthesized answer.
-#[derive(Debug)]
-pub struct SynthJob {
-    /// Already-formatted context block (all retrieved pages, rank-tagged).
-    pub context: String,
-    /// The user's question, verbatim.
-    pub question: String,
-    /// Worker sends the result here.
-    pub reply: oneshot::Sender<SynthResult>,
 }
 
 /// Reply from a worker for an expansion job. Each term is a single string
@@ -63,11 +43,85 @@ pub struct ExpandJob {
 
 pub type ExpandResult = Result<ExpandReply, WorkerError>;
 
+/// Reply from a worker for a synthesis job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SynthReply {
+    pub answer: String,
+    pub citations: Vec<String>,
+}
+
+/// Synthesis job: context block + question → synthesized answer.
+#[derive(Debug)]
+pub struct SynthJob {
+    /// Already-formatted context block (all retrieved pages, rank-tagged).
+    pub context: String,
+    /// The user's question, verbatim.
+    pub question: String,
+    /// Worker sends the result here.
+    pub reply: oneshot::Sender<SynthResult>,
+}
+
+pub type SynthResult = Result<SynthReply, WorkerError>;
+
+/// Reply from a worker for an ingest extraction job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestReply {
+    /// Wiki pages extracted from the transcript. Each has slug, title, tags, body.
+    pub pages: Vec<ExtractedPage>,
+}
+
+/// A wiki page extracted from a session transcript by the LLM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedPage {
+    pub slug: String,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub body: String,
+}
+
+pub type IngestResult = Result<IngestReply, WorkerError>;
+
+/// Ingest extraction job: cleaned transcript → wiki pages.
+#[derive(Debug)]
+pub struct IngestJob {
+    /// Cleaned transcript text (user + assistant + tool summaries).
+    pub transcript: String,
+    /// Worker sends the extracted pages here.
+    pub reply: oneshot::Sender<IngestResult>,
+}
+
+/// Merge job: proposed page + existing page → merged page.
+#[derive(Debug)]
+pub struct MergeJob {
+    /// Pages to merge: each pair is (proposed new content, existing content).
+    pub pages: Vec<MergePair>,
+    /// Worker sends the merged pages here.
+    pub reply: oneshot::Sender<MergeResult>,
+}
+
+/// A pair of pages to merge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergePair {
+    pub slug: String,
+    pub proposed: String,
+    pub existing: String,
+}
+
+/// Reply from a merge job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeReply {
+    pub merged_pages: Vec<ExtractedPage>,
+}
+
+pub type MergeResult = Result<MergeReply, WorkerError>;
+
 /// Job enqueued onto the worker pool. Workers dispatch by variant.
 #[derive(Debug)]
 pub enum AgentJob {
-    Synth(SynthJob),
     Expand(ExpandJob),
+    Synth(SynthJob),
+    Ingest(IngestJob),
+    Merge(MergeJob),
 }
 
 /// Sender half. Cloneable; each producer clones one. Senders block

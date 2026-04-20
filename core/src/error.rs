@@ -10,6 +10,9 @@ pub enum MemexError {
     )]
     SchemaVersionMismatch { found: u32, expected: u32 },
 
+    #[error("Not found: {0}")]
+    NotFound(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

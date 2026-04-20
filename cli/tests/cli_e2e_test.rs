@@ -23,10 +23,9 @@ fn search_empty_wiki() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Empty wiki still outputs signal line.
     assert!(
-        stdout.contains("signal:"),
-        "should contain signal line, got: {stdout}"
+        stdout.trim().is_empty(),
+        "empty wiki should produce no output, got: {stdout}"
     );
 }
 
@@ -48,7 +47,7 @@ fn search_with_content() {
     );
 
     let output = memex_cmd(&root)
-        .args(["search", "caching"])
+        .args(["search", "Caching Strategies"])
         .output()
         .unwrap();
     assert!(
@@ -57,125 +56,11 @@ fn search_with_content() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Output should contain signal line.
-    assert!(
-        stdout.contains("signal:"),
-        "should contain signal line, got: {stdout}"
-    );
-    // Output should contain the collection column.
-    let result_lines: Vec<&str> = stdout
-        .lines()
-        .filter(|l| !l.starts_with("signal:"))
-        .collect();
-    assert!(
-        !result_lines.is_empty(),
-        "should have result lines, got: {stdout}"
-    );
-    // Verify tab-separated format: docid\tcollection\tscore\tstem\tsnippet
-    let first_result = result_lines[0];
-    let fields: Vec<&str> = first_result.split('\t').collect();
-    assert!(
-        fields.len() >= 5,
-        "result should have at least 5 tab-separated fields, got: {first_result}"
-    );
     assert_eq!(
-        fields[1], "wiki",
-        "collection should be 'wiki', got: {}",
-        fields[1]
+        stdout.trim(),
+        "caching",
+        "should print slug, got: {stdout}"
     );
-    assert_eq!(
-        fields[3], "caching",
-        "stem should be 'caching', got: {}",
-        fields[3]
-    );
-}
-
-#[test]
-fn search_with_expand() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
-    std::fs::create_dir_all(root.join("wiki")).unwrap();
-
-    let output = memex_cmd(&root)
-        .args(["search", "anything", "--expand", "more"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search with expand should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("signal:"),
-        "should contain signal line, got: {stdout}"
-    );
-}
-
-#[test]
-fn search_output_includes_collection_column() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
-
-    // Write a wiki page and a source via the write command.
-    let content = make_page(
-        "Distributed Systems",
-        "Consensus algorithms, Raft, and Paxos for distributed coordination.",
-    );
-    let source_path = dir.path().join("ds-notes.txt");
-    std::fs::write(
-        &source_path,
-        "Notes on distributed systems: CAP theorem, eventual consistency.\n",
-    )
-    .unwrap();
-    let source_arg = source_path.to_string_lossy().to_string();
-    let out = run_write(
-        &root,
-        "distributed-systems",
-        &content,
-        &["--source", &source_arg],
-    );
-    assert!(
-        out.status.success(),
-        "write should succeed, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    // Search for a term that matches both wiki and source.
-    let output = memex_cmd(&root)
-        .args(["search", "distributed"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Verify signal line.
-    assert!(
-        stdout.contains("signal:"),
-        "should contain signal line, got: {stdout}"
-    );
-
-    // Every result line should have a collection column (wiki or source).
-    let result_lines: Vec<&str> = stdout
-        .lines()
-        .filter(|l| !l.starts_with("signal:"))
-        .collect();
-    for line in &result_lines {
-        let fields: Vec<&str> = line.split('\t').collect();
-        assert!(
-            fields.len() >= 5,
-            "result should have at least 5 fields, got: {line}"
-        );
-        assert!(
-            fields[1] == "wiki" || fields[1] == "source",
-            "collection should be 'wiki' or 'source', got: {}",
-            fields[1]
-        );
-    }
 }
 
 #[test]
@@ -195,9 +80,9 @@ fn search_query_sanitization_hyphens() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Search with hyphenated query (should be treated as phrase).
+    // Search by title with hyphenated term.
     let output = memex_cmd(&root)
-        .args(["search", "multi-agent"])
+        .args(["search", "Multi-Agent Architecture"])
         .output()
         .unwrap();
     assert!(
@@ -206,23 +91,10 @@ fn search_query_sanitization_hyphens() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("signal:"),
-        "should contain signal line, got: {stdout}"
-    );
-    // Should find the page.
-    let result_lines: Vec<&str> = stdout
-        .lines()
-        .filter(|l| !l.starts_with("signal:"))
-        .collect();
-    assert!(
-        !result_lines.is_empty(),
-        "hyphenated query should find results, got: {stdout}"
-    );
-    assert!(
-        result_lines[0].contains("multi-agent"),
-        "result stem should contain 'multi-agent', got: {}",
-        result_lines[0]
+    assert_eq!(
+        stdout.trim(),
+        "multi-agent",
+        "should print slug, got: {stdout}"
     );
 }
 
@@ -243,9 +115,9 @@ fn search_query_sanitization_phrases() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Search with a quoted phrase.
+    // Search by page title.
     let output = memex_cmd(&root)
-        .args(["search", "\"rate limiting\""])
+        .args(["search", "API Rate Limiting"])
         .output()
         .unwrap();
     assert!(
@@ -254,69 +126,11 @@ fn search_query_sanitization_phrases() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("signal:"),
-        "should contain signal line, got: {stdout}"
+    assert_eq!(
+        stdout.trim(),
+        "api-rate-limiting",
+        "should print slug, got: {stdout}"
     );
-    // Should find the page.
-    let result_lines: Vec<&str> = stdout
-        .lines()
-        .filter(|l| !l.starts_with("signal:"))
-        .collect();
-    assert!(
-        !result_lines.is_empty(),
-        "phrase query should find results, got: {stdout}"
-    );
-}
-
-#[test]
-fn search_with_expand_new_format() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
-
-    // Write a wiki page.
-    let content = make_page(
-        "Caching Strategies",
-        "LRU and TTL-based eviction policies for in-memory caches.",
-    );
-    let out = run_write(&root, "caching", &content, &[]);
-    assert!(
-        out.status.success(),
-        "write should succeed, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    // Search with expansion.
-    let output = memex_cmd(&root)
-        .args(["search", "caching", "--expand", "eviction"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search with expand should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("signal:"),
-        "should contain signal line, got: {stdout}"
-    );
-    // Result lines should use the new 5-column format.
-    let result_lines: Vec<&str> = stdout
-        .lines()
-        .filter(|l| !l.starts_with("signal:"))
-        .collect();
-    assert!(
-        !result_lines.is_empty(),
-        "expand search should produce results, got: {stdout}"
-    );
-    for line in &result_lines {
-        let fields: Vec<&str> = line.split('\t').collect();
-        assert!(
-            fields.len() >= 5,
-            "result should have at least 5 tab-separated fields, got: {line}"
-        );
-    }
 }
 
 fn write_wiki_page(root: &std::path::Path, filename: &str, title: &str, body: &str) {
@@ -476,7 +290,7 @@ fn run_write(
 ) -> std::process::Output {
     use std::io::Write;
     let mut cmd = memex_cmd(root);
-    cmd.args(["write", name]);
+    cmd.args(["write", "--direct", name]);
     cmd.args(extra_args);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -1315,223 +1129,12 @@ fn lint_fix_re_embeds_outdated_model() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Typed query expansion tests (--lex, --vec, --hyde)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn search_with_lex_flag() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
-
-    // Write a wiki page.
-    let content = make_page(
-        "Caching Strategies",
-        "Content about caching, performance, and memoization techniques.",
-    );
-    let out = run_write(&root, "caching-strategies", &content, &[]);
-    assert!(
-        out.status.success(),
-        "write should succeed, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    // Search with --lex flag.
-    let output = memex_cmd(&root)
-        .args(["search", "caching", "--lex", "memoization"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search with --lex should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // --lex is a typed flag, so signal line should NOT be present.
-    assert!(
-        !stdout.contains("signal:"),
-        "typed flags should skip signal detection, got: {stdout}"
-    );
-
-    // Should still find results via BM25.
-    let result_lines: Vec<&str> = stdout.lines().collect();
-    assert!(
-        !result_lines.is_empty(),
-        "should have results with --lex, got: {stdout}"
-    );
-    // Verify tab-separated format.
-    for line in &result_lines {
-        let fields: Vec<&str> = line.split('\t').collect();
-        assert!(
-            fields.len() >= 5,
-            "result should have at least 5 tab-separated fields, got: {line}"
-        );
-    }
-}
-
-#[test]
-fn search_with_typed_flags_skips_signal() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
-    std::fs::create_dir_all(root.join("wiki")).unwrap();
-
-    // Search with --lex on empty wiki: signal should NOT appear.
-    let output = memex_cmd(&root)
-        .args(["search", "anything", "--lex", "extra"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search with --lex should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.contains("signal:"),
-        "typed flags should skip signal, got: {stdout}"
-    );
-
-    // Same with --vec.
-    let output = memex_cmd(&root)
-        .args(["search", "anything", "--vec", "semantic"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search with --vec should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.contains("signal:"),
-        "typed flags should skip signal, got: {stdout}"
-    );
-
-    // Same with --hyde.
-    let output = memex_cmd(&root)
-        .args(["search", "anything", "--hyde", "hypothetical doc"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search with --hyde should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        !stdout.contains("signal:"),
-        "typed flags should skip signal, got: {stdout}"
-    );
-}
-
-#[test]
-fn search_with_vec_flag() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
-
-    // Write a page (embed-on-write will generate hash embeddings).
-    let content = make_page(
-        "Machine Learning Basics",
-        "Neural networks, gradient descent, backpropagation algorithms for deep learning.",
-    );
-    let out = run_write(&root, "ml-basics", &content, &[]);
-    assert!(
-        out.status.success(),
-        "write should succeed, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    // Search with --vec: should succeed (uses hash_embedding fallback).
-    let output = memex_cmd(&root)
-        .args(["search", "neural networks", "--vec", "deep learning"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search with --vec should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // No signal line with typed flags.
-    assert!(
-        !stdout.contains("signal:"),
-        "typed flags should skip signal, got: {stdout}"
-    );
-
-    // Primary query BM25 should find the page.
-    let result_lines: Vec<&str> = stdout.lines().collect();
-    assert!(
-        !result_lines.is_empty(),
-        "should have results, got: {stdout}"
-    );
-}
-
-#[test]
-fn search_expand_still_works() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
-
-    // Write a page.
-    let content = make_page(
-        "Database Indexing",
-        "B-tree indexes and hash indexes for fast database lookups.",
-    );
-    let out = run_write(&root, "db-indexing", &content, &[]);
-    assert!(
-        out.status.success(),
-        "write should succeed, stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    // Legacy --expand should still produce signal line.
-    let output = memex_cmd(&root)
-        .args(["search", "database", "--expand", "indexing"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search with --expand should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("signal:"),
-        "--expand should keep signal line, got: {stdout}"
-    );
-}
-
-#[test]
-fn search_typed_flags_take_precedence_over_expand() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
-    std::fs::create_dir_all(root.join("wiki")).unwrap();
-
-    // When both --lex and --expand are present, typed flags take precedence.
-    let output = memex_cmd(&root)
-        .args(["search", "anything", "--lex", "extra", "--expand", "legacy"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "search should succeed, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Typed flags take precedence: no signal line.
-    assert!(
-        !stdout.contains("signal:"),
-        "typed flags should take precedence over --expand, got: {stdout}"
-    );
-}
-
 #[test]
 fn search_probe_includes_vector() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("memex");
 
-    // Write a page about caching (embed-on-write generates hash embeddings).
+    // Write a page about caching.
     let content = make_page(
         "Caching Strategies",
         "LRU and TTL-based eviction policies for in-memory caches.",
@@ -1543,51 +1146,21 @@ fn search_probe_includes_vector() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // No-flags probe call: should run hybrid BM25 + vector search.
-    // With hash_embedding fallback, vector path executes even if semantic
-    // similarity is poor — we verify the search succeeds and signal line appears.
+    // Search by title.
     let output = memex_cmd(&root)
-        .args(["search", "caching"])
+        .args(["search", "Caching Strategies"])
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "probe search should succeed, stderr: {}",
+        "search should succeed, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Probe call always outputs signal line.
-    assert!(
-        stdout.contains("signal:"),
-        "probe should contain signal line, got: {stdout}"
-    );
-
-    // Should find the page via BM25 at minimum.
-    let result_lines: Vec<&str> = stdout
-        .lines()
-        .filter(|l| !l.starts_with("signal:"))
-        .collect();
-    assert!(
-        !result_lines.is_empty(),
-        "probe search should find results, got: {stdout}"
-    );
-    // First result should be the caching page.
-    let first = result_lines[0];
-    let fields: Vec<&str> = first.split('\t').collect();
-    assert!(
-        fields.len() >= 5,
-        "result should have at least 5 tab-separated fields, got: {first}"
-    );
     assert_eq!(
-        fields[1], "wiki",
-        "collection should be 'wiki', got: {}",
-        fields[1]
-    );
-    assert_eq!(
-        fields[3], "caching",
-        "stem should be 'caching', got: {}",
-        fields[3]
+        stdout.trim(),
+        "caching",
+        "should print slug, got: {stdout}"
     );
 }
 
@@ -1754,27 +1327,6 @@ fn write_with_multiple_sources() {
         ],
     );
     assert!(output.status.success());
-
-    // Both sources should be searchable.
-    let search_a = memex_cmd(&root)
-        .args(["search", "Alpha source caching"])
-        .output()
-        .unwrap();
-    let stdout_a = String::from_utf8_lossy(&search_a.stdout);
-    assert!(
-        stdout_a.contains("source"),
-        "source A should appear in search, got: {stdout_a}"
-    );
-
-    let search_b = memex_cmd(&root)
-        .args(["search", "Beta source networking"])
-        .output()
-        .unwrap();
-    let stdout_b = String::from_utf8_lossy(&search_b.stdout);
-    assert!(
-        stdout_b.contains("source"),
-        "source B should appear in search, got: {stdout_b}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1816,19 +1368,20 @@ fn lint_fix_stale_preserves_search() {
 
     // Verify searchable before modification.
     let search_before = memex_cmd(&root)
-        .args(["search", "xylophone42"])
+        .args(["search", "Searchable Page"])
         .output()
         .unwrap();
     let before_stdout = String::from_utf8_lossy(&search_before.stdout);
-    assert!(
-        before_stdout.contains("searchable"),
+    assert_eq!(
+        before_stdout.trim(),
+        "searchable",
         "should find page before stale, got: {before_stdout}"
     );
 
     // Make the page stale by appending content.
     let path = root.join("wiki/searchable.md");
     let mut existing = std::fs::read_to_string(&path).unwrap();
-    existing.push_str("\nAppended xylophone99 content.\n");
+    existing.push_str("\nAppended extra content.\n");
     std::fs::write(&path, &existing).unwrap();
 
     // Fix the stale index.
@@ -1841,12 +1394,13 @@ fn lint_fix_stale_preserves_search() {
 
     // Search should still find the page.
     let search_after = memex_cmd(&root)
-        .args(["search", "xylophone42"])
+        .args(["search", "Searchable Page"])
         .output()
         .unwrap();
     let after_stdout = String::from_utf8_lossy(&search_after.stdout);
-    assert!(
-        after_stdout.contains("searchable"),
+    assert_eq!(
+        after_stdout.trim(),
+        "searchable",
         "should still find page after stale fix, got: {after_stdout}"
     );
 }

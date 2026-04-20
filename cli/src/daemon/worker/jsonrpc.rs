@@ -1,6 +1,6 @@
-//! Shared JSON-RPC 2.0 primitives for the codex (`app-server`) and gemini
-//! (`--acp`) workers. Claude uses stream-json, not JSON-RPC, so it doesn't
-//! consume this module.
+//! Shared JSON-RPC 2.0 primitives for the codex (`app-server`) and gemini cli
+//! (`--acp`) workers. Claude Code uses stream-json, not JSON-RPC, so it
+//! doesn't consume this module.
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ pub(super) struct RpcError {
 }
 
 /// stdin/stdout halves of a JSON-RPC subprocess plus an incrementing id
-/// counter. Shared I/O primitives for codex and gemini workers.
+/// counter. Shared I/O primitives for codex and gemini cli workers.
 pub(super) struct RpcClient {
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,

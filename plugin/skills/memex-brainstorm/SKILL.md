@@ -15,18 +15,18 @@ then save the result to the wiki. Falls back to varied-angle single-model brains
 
 ## Discovery
 
-Check available CLIs: `which claude codex gemini 2>/dev/null`
+Check available CLIs: `which claude codex gemini 2>/dev/null` (binary names for Claude Code, Codex, Gemini CLI)
 
 ## Pipeline
 
 1. **Propose** (parallel): host agent + each available CLI generate proposals
    - `codex --quiet "Propose 3 approaches for: <topic>"`
-   - `gemini "Propose 3 approaches for: <topic>"`
+   - `gemini "Propose 3 approaches for: <topic>"` (Gemini CLI)
    - Host agent also proposes
 2. **Merge**: host agent synthesizes all proposals
 3. **Review** (parallel): external CLIs critique the merged design
    - `codex --quiet "Review for weaknesses: <merged>"`
-   - `gemini "Review for weaknesses: <merged>"`
+   - `gemini "Review for weaknesses: <merged>"` (Gemini CLI)
 4. **Iterate**: incorporate feedback, repeat until converged
 5. **Write**: `echo "<result>" | memex write "Design Topic"`
 

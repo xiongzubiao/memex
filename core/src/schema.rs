@@ -90,6 +90,18 @@ CREATE TABLE IF NOT EXISTS chunks (
     embedding   BLOB,
     PRIMARY KEY(hash, seq)
 );
+
+CREATE TABLE IF NOT EXISTS ingest_jobs (
+    job_id          TEXT PRIMARY KEY,
+    transcript_path TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    agent           TEXT NOT NULL,
+    memex_root      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    error           TEXT
+);
 "#;
 
 pub fn init_schema(conn: &Connection) -> Result<()> {

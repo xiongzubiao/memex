@@ -7,6 +7,7 @@ Cross-platform behavioral instructions for any AI agent using the memex plugin.
 - `/memex-query` — Search personal wiki and synthesize answers
 - `/memex-ingest` — Read source material and create wiki pages
 - `/memex-brainstorm` — Multi-LLM brainstorming via external CLIs
+- `memex backfill <agent>` — CLI command to batch-import existing agent sessions via daemon
 
 ## Proactive Behavior
 
@@ -31,3 +32,20 @@ If yes, update via `memex write --force`.
 ### Trigger 3: Wiki health check
 
 When the user asks about wiki health, issues, or maintenance, run `memex lint` and report findings.
+
+## Session Knowledge Capture
+
+When you discover something significant during this session — a design decision,
+a debugging finding, an architectural insight, or a "we tried X and it failed
+because Y" — capture it to memex.
+
+Search first: `memex search <topic>`. If a slug is printed, a page exists.
+Read it with `memex read <slug>`, then overwrite with updated content via
+`memex write --force <slug>` (pipe updated content via stdin).
+If no output, create a new page: `memex write <page-name>`.
+
+Do not capture mechanical operations (file reads, test runs, greps).
+Capture knowledge that would be valuable if this topic comes up again.
+
+This serves as compaction recovery — if your context gets compacted, query
+memex to recover earlier findings you captured.

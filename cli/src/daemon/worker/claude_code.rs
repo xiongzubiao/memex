@@ -1,4 +1,4 @@
-//! Claude subprocess worker.
+//! Claude Code subprocess worker.
 //!
 //! Spawns `claude -p --input-format stream-json --output-format stream-json ...`
 //! once per worker and keeps it warm across jobs. Each job is one turn: write
@@ -53,8 +53,8 @@ impl ClaudeSubprocess {
                 "LOGNAME",
                 "CLAUDE_CODE_OAUTH_TOKEN",
                 "ANTHROPIC_MODEL",
-                // Test fixture: selects mock-claude.sh behavior in integration tests.
-                "MOCK_CLAUDE_MODE",
+                // Test fixture: selects mock-claude-code.sh behavior in integration tests.
+                "MOCK_CLAUDE_CODE_MODE",
             ],
         );
 
@@ -119,6 +119,9 @@ impl ClaudeSubprocess {
                         if block.ty == "text"
                             && let Some(t) = block.text
                         {
+                            if answer.len() + t.len() > super::MAX_RESPONSE_BYTES {
+                                bail!("agent response exceeded 1MB limit");
+                            }
                             answer.push_str(&t);
                         }
                     }

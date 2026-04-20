@@ -1,7 +1,7 @@
 //! Shared JSON-reply parsers used by every agent worker. The agent prompt
 //! is identical across providers; so is the JSON output contract.
 
-use crate::daemon::queue::{ExpandReply, SynthReply};
+use crate::daemon::queue::{ExpandReply, ExtractedPage, IngestReply, MergeReply, SynthReply};
 use serde::Deserialize;
 
 /// Parse a synthesis reply. Returns `Err(raw_text)` if the payload doesn't
@@ -43,8 +43,38 @@ pub fn parse_expand(text: &str) -> Result<ExpandReply, String> {
     }
 }
 
+/// Parse an ingest extraction reply. Tries JSON first (safe from YAML alias
+/// expansion attacks), then YAML as fallback.
+pub fn parse_ingest(text: &str) -> Result<IngestReply, String> {
+    let cleaned = strip_code_fences(text);
+    if let Ok(pages) = serde_json::from_str::<Vec<ExtractedPage>>(cleaned) {
+        return Ok(IngestReply { pages });
+    }
+    if let Ok(pages) = serde_yaml::from_str::<Vec<ExtractedPage>>(cleaned) {
+        return Ok(IngestReply { pages });
+    }
+    Err(text.to_string())
+}
+
+/// Parse a merge reply. Same format as ingest: JSON first, YAML fallback.
+pub fn parse_merge(text: &str) -> Result<MergeReply, String> {
+    let cleaned = strip_code_fences(text);
+    if let Ok(pages) = serde_json::from_str::<Vec<ExtractedPage>>(cleaned)
+        && !pages.is_empty()
+    {
+        return Ok(MergeReply { merged_pages: pages });
+    }
+    if let Ok(pages) = serde_yaml::from_str::<Vec<ExtractedPage>>(cleaned)
+        && !pages.is_empty()
+    {
+        return Ok(MergeReply { merged_pages: pages });
+    }
+    Err(text.to_string())
+}
+
 fn strip_code_fences(text: &str) -> &str {
     text.trim()
+        .trim_start_matches("```yaml")
         .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_end_matches("```")

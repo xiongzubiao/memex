@@ -1,12 +1,12 @@
 {
   "hooks": {
-    "Stop": [
+    "SessionEnd": [
       {
         "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "memex ingest --agent codex",
+            "command": "memex ingest --agent gemini-cli",
             "timeout": 10
           }
         ]
@@ -14,11 +14,11 @@
     ],
     "SessionStart": [
       {
-        "matcher": "startup|resume",
         "hooks": [
           {
             "type": "command",
-            "command": "memex daemon start"
+            "command": "memex daemon start",
+            "name": "memex-daemon"
           }
         ]
       }

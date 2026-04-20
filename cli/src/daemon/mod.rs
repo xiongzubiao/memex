@@ -1,7 +1,7 @@
 //! Memex daemon subsystem.
 //!
-//! Plan 1 scope: IPC plumbing only (socket + flock + config + ping).
-//! Later plans add retrieval, agent workers, query expansion.
+//! IPC plumbing (socket + flock + config + ping), retrieval, agent workers,
+//! query expansion, and session ingestion.
 
 pub mod client;
 pub mod config;
@@ -146,6 +146,59 @@ pub fn status() -> Result<i32> {
             }
         }
     }
+}
+
+/// `memex ingest` entrypoint. Sends Request::Ingest to the daemon (auto-spawns if needed).
+/// Returns exit code (0 = queued, 1 = error/skipped).
+pub fn ingest(transcript_path: &str, agent: &str, root: &str) -> Result<i32> {
+    let paths = DaemonPaths::default_under(&memex_root());
+    let rt = tokio::runtime::Runtime::new()?;
+    let result: anyhow::Result<Vec<protocol::Event>> = rt.block_on(async {
+        let stream = client::connect_or_spawn(
+            &paths.socket,
+            &paths.lock,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await?;
+        let events = client::request(
+            stream,
+            &protocol::Request::Ingest {
+                v: 1,
+                transcript_path: transcript_path.to_string(),
+                agent: agent.to_string(),
+                memex_root: root.to_string(),
+            },
+        )
+        .await?;
+        Ok(events)
+    });
+
+    let events = match result {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("memex ingest: {e}");
+            return Ok(1);
+        }
+    };
+
+    let mut status_code = 1;
+    for ev in &events {
+        match ev {
+            protocol::Event::Queued { job_id, .. } => {
+                if !job_id.is_empty() {
+                    eprintln!("memex: queued {job_id}");
+                }
+            }
+            protocol::Event::Error { code, message, .. } => {
+                eprintln!("memex ingest error ({code}): {message}");
+            }
+            protocol::Event::Done { status } => {
+                status_code = *status;
+            }
+            _ => {}
+        }
+    }
+    Ok(status_code)
 }
 
 /// `memex query <question> --raw` entrypoint. Connects to the running daemon

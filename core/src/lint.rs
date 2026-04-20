@@ -204,11 +204,14 @@ pub(crate) fn is_issue_still_present(
             let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
             Ok(!outdated.is_empty())
         }
+        LintIssueKind::MissingFile => {
+            let full_path = root.join(&issue.target);
+            Ok(!full_path.exists())
+        }
         // Report-only kinds: always "present" (no auto-fix path).
         LintIssueKind::DanglingLink
         | LintIssueKind::MissingLink
-        | LintIssueKind::UntrackedFile
-        | LintIssueKind::MissingFile => Ok(true),
+        | LintIssueKind::UntrackedFile => Ok(true),
     }
 }
 
@@ -227,84 +230,45 @@ pub(crate) fn apply_fix_inner(
             let content = std::fs::read_to_string(&full_path)?;
             let old_hash = search.get_document_hash(&issue.target)?.unwrap_or_default();
             search.reindex_page_from_content(&issue.target, &content, &old_hash)?;
-            // Re-embed the new content. Uses hash_embedding fallback if ONNX unavailable.
-            let new_hash = search.get_document_hash(&issue.target)?.unwrap_or_default();
-            let body = crate::validate::parse_frontmatter(&content)
-                .map(|(_, b)| b)
-                .unwrap_or_else(|_| content.clone());
-            apply_embedding(search, &new_hash, &body);
+            // Re-embed the new content. Skipped if ONNX model unavailable.
+            if let Some(ref mut model) = crate::retrieval::load_default_model() {
+                let new_hash = search.get_document_hash(&issue.target)?.unwrap_or_default();
+                let body = crate::validate::parse_frontmatter(&content)
+                    .map(|(_, b)| b)
+                    .unwrap_or_else(|_| content.clone());
+                crate::retrieval::embed_document(search, &new_hash, &body, model);
+            }
             Ok(())
         }
         LintIssueKind::OutdatedEmbedding => {
-            // Pull the actual hash (issue.target contains "old-model => current")
-            // Fix by reading content and re-embedding.
-            let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
-            for hash in &outdated {
-                let full_content = search.get_content(hash)?;
-                let body = crate::validate::parse_frontmatter(&full_content)
-                    .map(|(_, b)| b)
-                    .unwrap_or(full_content);
-                apply_embedding(search, hash, &body);
+            if let Some(ref mut model) = crate::retrieval::load_default_model() {
+                let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
+                for hash in &outdated {
+                    let full_content = search.get_content(hash)?;
+                    let body = crate::validate::parse_frontmatter(&full_content)
+                        .map(|(_, b)| b)
+                        .unwrap_or(full_content);
+                    crate::retrieval::embed_document(search, hash, &body, model);
+                }
             }
+            Ok(())
+        }
+        LintIssueKind::MissingFile => {
+            // Restore the file from the content-addressable store.
+            let hash = search.get_document_hash(&issue.target)?.unwrap_or_default();
+            if hash.is_empty() {
+                return Ok(()); // no DB row to restore from
+            }
+            let content = search.get_content(&hash)?;
+            let full_path = root.join(&issue.target);
+            if let Some(parent) = full_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&full_path, content)?;
             Ok(())
         }
         _ => Ok(()), // report-only kinds
     }
-}
-
-/// Embed and persist chunks for a content hash. Uses hash_embedding fallback
-/// if ONNX model isn't available — keeps chunks populated so vector search
-/// works (with lower quality) even without the model installed.
-///
-/// Wraps `load_model` in `catch_unwind` because the `ort` crate panics
-/// (rather than returning Result::Err) when the ONNX Runtime shared library
-/// cannot be loaded. Without the panic guard, a missing libonnxruntime
-/// would crash the whole `lint --fix` process.
-fn apply_embedding(search: &Bm25Search, hash: &str, body: &str) {
-    let model_path = dirs::home_dir().map(|h| h.join(".memex/models/embedding-gemma-300m.onnx"));
-
-    let chunks = crate::embed::chunk_text(body, 900, 0.15);
-
-    let mut model_opt: Option<crate::embed::EmbeddingModel> = None;
-    if let Some(ref mp) = model_path
-        && mp.exists()
-        && let Some(path_str) = mp.to_str()
-    {
-        let path_owned = path_str.to_string();
-        if let Some(Ok(m)) = crate::embed::catch_unwind_silent(move || {
-            crate::embed::load_model(&path_owned, "embedding-gemma-300m")
-        }) {
-            model_opt = Some(m);
-        }
-    }
-    let model_name = if model_opt.is_some() {
-        "embedding-gemma-300m"
-    } else {
-        "hash-embedding"
-    };
-
-    let _ = search.with_connection(|conn| {
-        crate::vector::delete_chunks(conn, hash)?;
-        for (seq, chunk) in chunks.iter().enumerate() {
-            let embedding = if let Some(ref mut model) = model_opt {
-                crate::embed::embed_text(model, &chunk.text)
-                    .unwrap_or_else(|_| crate::embed::hash_embedding(&chunk.text))
-            } else {
-                crate::embed::hash_embedding(&chunk.text)
-            };
-            let _ = crate::vector::store_chunk(
-                conn,
-                hash,
-                seq as i32,
-                &chunk.text,
-                chunk.pos,
-                chunk.len,
-                model_name,
-                &embedding,
-            );
-        }
-        Ok(())
-    });
 }
 
 #[cfg(test)]

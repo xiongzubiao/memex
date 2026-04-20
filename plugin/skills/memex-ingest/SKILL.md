@@ -13,16 +13,22 @@ description: |
 Turn source material into wiki pages. Read the source, propose pages, check for
 duplicates, write with `--source` to keep the original searchable.
 
+## Arguments
+
+- First argument: path to the source file to ingest
+- `--source <path>` (optional): use this path for `memex write --source` instead of the
+  input file path. Useful when the input is a copy or extract of the original source.
+
 ## Pipeline
 
 1. Read source file using Read tool
 2. Summarize what the source contains
 3. Ask user: "I see content about X, Y, Z. What wiki pages should I create?"
 4. **Duplicate check** for each page: `memex search "<title>"`
-   - wiki match found → read existing page, ask user: merge or create new?
-   - source-only matches are not duplicates
-   - no match → create new page
+   - slug printed → existing page found, read it with `memex read <slug>`, ask user: merge or create new?
+   - no output → no match, create new page
 5. Write each page: `echo "<content>" | memex write "Title" --quiet --source /path`
+   Use the `--source` override path if provided, otherwise use the input file path.
    Use `--force` when merging into an existing page.
 6. Run `memex lint` for wiki-wide health check
 7. Report: pages created, lint findings
@@ -60,6 +66,5 @@ sources: []
 - Skipping the duplicate check — creates redundant wiki pages
 - Using `--force` without asking the user first — overwrites silently
 - Not running `memex lint` after batch writes — misses dangling links
-- Treating source-collection search hits as duplicates — only wiki hits matter
 - Using title-case in wiki links — `[[My Page]]` creates dangling links; use `[[my-page]]`
 - Missing frontmatter fields — `title`, `tags`, `created_at`, `updated_at` are all required

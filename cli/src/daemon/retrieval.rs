@@ -6,7 +6,7 @@
 //! cache, and reading the page body from disk.
 
 use memex_core::retrieval::{
-    self as core_retrieval, HybridResult, Signal, embed_query, hybrid_retrieve, load_default_model,
+    self as core_retrieval, HybridResult, Signal, embed_query, load_default_model,
 };
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
@@ -138,13 +138,11 @@ impl RetrievalActor {
         });
 
         let memex = self.get_or_open(&root)?;
-        let HybridResult { results, signal } = match &expansion_embedded {
-            Some(exp) => {
-                core_retrieval::hybrid_retrieve_expanded(memex.search(), question, &q_emb, exp)
-            }
-            None => hybrid_retrieve(memex.search(), question, &q_emb),
-        }
-        .map_err(|e| RetrievalError::Other(anyhow::anyhow!(e)))?;
+        let default_exp = core_retrieval::Expansion::default();
+        let exp = expansion_embedded.as_ref().unwrap_or(&default_exp);
+        let HybridResult { results, signal } =
+            core_retrieval::hybrid_retrieve_expanded(memex.search(), question, &q_emb, exp, false)
+                .map_err(|e| RetrievalError::Other(anyhow::anyhow!(e)))?;
 
         let mut pages = Vec::with_capacity(top_k);
         for r in results.into_iter().take(top_k) {

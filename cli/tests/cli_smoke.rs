@@ -28,7 +28,7 @@ fn write_under_contention_exits_2() {
         use std::io::Write;
         let mut cmd = memex_cmd(&root);
         cmd.env("MEMEX_LOCK_TIMEOUT_SECONDS", "1")
-            .arg("write")
+            .args(["write", "--direct"])
             .arg("foo")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())

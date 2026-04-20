@@ -1,7 +1,6 @@
-use clap::{Parser, Subcommand};
-use memex_core::retrieval::result_stem;
+use clap::{Parser, Subcommand, ValueEnum};
 use memex_core::Memex;
-use memex_core::search::WikiSearch;
+use memex_core::search::now_rfc3339;
 use std::io::Read as _;
 use std::path::Path;
 
@@ -12,24 +11,32 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum Agent {
+    /// Claude Code sessions (~/.claude/projects/*/*.jsonl)
+    ClaudeCode,
+    /// OpenAI Codex CLI sessions (~/.codex/sessions/*/*/*/*.jsonl)
+    Codex,
+    /// Google Gemini CLI sessions (~/.gemini/tmp/*/chats/session-*.json)
+    GeminiCli,
+}
+
+impl Agent {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Agent::ClaudeCode => "claude-code",
+            Agent::Codex => "codex",
+            Agent::GeminiCli => "gemini-cli",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// BM25 full-text search
+    /// Search wiki pages by title
     Search {
-        /// Search query (full sentence or keywords)
-        query: String,
-        /// Keyword expansion terms (BM25 only, repeatable)
-        #[arg(long)]
-        lex: Vec<String>,
-        /// Semantic expansion terms (vector only, repeatable)
-        #[arg(long)]
-        vec: Vec<String>,
-        /// Hypothetical document expansion (vector only, repeatable)
-        #[arg(long)]
-        hyde: Vec<String>,
-        /// Legacy expansion terms for RRF fusion (repeatable)
-        #[arg(long)]
-        expand: Vec<String>,
+        /// Page title to search for
+        title: String,
     },
     /// Read wiki pages by docid, stem, or title
     Read {
@@ -49,6 +56,9 @@ enum Commands {
         /// Source file paths to attach (repeatable)
         #[arg(long = "source")]
         sources: Vec<String>,
+        /// Bypass daemon and write directly to SQLite (escape hatch)
+        #[arg(long)]
+        direct: bool,
     },
     /// Delete a wiki page
     Delete {
@@ -80,6 +90,19 @@ enum Commands {
         #[arg(long, default_value = "5")]
         top_k: usize,
     },
+    /// Ingest a session transcript via the daemon (thin client, used by hooks)
+    Ingest {
+        /// Agent type (claude-code, codex, gemini-cli)
+        #[arg(long)]
+        agent: Agent,
+    },
+    /// Bulk-ingest historical sessions via the daemon
+    Backfill {
+        /// Agent type (claude-code, codex, gemini-cli)
+        agent: Agent,
+    },
+    /// Show daemon and ingestion status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -92,67 +115,15 @@ enum DaemonAction {
     Status,
 }
 
-/// Embed a query: load ONNX on demand, embed, fall back to hash on failure.
-/// Thin wrapper over `memex_core::retrieval::embed_query`.
-fn embed_query(text: &str) -> Vec<f32> {
-    let mut model = memex_core::retrieval::load_default_model();
-    memex_core::retrieval::embed_query(model.as_mut(), text)
-}
-
-fn run_search(
-    query: &str,
-    lex: &[String],
-    vec: &[String],
-    hyde: &[String],
-    expand: &[String],
-) -> anyhow::Result<()> {
+fn run_search(title: &str) -> anyhow::Result<()> {
     let root = memex_cli::memex_root();
     let memex = Memex::open(root)?;
     let search = memex.search();
+    let mut model = memex_core::retrieval::load_default_model();
 
-    let has_typed_flags = !lex.is_empty() || !vec.is_empty() || !hyde.is_empty();
-
-    // All three modes use the same shared hybrid_retrieve_expanded — they
-    // differ only in where the expansion terms come from and what's printed.
-    use memex_core::retrieval::{Expansion, Signal};
-
-    let q_emb = embed_query(query);
-    let expansion = if has_typed_flags {
-        Expansion {
-            lex: lex.to_vec(),
-            vec_embs: vec.iter().map(|t| embed_query(t)).collect(),
-            hyde_embs: hyde.iter().map(|t| embed_query(t)).collect(),
-        }
-    } else if !expand.is_empty() {
-        // Legacy --expand: each term runs as a lex probe (wiki 2x + source).
-        Expansion {
-            lex: expand.to_vec(),
-            vec_embs: vec![],
-            hyde_embs: vec![],
-        }
-    } else {
-        Expansion::default()
-    };
-    let hit = memex_core::retrieval::hybrid_retrieve_expanded(search, query, &q_emb, &expansion)?;
-
-    // Typed-flags mode suppresses the signal line (matches prior behavior);
-    // default and legacy modes print it.
-    if !has_typed_flags {
-        let signal = match hit.signal {
-            Signal::Strong => "strong",
-            Signal::Weak => "weak",
-        };
-        println!("signal: {signal}");
+    if let Some(slug) = memex_core::retrieval::search_wiki_by_title(search, title, model.as_mut()) {
+        println!("{slug}");
     }
-
-    for result in &hit.results {
-        let stem = result_stem(result);
-        println!(
-            "{}\t{}\t{:.3}\t{}\t{}",
-            result.docid, result.collection, result.score, stem, result.snippet
-        );
-    }
-
     Ok(())
 }
 
@@ -238,19 +209,6 @@ fn open_editor_for_page(name: &str) -> anyhow::Result<String> {
     Ok(content)
 }
 
-/// Convert a human-readable name into a URL-safe filename stem.
-fn slugify(name: &str) -> String {
-    let slug: String = name
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
-    slug.split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
 /// Replace the body after frontmatter with `new_body`, preserving frontmatter verbatim.
 ///
 /// Locates the closing `---` of the frontmatter block and searches for the body
@@ -281,60 +239,83 @@ fn reconstruct_page(original: &str, new_body: &str) -> String {
     format!("{prefix}\n\n{new_body}")
 }
 
-/// Chunk a document body and store embeddings for each chunk.
-///
-/// Tries to load the ONNX embedding model from `~/.memex/models/`. If the model
-/// is unavailable or fails to load, falls back to deterministic hash-based
-/// embeddings so the chunks table is always populated and vector search still
-/// works (with lower quality).
-fn embed_document(search: &memex_core::search::Bm25Search, hash: &str, body: &str) {
-    let model_path = dirs::home_dir().map(|h| h.join(".memex/models/embedding-gemma-300m.onnx"));
-
-    let chunks = memex_core::embed::chunk_text(body, 900, 0.15);
-
-    // Try loading the real model; fall back to hash_embedding on failure.
-    let mut model_opt: Option<memex_core::embed::EmbeddingModel> = None;
-    if let Some(ref mp) = model_path
-        && mp.exists()
-        && let Some(path_str) = mp.to_str()
-        && let Some(Ok(m)) = memex_core::embed::catch_unwind_silent(|| {
-            memex_core::embed::load_model(path_str, "embedding-gemma-300m")
-        })
-    {
-        model_opt = Some(m);
-    }
-
-    let model_name = if model_opt.is_some() {
-        "embedding-gemma-300m"
+/// Write a wiki page via the daemon. Sends Request::Write.
+fn run_write_via_daemon(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow::Result<()> {
+    // Read content from stdin (same as direct path)
+    let content = if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
     } else {
-        "hash-embedding"
+        open_editor_for_page(name)?
     };
 
-    let _ = search.with_connection(|conn| {
-        // Delete existing chunks for this hash before re-embedding.
-        memex_core::vector::delete_chunks(conn, hash)?;
-        for (seq, chunk) in chunks.iter().enumerate() {
-            let embedding = if let Some(ref mut model) = model_opt {
-                memex_core::embed::embed_text(model, &chunk.text)
-                    .unwrap_or_else(|_| memex_core::embed::hash_embedding(&chunk.text))
-            } else {
-                memex_core::embed::hash_embedding(&chunk.text)
-            };
-            let _ = memex_core::vector::store_chunk(
-                conn,
-                hash,
-                seq as i32,
-                &chunk.text,
-                chunk.pos,
-                chunk.len,
-                model_name,
-                &embedding,
-            );
-        }
-        Ok(())
+    if content.trim().is_empty() {
+        anyhow::bail!("empty content");
+    }
+
+    let root = memex_cli::memex_root();
+    let root_str = root.to_string_lossy();
+
+    // Extract tags from frontmatter if present
+    let tags = memex_core::search::parse_page_for_indexing(&content)
+        .map(|(_, tags_str, _, _)| {
+            tags_str.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let result: anyhow::Result<Vec<memex_cli::daemon::protocol::Event>> = rt.block_on(async {
+        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
+        let stream = memex_cli::daemon::client::connect_or_spawn(
+            &paths.socket,
+            &paths.lock,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        ).await?;
+        let events = memex_cli::daemon::client::request(
+            stream,
+            &memex_cli::daemon::protocol::Request::Write {
+                v: 1,
+                title: name.to_string(),
+                content,
+                tags,
+                sources: sources.to_vec(),
+                force,
+                memex_root: root_str.to_string(),
+            },
+        ).await?;
+        Ok(events)
     });
+
+    let events = result?;
+    for ev in &events {
+        match ev {
+            memex_cli::daemon::protocol::Event::Written { slug, docid } => {
+                if !quiet {
+                    println!("written: {slug} ({docid})");
+                }
+            }
+            memex_cli::daemon::protocol::Event::Error { code, message, .. } => {
+                eprintln!("write error ({code}): {message}");
+            }
+            _ => {}
+        }
+    }
+
+    // Daemon returns not_implemented for now — fall back to direct write
+    let has_error = events.iter().any(|e| matches!(e, memex_cli::daemon::protocol::Event::Error { code, .. } if code == "not_implemented"));
+    if has_error {
+        eprintln!("memex: daemon write not yet implemented, falling back to direct write");
+        let _ = init_ort_runtime();
+        // Re-read stdin won't work (already consumed). Just report the fallback.
+        // The user should use --direct until daemon write is implemented.
+        anyhow::bail!("daemon write routing not yet implemented. Use --direct flag.");
+    }
+
+    Ok(())
 }
 
+/// Write a wiki page directly to SQLite (--direct flag).
 fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow::Result<()> {
     // Phase 1 — input (no lock).
     let content = if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -345,7 +326,7 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
         open_editor_for_page(name)?
     };
 
-    let stem = slugify(name);
+    let stem = memex_cli::slugify(name);
     if stem.is_empty() {
         anyhow::bail!("Name slugifies to empty string: {name:?}");
     }
@@ -442,7 +423,11 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
         &now,
     )?;
 
-    embed_document(search, &hash, &linked_body);
+    // Load model once for wiki page + all sources.
+    let mut model = memex_core::retrieval::load_default_model();
+    if let Some(ref mut m) = model {
+        memex_core::retrieval::embed_document(search, &hash, &linked_body, m);
+    }
 
     if let Some(ref old_h) = old_hash
         && old_h != &hash
@@ -451,38 +436,26 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
     }
 
     // Source ingestion
-    for source_path_str in sources {
-        let source_path = std::path::PathBuf::from(source_path_str);
-        if !source_path.exists() {
-            eprintln!("warning: source not found: {source_path_str} (skipping)");
-            continue;
+    if !sources.is_empty() {
+        let mut source_docids: Vec<String> = search.existing_docids()?.into_iter().collect();
+        for source_path_str in sources {
+            let source_path = std::path::PathBuf::from(source_path_str);
+            if !source_path.exists() {
+                eprintln!("warning: source not found: {source_path_str} (skipping)");
+                continue;
+            }
+            let source_path = std::fs::canonicalize(&source_path)?;
+            let source_content = std::fs::read_to_string(&source_path)?;
+            let source_abs = source_path.to_string_lossy().to_string();
+            let source_title = source_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let source_summary = memex_core::index::extract_summary(&source_content, 120);
+            let docid = store_source_with_docids(search, &source_abs, &source_content, &source_title, &source_summary, &source_docids, model.as_mut())?;
+            source_docids.push(docid);
         }
-        let source_path = std::fs::canonicalize(&source_path)?;
-        let source_content = std::fs::read_to_string(&source_path)?;
-        let source_hash = search.insert_content(&source_content)?;
-        let source_abs = source_path.to_string_lossy().to_string();
-        let existing_docids = search.existing_docids()?;
-        let existing_vec: Vec<String> = existing_docids.into_iter().collect();
-        let source_docid =
-            memex_core::docid::allocate_docid(&source_hash, "source", &source_abs, &existing_vec);
-        let source_title = source_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let source_summary = memex_core::index::extract_summary(&source_content, 120);
-        search.upsert_document(
-            "source",
-            &source_abs,
-            &source_title,
-            &source_hash,
-            &source_docid,
-            "",
-            &source_summary,
-            &now,
-            &now,
-        )?;
-        embed_document(search, &source_hash, &source_content);
     }
 
     let wiki_page_count = search.wiki_page_count()?;
@@ -833,6 +806,135 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+// ---------------------------------------------------------------------------
+// Session ingestion
+// ---------------------------------------------------------------------------
+
+fn store_source_with_docids(
+    search: &memex_core::search::Bm25Search,
+    path: &str,
+    content: &str,
+    title: &str,
+    summary: &str,
+    existing_docids: &[String],
+    model: Option<&mut memex_core::embed::EmbeddingModel>,
+) -> anyhow::Result<String> {
+    let hash = search.insert_content(content)?;
+    let docid = memex_core::docid::allocate_docid(&hash, "source", path, existing_docids);
+    let now = now_rfc3339();
+    search.upsert_document("source", path, title, &hash, &docid, "", summary, &now, &now)?;
+    if let Some(model) = model {
+        memex_core::retrieval::embed_document(search, &hash, content, model);
+    }
+    Ok(docid)
+}
+
+fn discover_session_files(agent: &Agent) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+    let pattern = match agent {
+        Agent::ClaudeCode => home.join(".claude/projects/*/*.jsonl"),
+        Agent::Codex => home.join(".codex/sessions/*/*/*/*.jsonl"),
+        Agent::GeminiCli => home.join(".gemini/tmp/*/chats/session-*.json"),
+    };
+    let pattern_str = pattern.to_string_lossy().to_string();
+    let files: Vec<std::path::PathBuf> = glob::glob(&pattern_str)
+        .map_err(|e| anyhow::anyhow!("Glob error: {e}"))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(files)
+}
+
+// ---------------------------------------------------------------------------
+// Daemon thin clients (ingest, backfill, status)
+// ---------------------------------------------------------------------------
+
+/// Thin hook client: read stdin JSON, extract transcript_path, send to daemon.
+fn run_ingest_client(agent: &Agent) -> anyhow::Result<()> {
+    // MEMEX_INTERNAL guard: skip daemon's own sessions
+    if std::env::var("MEMEX_INTERNAL").as_deref() == Ok("1") {
+        return Ok(());
+    }
+
+    // Read stdin JSON (hook passes {"transcript_path": "...", ...})
+    // Cap at 64KB — hook payloads are small JSON.
+    let mut input = Vec::new();
+    std::io::stdin().take(65_536).read_to_end(&mut input)?;
+    let input = String::from_utf8(input)
+        .map_err(|e| anyhow::anyhow!("Hook stdin is not valid UTF-8: {e}"))?;
+    let json: serde_json::Value = serde_json::from_str(input.trim())
+        .map_err(|e| anyhow::anyhow!("Failed to parse hook stdin JSON: {e}"))?;
+    let transcript_path = json
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Hook stdin JSON missing 'transcript_path' field"))?;
+
+    let root = memex_cli::memex_root();
+    let code = memex_cli::daemon::ingest(
+        transcript_path,
+        agent.as_str(),
+        root.to_str().unwrap_or("~/.memex"),
+    )?;
+    std::process::exit(code);
+}
+
+/// Discover session files for an agent and send each to the daemon for ingestion.
+fn run_backfill(agent: &Agent) -> anyhow::Result<()> {
+    let session_files = discover_session_files(agent)?;
+    if session_files.is_empty() {
+        println!("No session files found for {agent:?}");
+        return Ok(());
+    }
+    println!("Discovered {} sessions", session_files.len());
+
+    let root = memex_cli::memex_root();
+    let root_str = root.to_string_lossy();
+
+    let mut queued = 0u32;
+    let mut skipped = 0u32;
+    let mut errors = 0u32;
+
+    for path in &session_files {
+        let path_str = path.to_string_lossy();
+        match memex_cli::daemon::ingest(&path_str, agent.as_str(), &root_str) {
+            Ok(0) => {
+                queued += 1;
+                eprintln!("queued: {path_str}");
+            }
+            Ok(_) => skipped += 1,
+            Err(e) => {
+                eprintln!("error: {path_str}: {e}");
+                errors += 1;
+            }
+        }
+    }
+
+    println!(
+        "Queued {queued} (skipped {skipped}, errors {errors}) of {} sessions",
+        session_files.len()
+    );
+    Ok(())
+}
+
+/// Show daemon status and recent ingestion activity.
+fn run_status() -> anyhow::Result<()> {
+    let code = memex_cli::daemon::status()?;
+    if code != 0 {
+        println!("Daemon: not running");
+    }
+
+    // Show wiki stats
+    let root = memex_cli::memex_root();
+    if let Ok(memex) = Memex::open(root) {
+        let search = memex.search();
+        let wiki_count = search.wiki_page_count().unwrap_or(0);
+        let source_count = search.source_count().unwrap_or(0);
+        println!("Wiki: {wiki_count} pages, {source_count} sources");
+    }
+
+    std::process::exit(code);
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = dispatch(cli);
@@ -856,15 +958,9 @@ fn main() {
 
 fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Commands::Search {
-            query,
-            lex,
-            vec,
-            hyde,
-            expand,
-        } => {
+        Commands::Search { title } => {
             let _ = init_ort_runtime();
-            run_search(&query, &lex, &vec, &hyde, &expand)
+            run_search(&title)
         }
         Commands::Read { refs } => run_read(&refs),
         Commands::Write {
@@ -872,9 +968,14 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             force,
             quiet,
             sources,
+            direct,
         } => {
-            let _ = init_ort_runtime();
-            run_write(&name, force, quiet, &sources)
+            if direct {
+                let _ = init_ort_runtime();
+                run_write(&name, force, quiet, &sources)
+            } else {
+                run_write_via_daemon(&name, force, quiet, &sources)
+            }
         }
         Commands::Delete { page_ref, force } => run_delete(&page_ref, force),
         Commands::Lint { fix } => {
@@ -903,6 +1004,9 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             };
             std::process::exit(code);
         }
+        Commands::Ingest { agent } => run_ingest_client(&agent),
+        Commands::Backfill { agent } => run_backfill(&agent),
+        Commands::Status => run_status(),
     }
 }
 

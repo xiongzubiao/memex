@@ -9,6 +9,11 @@ use crate::types::Document;
 /// "No minScore filtering (QMD's `hybridQuery` default is 0)."
 pub const MIN_SCORE: f32 = 0.0;
 
+/// RFC 3339 timestamp at seconds precision, UTC.
+pub fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 /// A single search result from the BM25 full-text index.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -22,41 +27,6 @@ pub struct SearchResult {
     pub collection: String,
     /// Short document identifier.
     pub docid: String,
-}
-
-/// Trait for full-text wiki search.
-#[async_trait::async_trait]
-pub trait WikiSearch: Send + Sync {
-    /// Search the index for pages matching `query`, returning the top `top_k` results.
-    /// `intent` is an optional hint for future semantic search integration.
-    async fn search(
-        &self,
-        query: &str,
-        top_k: usize,
-        intent: Option<&str>,
-    ) -> Result<Vec<SearchResult>>;
-
-    /// Index a single page (insert or replace).
-    #[allow(clippy::too_many_arguments)]
-    fn index_page(
-        &self,
-        path: &Path,
-        title: &str,
-        body: &str,
-        tags: &str,
-        docid: &str,
-        summary: &str,
-        last_modified: &str,
-    ) -> Result<()>;
-
-    /// Remove a page from the index by its path.
-    fn remove_page(&self, path: &str) -> Result<()>;
-
-    /// Rebuild the entire search index by walking the wiki directory.
-    fn rebuild(&self, root: &Path) -> Result<()>;
-
-    /// Return the set of all docids currently stored in the index.
-    fn existing_docids(&self) -> Result<std::collections::HashSet<String>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +51,37 @@ pub fn is_strong_signal(s1: f64, s2: f64) -> bool {
     s1 >= 0.85 && (s1 - s2) >= 0.15
 }
 
+/// Insert or update a document on a raw connection. Used by both
+/// `upsert_document` (mutex-guarded) and `store_ingest_batch` (transactional).
+/// On conflict, preserves created_at and docid.
+#[allow(clippy::too_many_arguments)]
+fn upsert_document_conn(
+    conn: &rusqlite::Connection,
+    collection: &str,
+    path: &str,
+    title: &str,
+    hash: &str,
+    docid: &str,
+    tags: &str,
+    summary: &str,
+    created_at: &str,
+    updated_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO documents (collection, path, title, hash, docid, tags, summary, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         ON CONFLICT(collection, path) DO UPDATE SET \
+             title = excluded.title, \
+             hash = excluded.hash, \
+             tags = excluded.tags, \
+             summary = excluded.summary, \
+             updated_at = excluded.updated_at",
+        rusqlite::params![collection, path, title, hash, docid, tags, summary, created_at, updated_at],
+    )
+    .map_err(sqlite_err)?;
+    Ok(())
+}
+
 /// BM25 search filtered by collection.
 ///
 /// Returns results from the `documents_fts` virtual table joined with `documents`,
@@ -103,8 +104,16 @@ pub fn search_bm25(
         return Ok(Vec::new());
     }
 
-    // BM25 column weights: path, title, tags, body
-    // Wiki uses tags weight 1.5, source uses 0.0
+    search_bm25_raw(conn, &sanitized, collection, limit)
+}
+
+/// Inner BM25 search with a pre-sanitized FTS5 MATCH expression.
+fn search_bm25_raw(
+    conn: &rusqlite::Connection,
+    match_expr: &str,
+    collection: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
     let bm25_expr = if collection == "source" {
         "bm25(documents_fts, 1.5, 4.0, 0.0, 1.0)"
     } else {
@@ -127,7 +136,7 @@ pub fn search_bm25(
     };
 
     let rows: Vec<(String, String, String, String, f64, String)> = match stmt.query_map(
-        rusqlite::params![sanitized, collection, limit as i64],
+        rusqlite::params![match_expr, collection, limit as i64],
         |row| {
             Ok((
                 row.get::<_, String>(1)?, // docid
@@ -380,6 +389,24 @@ pub fn rrf_fuse(
         .collect()
 }
 
+/// Construct a `Document` from a SQLite row with the standard 10-column SELECT.
+/// Expects columns: id, collection, path, title, hash, docid, tags, summary,
+/// created_at, updated_at.
+fn row_to_document(row: &rusqlite::Row) -> rusqlite::Result<Document> {
+    Ok(Document {
+        id: row.get(0)?,
+        collection: row.get(1)?,
+        path: row.get(2)?,
+        title: row.get(3)?,
+        hash: row.get(4)?,
+        docid: row.get(5)?,
+        tags: row.get(6)?,
+        summary: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
 /// Three-tier identifier resolution.
 ///
 /// 1. Docid prefix: `WHERE docid LIKE ?1 || '%'`
@@ -393,18 +420,7 @@ pub fn resolve_ref(conn: &rusqlite::Connection, reference: &str) -> Result<Vec<D
     )?;
     let docs: Vec<Document> = stmt
         .query_map(rusqlite::params![reference], |row| {
-            Ok(Document {
-                id: row.get(0)?,
-                collection: row.get(1)?,
-                path: row.get(2)?,
-                title: row.get(3)?,
-                hash: row.get(4)?,
-                docid: row.get(5)?,
-                tags: row.get(6)?,
-                summary: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
+            row_to_document(row)
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -422,18 +438,7 @@ pub fn resolve_ref(conn: &rusqlite::Connection, reference: &str) -> Result<Vec<D
     )?;
     let docs: Vec<Document> = stmt
         .query_map(rusqlite::params![stem_pattern, exact_stem], |row| {
-            Ok(Document {
-                id: row.get(0)?,
-                collection: row.get(1)?,
-                path: row.get(2)?,
-                title: row.get(3)?,
-                hash: row.get(4)?,
-                docid: row.get(5)?,
-                tags: row.get(6)?,
-                summary: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
+            row_to_document(row)
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -448,18 +453,7 @@ pub fn resolve_ref(conn: &rusqlite::Connection, reference: &str) -> Result<Vec<D
     )?;
     let docs: Vec<Document> = stmt
         .query_map(rusqlite::params![reference], |row| {
-            Ok(Document {
-                id: row.get(0)?,
-                collection: row.get(1)?,
-                path: row.get(2)?,
-                title: row.get(3)?,
-                hash: row.get(4)?,
-                docid: row.get(5)?,
-                tags: row.get(6)?,
-                summary: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
+            row_to_document(row)
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -467,14 +461,14 @@ pub fn resolve_ref(conn: &rusqlite::Connection, reference: &str) -> Result<Vec<D
 }
 
 // ---------------------------------------------------------------------------
-// Backward-compatible Bm25Search wrapper
+// Bm25Search
 // ---------------------------------------------------------------------------
 
 /// BM25 full-text search backed by SQLite FTS5.
 ///
 /// Uses the new content-addressable schema (content/documents/documents_fts)
 /// from `schema::init_schema`. The inner `Connection` is wrapped in a `Mutex`
-/// so that `Bm25Search` satisfies the `Send + Sync` bounds required by `WikiSearch`.
+/// so that `Bm25Search` is `Send + Sync`.
 pub struct Bm25Search {
     conn: Mutex<rusqlite::Connection>,
 }
@@ -699,6 +693,20 @@ impl Bm25Search {
         crate::content::insert_content(&conn, doc)
     }
 
+
+    /// Check if a content hash already exists in the content table.
+    pub fn content_exists(&self, hash: &str) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM content WHERE hash = ?1",
+                [hash],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        Ok(count > 0)
+    }
+
     /// Insert or update a document row in the documents table.
     ///
     /// On conflict (same collection + path), updates title, hash, tags,
@@ -717,19 +725,58 @@ impl Bm25Search {
         updated_at: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
-        conn.execute(
-            "INSERT INTO documents (collection, path, title, hash, docid, tags, summary, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-             ON CONFLICT(collection, path) DO UPDATE SET \
-                 title = excluded.title, \
-                 hash = excluded.hash, \
-                 tags = excluded.tags, \
-                 summary = excluded.summary, \
-                 updated_at = excluded.updated_at",
-            rusqlite::params![collection, path, title, hash, docid, tags, summary, created_at, updated_at],
-        )
-        .map_err(sqlite_err)?;
-        Ok(())
+        upsert_document_conn(&conn, collection, path, title, hash, docid, tags, summary, created_at, updated_at)
+    }
+
+    /// Store a source document and its derived wiki pages in a single
+    /// transaction. Returns (source_content_hash, source_docid, wiki_slugs).
+    /// Wiki file writes happen after COMMIT, not inside the transaction,
+    /// because filesystem writes can't be rolled back.
+    pub fn store_ingest_batch(
+        &self,
+        source_text: &str,
+        source_path: &str,
+        source_title: &str,
+        source_summary: &str,
+        wiki_pages: &[(String, String, String, String)], // (slug, title, content, tags)
+        now: &str,
+    ) -> Result<(String, String, Vec<String>)> {
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        conn.execute_batch("BEGIN").map_err(sqlite_err)?;
+
+        let result = (|| -> Result<(String, String, Vec<String>)> {
+            // Source
+            let cleaned_hash = crate::content::insert_content(&conn, source_text)?;
+            let existing: Vec<String> = {
+                let mut stmt = conn.prepare("SELECT docid FROM documents WHERE docid != ''")
+                    .map_err(sqlite_err)?;
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .map_err(sqlite_err)?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
+            let src_docid = crate::docid::allocate_docid(&cleaned_hash, "source", source_path, &existing);
+            upsert_document_conn(&conn, "source", source_path, source_title, &cleaned_hash, &src_docid, "", source_summary, now, now)?;
+
+            // Wiki pages
+            let mut slugs = Vec::new();
+            let mut all_docids = existing;
+            for (slug, title, content, tags) in wiki_pages {
+                let page_hash = crate::content::insert_content(&conn, content)?;
+                let page_docid = crate::docid::allocate_docid(&page_hash, "wiki", slug, &all_docids);
+                upsert_document_conn(&conn, "wiki", slug, title, &page_hash, &page_docid, tags, "", now, now)?;
+                all_docids.push(page_docid);
+                slugs.push(slug.clone());
+            }
+
+            Ok((cleaned_hash, src_docid, slugs))
+        })();
+
+        match &result {
+            Ok(_) => { conn.execute_batch("COMMIT").map_err(sqlite_err)?; }
+            Err(_) => { let _ = conn.execute_batch("ROLLBACK"); }
+        }
+        result
     }
 
     /// Get the content hash for a document by its path.
@@ -770,6 +817,64 @@ impl Bm25Search {
         Ok(count as usize)
     }
 
+    // -----------------------------------------------------------------------
+    // Ingest job tracking
+    // -----------------------------------------------------------------------
+
+    pub fn insert_ingest_job(
+        &self,
+        job_id: &str,
+        transcript_path: &str,
+        content_hash: &str,
+        agent: &str,
+        memex_root: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        let now = now_rfc3339();
+        conn.execute(
+            "INSERT OR IGNORE INTO ingest_jobs (job_id, transcript_path, content_hash, agent, memex_root, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+            rusqlite::params![job_id, transcript_path, content_hash, agent, memex_root, &now, &now],
+        ).map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    pub fn update_ingest_job_status(&self, job_id: &str, status: &str, error: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        let now = now_rfc3339();
+        conn.execute(
+            "UPDATE ingest_jobs SET status = ?1, updated_at = ?2, error = ?3 WHERE job_id = ?4",
+            rusqlite::params![status, &now, error, job_id],
+        ).map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    pub fn pending_ingest_jobs(&self) -> Result<Vec<(String, String, String, String)>> {
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        let mut stmt = conn.prepare(
+            "SELECT job_id, transcript_path, agent, memex_root FROM ingest_jobs WHERE status IN ('pending', 'processing')"
+        ).map_err(sqlite_err)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        }).map_err(sqlite_err)?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row.map_err(sqlite_err)?);
+        }
+        Ok(jobs)
+    }
+
+    pub fn source_count(&self) -> Result<usize> {
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE collection = 'source'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_err)?;
+        Ok(count as usize)
+    }
+
     /// Return all wiki documents (collection = 'wiki').
     pub fn all_wiki_documents(&self) -> Result<Vec<Document>> {
         let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
@@ -780,20 +885,7 @@ impl Bm25Search {
             )
             .map_err(sqlite_err)?;
         let docs: Vec<Document> = stmt
-            .query_map([], |row| {
-                Ok(Document {
-                    id: row.get(0)?,
-                    collection: row.get(1)?,
-                    path: row.get(2)?,
-                    title: row.get(3)?,
-                    hash: row.get(4)?,
-                    docid: row.get(5)?,
-                    tags: row.get(6)?,
-                    summary: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            })
+            .query_map([], row_to_document)
             .map_err(sqlite_err)?
             .filter_map(|r| r.ok())
             .collect();
@@ -927,6 +1019,32 @@ impl Bm25Search {
         search_bm25(&conn, query, collection, limit)
     }
 
+    /// BM25 search restricted to the title column. Transforms the query to
+    /// use FTS5 `title:` column prefix, then delegates to `search_bm25`.
+    pub fn search_title_only(
+        &self,
+        query: &str,
+        collection: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sanitized = sanitize_query(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Prefix each AND term with "title:" for column-specific FTS5 matching.
+        let title_query = sanitized
+            .split(" AND ")
+            .map(|term| format!("title: {term}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        search_bm25_raw(&conn, &title_query, collection, limit)
+    }
+
     /// Look up document metadata by content hash.
     ///
     /// Returns all documents that reference the given content hash.
@@ -941,103 +1059,15 @@ impl Bm25Search {
             )
             .map_err(sqlite_err)?;
         let docs: Vec<Document> = stmt
-            .query_map(rusqlite::params![hash], |row| {
-                Ok(Document {
-                    id: row.get(0)?,
-                    collection: row.get(1)?,
-                    path: row.get(2)?,
-                    title: row.get(3)?,
-                    hash: row.get(4)?,
-                    docid: row.get(5)?,
-                    tags: row.get(6)?,
-                    summary: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            })
+            .query_map(rusqlite::params![hash], row_to_document)
             .map_err(sqlite_err)?
             .filter_map(|r| r.ok())
             .collect();
         Ok(docs)
     }
-}
 
-#[async_trait::async_trait]
-impl WikiSearch for Bm25Search {
-    async fn search(
-        &self,
-        query: &str,
-        top_k: usize,
-        _intent: Option<&str>,
-    ) -> Result<Vec<SearchResult>> {
-        let query = query.trim();
-        if query.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let sanitized = sanitize_query(query);
-        if sanitized.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
-
-        // FTS5 MATCH can fail on malformed input — return empty results.
-        // BM25 column weights for documents_fts: path=1.5, title=4.0, tags=1.5, body=1.0
-        let sql = r#"
-            SELECT d.path, d.title,
-                   bm25(documents_fts, 1.5, 4.0, 1.5, 1.0) AS raw_score,
-                   d.docid, d.collection, d.summary
-            FROM documents_fts f
-            JOIN documents d ON d.id = f.rowid
-            WHERE documents_fts MATCH ?1
-            ORDER BY raw_score
-            LIMIT ?2
-        "#;
-
-        let mut stmt = match conn.prepare(sql) {
-            Ok(s) => s,
-            Err(_) => return Ok(Vec::new()),
-        };
-
-        let rows: Vec<(String, String, f64, String, String, String)> =
-            match stmt.query_map(rusqlite::params![sanitized, top_k as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, f64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            }) {
-                Ok(mapped) => mapped.filter_map(|r| r.ok()).collect(),
-                Err(_) => return Ok(Vec::new()),
-            };
-
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let results = rows
-            .into_iter()
-            .map(|(path, title, raw, docid, collection, summary)| {
-                let score = normalize_bm25(raw) as f32;
-                SearchResult {
-                    path: PathBuf::from(path),
-                    title,
-                    score,
-                    snippet: summary,
-                    collection,
-                    docid,
-                }
-            })
-            .collect();
-
-        Ok(results)
-    }
-
-    fn index_page(
+    #[allow(clippy::too_many_arguments)]
+    pub fn index_page(
         &self,
         path: &Path,
         title: &str,
@@ -1096,7 +1126,7 @@ impl WikiSearch for Bm25Search {
         Ok(())
     }
 
-    fn remove_page(&self, path: &str) -> Result<()> {
+    pub fn remove_page(&self, path: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
         conn.execute(
             "DELETE FROM documents WHERE path = ?1",
@@ -1106,7 +1136,7 @@ impl WikiSearch for Bm25Search {
         Ok(())
     }
 
-    fn existing_docids(&self) -> Result<std::collections::HashSet<String>> {
+    pub fn existing_docids(&self) -> Result<std::collections::HashSet<String>> {
         let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
         let mut stmt = conn
             .prepare("SELECT docid FROM documents WHERE docid != ''")
@@ -1121,7 +1151,7 @@ impl WikiSearch for Bm25Search {
         Ok(set)
     }
 
-    fn rebuild(&self, root: &Path) -> Result<()> {
+    pub fn rebuild(&self, root: &Path) -> Result<()> {
         use crate::docid;
 
         let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
@@ -1629,7 +1659,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Backward-compatible Bm25Search tests
+    // Bm25Search tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1660,8 +1690,7 @@ mod tests {
             .unwrap();
 
         let results = search
-            .search("borrow checker rust", 10, None)
-            .await
+            .search_collection("borrow checker rust", "wiki", 10)
             .unwrap();
         assert!(
             !results.is_empty(),
@@ -1700,12 +1729,12 @@ mod tests {
             .unwrap();
 
         // Verify it's there
-        let before = search.search("ephemeral", 10, None).await.unwrap();
+        let before = search.search_collection("ephemeral", "wiki", 10).unwrap();
         assert_eq!(before.len(), 1);
 
         search.remove_page("wiki/ephemeral.md").unwrap();
 
-        let after = search.search("ephemeral", 10, None).await.unwrap();
+        let after = search.search_collection("ephemeral", "wiki", 10).unwrap();
         assert!(
             after.is_empty(),
             "removed page should not appear in results"
@@ -1716,7 +1745,7 @@ mod tests {
     async fn bm25_empty_search() {
         let (_dir, search) = open_temp_search();
 
-        let results = search.search("anything", 10, None).await.unwrap();
+        let results = search.search_collection("anything", "wiki", 10).unwrap();
         assert!(results.is_empty(), "empty DB should return no results");
     }
 
@@ -1752,7 +1781,7 @@ mod tests {
         let search = Bm25Search::open(&db_path).unwrap();
         search.rebuild(root).unwrap();
 
-        let results = search.search("alpha greek", 10, None).await.unwrap();
+        let results = search.search_collection("alpha greek", "wiki", 10).unwrap();
         assert!(!results.is_empty(), "rebuild should index wiki pages");
         assert_eq!(results[0].path, PathBuf::from("wiki/alpha.md"));
     }
@@ -1841,17 +1870,11 @@ mod tests {
         assert!(parse_page_for_indexing(page).is_none());
     }
 
-    #[test]
-    fn sanitize_query_strips_operators() {
-        assert_eq!(sanitize_query("hello (world)"), "\"hello\"* AND \"world\"*");
-        assert_eq!(sanitize_query(""), "");
-    }
-
     #[tokio::test]
     async fn bm25_malformed_query_returns_empty() {
         let (_dir, search) = open_temp_search();
         // Even with special chars, we should get empty rather than an error
-        let results = search.search("***", 10, None).await.unwrap();
+        let results = search.search_collection("***", "wiki", 10).unwrap();
         assert!(results.is_empty());
     }
 
@@ -1884,7 +1907,7 @@ mod tests {
             )
             .unwrap();
 
-        let results = search.search("quantum computing", 10, None).await.unwrap();
+        let results = search.search_collection("quantum computing", "wiki", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].title, "Updated Title");
     }

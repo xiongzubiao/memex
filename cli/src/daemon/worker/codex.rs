@@ -252,6 +252,9 @@ impl CodexSubprocess {
                         && let Ok(d) = serde_json::from_value::<AgentMessageDelta>(params)
                         && let Some(delta) = d.delta
                     {
+                        if answer.len() + delta.len() > super::MAX_RESPONSE_BYTES {
+                            bail!("agent response exceeded 1MB limit");
+                        }
                         answer.push_str(&delta);
                     }
                 }

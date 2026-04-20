@@ -222,9 +222,7 @@ pub fn embed_text(model: &mut EmbeddingModel, text: &str) -> crate::error::Resul
             Ok(data.to_vec())
         }
     } else {
-        // Unrecognised input format — return deterministic hash-based fake
-        // embedding so downstream infrastructure can still be built and tested.
-        Ok(hash_embedding(text))
+        Err(crate::error::MemexError::Other(anyhow::anyhow!("unrecognized model input format: expected input_ids + attention_mask")))
     }
 }
 

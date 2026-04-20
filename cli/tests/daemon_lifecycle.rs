@@ -1,17 +1,15 @@
 //! Integration tests for the daemon lifecycle.
 
+mod common;
+
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-fn binary() -> &'static str {
-    env!("CARGO_BIN_EXE_memex")
-}
-
 /// Spawn the daemon in foreground mode; caller must ensure it's stopped.
 fn spawn_daemon(memex_root: &std::path::Path) -> Child {
-    Command::new(binary())
+    Command::new(common::binary())
         .args(["daemon", "start"])
         .env("MEMEX_ROOT", memex_root)
         .stdout(Stdio::null())
@@ -33,7 +31,7 @@ fn wait_until<F: FnMut() -> bool>(mut f: F, timeout: Duration) -> bool {
 }
 
 fn status(memex_root: &std::path::Path) -> String {
-    let out = Command::new(binary())
+    let out = Command::new(common::binary())
         .args(["daemon", "status"])
         .env("MEMEX_ROOT", memex_root)
         .output()
@@ -42,7 +40,7 @@ fn status(memex_root: &std::path::Path) -> String {
 }
 
 fn stop(memex_root: &std::path::Path) -> std::process::Output {
-    Command::new(binary())
+    Command::new(common::binary())
         .args(["daemon", "stop"])
         .env("MEMEX_ROOT", memex_root)
         .output()
