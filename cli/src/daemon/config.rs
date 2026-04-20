@@ -54,7 +54,7 @@ impl Default for WorkerConfig {
             .map(|n| n.get())
             .unwrap_or(1);
         Self {
-            agent: Agent::Claude,
+            agent: Agent::ClaudeCode,
             model: None,
             max_count: cpus,
             idle_reap_sec: 600,
@@ -65,11 +65,11 @@ impl Default for WorkerConfig {
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Agent {
-    Claude,
+    ClaudeCode,
     Codex,
-    Gemini,
+    GeminiCli,
 }
 
 impl Agent {
@@ -80,9 +80,9 @@ impl Agent {
     /// provider CLIs accept the canonical catalog name.
     pub fn default_model(&self) -> &'static str {
         match self {
-            Agent::Claude => "claude-sonnet-4-6",
+            Agent::ClaudeCode => "claude-sonnet-4-6",
             Agent::Codex => "gpt-5.4-mini",
-            Agent::Gemini => "gemini-3-flash-preview",
+            Agent::GeminiCli => "gemini-3-flash-preview",
         }
     }
 }
@@ -191,7 +191,7 @@ mod tests {
     fn default_values_match_spec() {
         let c = Config::default();
         assert_eq!(c.daemon.idle_timeout_min, 15);
-        assert_eq!(c.daemon.worker.agent, Agent::Claude);
+        assert_eq!(c.daemon.worker.agent, Agent::ClaudeCode);
         assert_eq!(c.daemon.worker.model, None);
         assert!(c.daemon.worker.max_count >= 1);
         assert_eq!(c.daemon.worker.idle_reap_sec, 600);

@@ -1,4 +1,4 @@
-//! Gemini subprocess worker.
+//! Gemini CLI subprocess worker.
 //!
 //! Spawns `gemini --acp -e none` once per worker and keeps it warm. Speaks
 //! Zed's Agent Communication Protocol (JSON-RPC 2.0 over stdio).
@@ -350,6 +350,9 @@ impl GeminiSubprocess {
                 && let Some(c) = u.update.content
                 && let Some(text) = c.text
             {
+                if answer.len() + text.len() > super::MAX_RESPONSE_BYTES {
+                    bail!("agent response exceeded 1MB limit");
+                }
                 answer.push_str(&text);
             }
             // agent_thought_chunk, available_commands_update,

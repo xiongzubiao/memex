@@ -1,7 +1,31 @@
 # Memex — Design Specification
 
 **Status:** DRAFT
-**Date:** 2026-04-07 (revised 2026-04-13)
+**Date:** 2026-04-07 (revised 2026-04-15)
+
+> **Partial supersession notice (2026-04-19):**
+> - **Section 7 (Session Ingestion & Distillation)** is superseded by `2026-04-19-daemon-ingestion-design.md`. The hook-based distillation model, `/memex-distill` skill, `distilled_at` tracking, `memex source list --undistilled`, and `memex source mark-distilled` are replaced by daemon-based ingestion with an Extract + Merge LLM pipeline (1-2 calls per session).
+> - **Architecture overview** references to `source mark-distilled`, `/memex-distill`, and the hook-spawned background agent are superseded.
+> - **CLI commands** `memex source list --undistilled` and `memex source mark-distilled` are removed. `memex hook session-end` is replaced by `memex ingest`.
+> - **SQLite schema** `distilled_at` column is removed.
+> - **Daemon scope** is expanded from read-only (per `2026-04-17`) to read-write (per `2026-04-19`). All mutations now route through the daemon by default.
+> - Sections 1-6, 8-9 of this document remain current.
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+1. [Wiki Page Format](#1-wiki-page-format)
+2. [CLI Commands](#2-cli-commands)
+3. [Skills](#3-skills)
+4. [Proactive Behavior](#4-proactive-behavior)
+5. [SQLite Schema](#5-sqlite-schema)
+6. [Search & Ranking](#6-search--ranking)
+7. [Session Ingestion & Distillation](#7-session-ingestion--distillation)
+8. [Plugin Distribution](#8-plugin-distribution)
+9. [Deferred](#9-deferred)
+- [References](#references)
 
 ---
 
@@ -15,37 +39,29 @@ Memex is an independent experiment exploring the wiki synthesis pattern, separat
 
 ### Architecture
 
-The `memex` binary is an LLM-free wiki storage and search engine. All intelligence lives in agent skills that run inside AI agents — coding agents (Claude Code, Codex, Gemini CLI, Cursor), autonomous agents (OpenClaw, Hermes), or any agent that can invoke shell commands. Five commands: `write`, `read`, `search`, `delete`, `lint`. Skills orchestrate these commands to implement retrieval pipelines, interactive ingestion, and multi-LLM brainstorming.
+The `memex` binary is an LLM-free wiki storage and search engine. All intelligence lives in agent skills that run inside AI agents — coding agents (Claude Code, Codex, Gemini CLI, Cursor), autonomous agents (OpenClaw, Hermes), or any agent that can invoke shell commands. Eight commands: `write`, `read`, `search`, `delete`, `lint`, `import` (session preprocessing), `source list` (query source documents), and `source mark-distilled` (distillation tracking). Skills orchestrate these commands to implement retrieval pipelines, interactive ingestion, multi-LLM brainstorming, and session distillation.
 
 ```mermaid
 graph TD
-    CA["Coding Agents<br/>Claude Code, Codex,<br/>Gemini CLI, Cursor"] --> P
-    AA["Autonomous Agents<br/>OpenClaw, Hermes, ..."] --> P
-
-    subgraph P["memex plugin"]
-        Q["memex-query<br/>SKILL.md"]
-        I["memex-ingest<br/>SKILL.md"]
-        B["memex-brainstorm<br/>SKILL.md"]
-    end
-
-    Q -->|shell calls| CLI
-    I -->|shell calls| CLI
-    B -->|shell calls| CLI
-
-    CLI["memex CLI (LLM-free)<br/>write · read · search · delete · lint"]
-
-    CLI --> SQLite["SQLite<br/>FTS5 + vectors"]
-    CLI --> Wiki["wiki/*.md<br/>on disk"]
-    CLI --> Model["ONNX model<br/>(embed)"]
+    Agents["AI Agents<br/>Claude Code · Codex · Gemini CLI · Cursor · OpenClaw · Hermes · ..."]
+    Agents --> Skills["memex plugin skills<br/>query · ingest · brainstorm · distill · backfill"]
+    Skills -->|"shell calls"| CLI["memex CLI (LLM-free)<br/>write · read · search · delete · lint<br/>import · source list · source mark-distilled"]
+    CLI --> SQLite["SQLite<br/>(FTS5 + sqlite-vec)"]
+    CLI --> Wiki["wiki/*.md<br/>(on disk)"]
+    CLI --> Model["ONNX model<br/>(computes embeddings)"]
+    Hooks["Lifecycle Hooks"] -->|"SessionEnd: run"| CLI
+    Hooks -->|"SessionEnd: spawn"| BG["Background Agent → /memex-distill"]
+    Hooks -->|"SessionStart: inject context"| Agents
 ```
 
 | Concept | Implementation |
 |---|---|
-| Storage | Content-addressable SQLite following QMD (Section 2) |
-| Search | BM25 + vector, typed queries (lex/vec/hyde), RRF fusion (Section 3) |
 | Wiki | `~/.memex/wiki/*.md` with YAML frontmatter (Section 1) |
 | Source | Original content in `source` collection, SQLite only (Section 1) |
-| Skills | query, ingest, brainstorm — cross-platform SKILL.md (Section 6) |
+| Skills | query, ingest, brainstorm, distill, backfill — cross-platform SKILL.md (Section 3) |
+| Storage | Content-addressable SQLite following QMD (Section 5) |
+| Search | BM25 + vector, typed queries (lex/vec/hyde), RRF fusion (Section 6) |
+| Session ingestion | Lifecycle hooks + CLI preprocessing + distillation (Section 7) |
 | Plugin | npm package with bundled binary + model (Section 8) |
 
 ---
@@ -108,314 +124,9 @@ Wiki links use `[[page-stem]]` syntax where `page-stem` matches the filename wit
 
 ---
 
-## 2. SQLite Schema
+## 2. CLI Commands
 
-Follows QMD's content-addressable document model. All text lives in a single `content` table keyed by SHA-256 hash. The `documents` table stores all metadata (path, title, docid, tags, summary) and points to content via hash.
-
-```mermaid
-erDiagram
-    documents ||--o| content : "hash FK"
-    content ||--o{ chunks : "hash FK"
-    chunks ||--|| chunks_vec : "hash_seq PK"
-    documents ||--o{ documents_fts : "triggers"
-
-    documents {
-        int id PK
-        text collection
-        text path
-        text title
-        text hash FK
-        text docid UK
-        text tags
-        text summary
-        text created_at
-        text updated_at
-    }
-    content {
-        text hash PK
-        text doc
-        text created_at
-    }
-    chunks {
-        text hash FK
-        int seq
-        text chunk_text
-        text model
-    }
-    chunks_vec {
-        text hash_seq PK
-        float768 embedding
-    }
-```
-
-### Content table
-
-Single source of truth for all document text. Content-addressable: identical text inserted twice is deduplicated.
-
-**Hashed payload**: for wiki pages, the hash is computed over the **complete .md file** (frontmatter + body, exactly as written to disk). For source documents, the hash is computed over the full source file content at ingestion time. `lint --fix` detects stale wiki indexes by comparing the on-disk file hash against the stored hash (source documents are SQLite-only and not checked against disk).
-
-```sql
-CREATE TABLE IF NOT EXISTS content (
-    hash       TEXT PRIMARY KEY,           -- SHA-256 of complete file content
-    doc        TEXT NOT NULL,              -- full document text (frontmatter + body)
-    created_at TEXT NOT NULL               -- ISO 8601 timestamp
-);
-```
-
-### Documents table
-
-Maps filesystem paths and collections to content hashes. A document is a wiki page or a source.
-
-```sql
-CREATE TABLE IF NOT EXISTS documents (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    collection  TEXT NOT NULL,             -- 'wiki' or 'source'
-    path        TEXT NOT NULL,             -- filesystem path (wiki: relative, source: absolute local path)
-    title       TEXT NOT NULL,             -- extracted from frontmatter (wiki) or filename (source)
-    hash        TEXT NOT NULL REFERENCES content(hash),
-    docid       TEXT NOT NULL,             -- short content hash (6+ chars)
-    tags        TEXT NOT NULL DEFAULT '',  -- wiki: from frontmatter; source: empty
-    summary     TEXT NOT NULL DEFAULT '',  -- wiki: frontmatter summary if present, else first 120 chars of body; source: empty
-    created_at  TEXT NOT NULL,              -- ISO 8601 timestamp
-    updated_at  TEXT NOT NULL,             -- ISO 8601 timestamp
-    UNIQUE(collection, path)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_docid ON documents(docid) WHERE docid != '';
-```
-
-### FTS5 virtual table
-
-Single FTS5 table indexing all documents. Searched with collection-filtered queries.
-
-```sql
-CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-    path,
-    title,
-    tags,
-    body,
-    content='',                              -- contentless: triggers manage content
-    tokenize='porter unicode61'
-);
-```
-
-Contentless FTS (`content=''`) because the `body` column comes from a join with `content` table, not from `documents` directly. Triggers manage all inserts/deletes. This avoids the column mismatch that `content='documents'` would cause on FTS rebuild.
-
-FTS5 triggers join `documents` with `content` to populate the virtual table. The `body` value is the **body only** (after stripping YAML frontmatter), not the full .md file. This prevents frontmatter fields from being double-indexed (title and tags are already separate FTS columns). The same stripping applies to chunking and embedding.
-
-```sql
-CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-    INSERT INTO documents_fts(rowid, path, title, tags, body)
-    VALUES (
-        new.id, new.path, new.title, new.tags,
-        (SELECT strip_frontmatter(doc) FROM content WHERE hash = new.hash)
-    );
-END;
-
-CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-    INSERT INTO documents_fts(documents_fts, rowid, path, title, tags, body)
-    VALUES ('delete', old.id, old.path, old.title, old.tags,
-        (SELECT strip_frontmatter(doc) FROM content WHERE hash = old.hash)
-    );
-END;
-
-CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-    INSERT INTO documents_fts(documents_fts, rowid, path, title, tags, body)
-    VALUES ('delete', old.id, old.path, old.title, old.tags,
-        (SELECT strip_frontmatter(doc) FROM content WHERE hash = old.hash)
-    );
-    INSERT INTO documents_fts(rowid, path, title, tags, body)
-    VALUES (
-        new.id, new.path, new.title, new.tags,
-        (SELECT strip_frontmatter(doc) FROM content WHERE hash = new.hash)
-    );
-END;
-```
-
-`strip_frontmatter()` is a Rust function registered as a SQLite application-defined function. It strips YAML frontmatter (text between `---` delimiters at the start of the document) and returns the body only. Source documents without frontmatter are returned as-is.
-
-### Vector search tables
-
-Content-hash-based storage. Embeddings are keyed by content hash + chunk sequence. Survive renames and deduplicate naturally.
-
-```sql
-CREATE TABLE IF NOT EXISTS chunks (
-    hash        TEXT NOT NULL REFERENCES content(hash),
-    seq         INTEGER NOT NULL,          -- chunk index within document
-    chunk_text  TEXT NOT NULL,             -- chunk text (body only, frontmatter stripped)
-    pos         INTEGER NOT NULL,          -- character offset in body
-    len         INTEGER NOT NULL,          -- character length of chunk
-    model       TEXT NOT NULL,             -- embedding model name
-    embedded_at TEXT NOT NULL,             -- ISO 8601 timestamp
-    PRIMARY KEY(hash, seq)
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-    hash_seq TEXT PRIMARY KEY,             -- "{hash}_{seq}"
-    embedding float[768] distance_metric=cosine
-);
-```
-
-### Mutation ordering invariant
-
-All operations that change `documents.hash` (wiki overwrite via `--force`, backlink rewrite, `lint --fix` reindex, source upsert) or delete a document follow this order:
-
-```mermaid
-graph TD
-    File["File: write .md to disk"]
-    File --> Begin["BEGIN TRANSACTION"]
-
-    Begin --> S1["1. Insert new content hash"]
-    S1 --> S2["2. Chunk + embed into chunks / chunks_vec"]
-    S2 --> S3["3. Update/delete documents row<br/>(FTS5 triggers fire here)"]
-    S3 --> S4{"Old hash orphaned?"}
-    S4 -->|yes| S5["4. Orphan cleanup:<br/>DELETE FROM chunks WHERE hash = old<br/>DELETE FROM chunks_vec WHERE hash_seq LIKE old_%<br/>DELETE FROM content WHERE hash = old"]
-    S4 -->|no| Commit
-    S5 --> Commit["COMMIT"]
-
-    Commit --> Del["File: delete .md from disk (if delete op)"]
-```
-
-Filesystem writes happen **outside** the transaction: file written before BEGIN, deleted after COMMIT. If crash occurs between file and DB, `lint --fix` detects the mismatch (untracked file or missing file).
-
-This ordering ensures: FTS triggers have access to content during step 3 (old + new content rows both exist), vector search never sees a document without embeddings (step 2 before step 3), and stale data is cleaned last (step 4). The SQLite transaction guarantees crash safety — partial mutations are rolled back.
-
-### Docid
-
-Short identifier for each document. Every document (wiki and source) gets a docid.
-
-- **Primary**: first 6 characters of the content hash. Extend to 7, 8, ... if another document already has that prefix.
-- **Fallback**: if two documents have identical content (same full hash, different paths), the content-hash prefix can never disambiguate. In this case, hash `collection + path` and use a 6+ char prefix of that instead. This is rare (duplicate content across different paths).
-- Most documents get 6-char content-hash docids (16.7M possibilities, collisions unlikely below ~5,000 documents)
-- **Stability**: content-hash docids change when content is edited. Path-hash fallback docids are stable only while the duplicate-content condition persists; if a document is later edited so its content hash becomes unique, the docid reverts to content-hash-based on next recompute. In all cases, docids should be treated as short-lived lookup handles, not permanent identifiers. Agents should use filename stems in citations and cross-references. Wiki links (`[[page-stem]]`) are filename-based for this reason.
-- Stored in `documents` table with unique index for O(1) lookup
-- Computed on write, collision check is a single `WHERE docid = ?` query per attempt
-- `memex read` and `memex delete` accept any identifier form (docid, stem, path, or title) — see identifier resolution in CLI Commands
-
-### Summary
-
-Frontmatter `summary` field if present; otherwise, first 120 characters of the body (after stripping frontmatter). Stored in `documents.summary`. Available for agent use via `memex read` output; not included in search output (search returns docid + score + stem + chunk snippet).
-
----
-
-## 3. Search & Ranking
-
-```mermaid
-graph TD
-    Q["Query + optional --lex / --vec / --hyde expansions"]
-
-    subgraph Retrieval["1. Retrieval"]
-        BM25["BM25 FTS5<br/>wiki (2x weight) + source (1x weight)<br/>separate list per query term"]
-        Vec["Vector search (sqlite-vec cosine)<br/>embed each query, search chunks,<br/>collapse to doc-level by max score"]
-    end
-
-    subgraph Fusion["2. Fusion"]
-        RRF["RRF merge all ranked lists (k=60)<br/>reassign scores as 1/rank"]
-    end
-
-    subgraph Selection["3. Selection"]
-        Chunk["Best chunk per doc<br/>(keyword overlap scoring)"]
-        Signal{"Signal detection<br/>(wiki BM25 probe only,<br/>skipped if expansions present)"}
-    end
-
-    Out["Output: signal · docid · collection · score · stem · chunk snippet"]
-
-    Q --> BM25
-    Q --> Vec
-    BM25 --> RRF
-    Vec --> RRF
-    RRF --> Chunk
-    Chunk --> Signal
-    Signal --> Out
-```
-
-Subsections below define each step in this pipeline.
-
-### Embedding model
-
-- **Default**: embedding-gemma-300m (ONNX INT8, ~329MB)
-  - 768 dimensions, 2048 token context, strong code support (90.1 on CodeSearchNet Retrieval)
-- **Bundled**: model pinned by npm package version, downloaded during `postinstall` to `~/.memex/models/`. Model upgrades via `npm update`.
-- **Runtime**: ONNX via `ort` crate (prebuilt binaries, no cmake needed, ~135ms/embed on CPU). GGUF/llama.cpp rejected: ~3s/embed on CPU (20x slower), requires cmake + C++ toolchain.
-
-### Chunking
-
-Documents are split into chunks before embedding:
-- **Max chunk size**: 900 tokens (within embedding-gemma's 2048 limit)
-- **Overlap**: 15% (~135 tokens)
-- **Markdown-aware break points** with scored boundaries: heading h1-h6 (score 100-50), code block (80), paragraph (20), list item (5), newline (1). Higher-scored break points are preferred. Code fence protection prevents splitting inside fenced blocks.
-- **Search window**: 200 tokens around target split point to find the best break point
-- **Both wiki pages and source content are chunked and embedded**
-
-### RRF fusion (following QMD)
-
-Each document $d$ receives an RRF score summed across $n$ ranked lists:
-
-$$\text{RRF}(d) = \sum_{i=1}^{n} \frac{w_i}{k + r_i(d)} + \text{bonus}(r_i(d))$$
-
-where $r_i(d)$ is the **1-based rank** of document $d$ in list $i$ (rank 1 = top result). Documents not in a list are excluded from that list's contribution.
-
-| Parameter | Value | Notes |
-|---|---|---|
-| $k$ | 60 | Smoothing constant |
-| $w_i$ | 2.0 for wiki BM25 lists, 1.0 for all others | By collection, not by position (see below) |
-| $\text{bonus}$ | +0.05 if $r = 1$, +0.02 if $r \in \{2, 3\}$ | Top-rank bonus |
-
-**List weighting**: wiki BM25 lists (from primary query and each `--lex` term) get weight 2.0. Source BM25 lists and all vector lists get weight 1.0. This is **collection-based**, not positional — unlike QMD which weights the first 2 lists by position. Memex uses collection-based weighting because `--lex` expansion creates variable numbers of BM25 lists; positional weighting would incorrectly over-weight whichever list happens to be second.
-
-Post-fusion scores reassigned as $s(d) = 1 / r$ where $r$ is the final rank (rank 1 = 1.0, rank 2 = 0.5, rank 3 = 0.33). No minScore filtering (QMD's `hybridQuery` default is 0).
-
-Note: QMD blends RRF rank with local reranker scores via $s = w_{\text{rrf}} \cdot \frac{1}{r} + (1 - w_{\text{rrf}}) \cdot s_{\text{rerank}}$. Memex returns RRF scores with best-chunk snippets; the agent LLM reranks results using the snippets before reading full documents.
-
-### BM25 column weights
-
-| Collection | SQL | Weights |
-|---|---|---|
-| wiki | `bm25(documents_fts, 1.5, 4.0, 1.5, 1.0)` | path=1.5, title=4.0, tags=1.5, body=1.0 |
-| source | `bm25(documents_fts, 1.5, 4.0, 0.0, 1.0)` | path=1.5, title=4.0, tags=0.0, body=1.0 |
-
-Note: QMD has 3 FTS columns (filepath, title, body) with weights (1.5, 4.0, 1.0); memex adds a tags column. Wiki 2x weighting is applied in the RRF list weighting above, not in BM25 scores.
-
-### Score normalization
-
-Raw FTS5 BM25 scores (negative, lower = better) normalized via sigmoid:
-
-$$s = \frac{|x|}{1 + |x|}$$
-
-Query-independent mapping:
-
-| Raw BM25 | Normalized | Interpretation |
-|---|---|---|
-| $-10$ | $0.91$ | Strong match |
-| $-2$ | $0.67$ | Medium match |
-| $-0.5$ | $0.33$ | Weak match |
-| $0$ | $0$ | No match |
-
-### Signal detection
-
-Runs on the **initial BM25 probe only** (normalized BM25 scores before RRF fusion), not on post-fusion `1/rank` scores. This matches QMD's `hybridQuery()` which probes FTS first, then decides whether to expand.
-
-$$\text{strong} \iff s_1 \geq 0.85 \;\wedge\; (s_1 - s_2) \geq 0.15$$
-
-where $s_1$ and $s_2$ are the top two **normalized BM25 scores** from the wiki collection FTS probe. If fewer than 2 results, $s_2 = 0$. If no results, signal is always weak. When strong, the agent skips query expansion. Source and vector evidence do not participate in signal detection (intentional: the BM25 probe is a fast pre-check, not a full search).
-
-### Best chunk selection
-
-For each result document, the best-matching chunk is selected via keyword overlap scoring (primary query terms weighted 1.0, `--lex` terms weighted 1.0, `--vec`/`--hyde` terms weighted 0.5). The chunk snippet is included in the output for agent reranking.
-
-### Vector search: chunk-to-document collapse
-
-Each `--vec`/`--hyde` query (and the primary query) is embedded and searched via sqlite-vec cosine similarity. Chunk hits are collapsed to document-level: for each document, keep the chunk with the highest cosine score, deduplicate by document, rank by max chunk score. Each query produces one document-level ranked list fed into RRF.
-
-### Configuration
-
-Embedding model is a constant in the binary, pinned by the npm package version. No user-facing configuration. Model upgrades ship with npm package updates; run `memex lint --fix` after upgrade to re-embed (see lint command).
-
----
-
-## 4. CLI Commands
-
-The `memex` binary is LLM-free. No `init` (lazy init on first `write`), no `auth` (no LLM provider). Five commands: `write`, `read`, `search`, `delete`, `lint`.
+The `memex` binary is LLM-free. No `init` (lazy init on first `write`), no `auth` (no LLM provider). Eight commands: `write`, `read`, `search`, `delete`, `lint`, `import`, `source list`, and `source mark-distilled`.
 
 ### `memex write <filename|title> [--source <path> ...] [--force] [--quiet]`
 
@@ -480,6 +191,30 @@ existing: "REST API Design Patterns" (updated_at 2026-04-10)
 - `backlinked` — existing pages that now link to this page (auto-linked). Suppressed by `--quiet`.
 - `suggest-create` — topics mentioned in body with no matching page. Suppressed by `--quiet`.
 - `conflict` — exact filename match (use `--force` to overwrite). Never suppressed.
+
+#### Auto cross-linking
+
+`memex write` automatically maintains wiki cross-references (steps 3-4 above). No LLM needed.
+
+**Forward linking:** On write, scan the body for mentions of existing page titles and filename stems (case-insensitive). Replace the first occurrence with a `[[page-stem]]` wiki link.
+
+- Body: "This covers REST patterns and caching strategies."
+- `rest-patterns.md` and `caching-strategies.md` exist
+- After write: "This covers [[rest-patterns]] and [[caching-strategies]]."
+
+**Backward linking:** After writing a new page, scan all existing pages for mentions of the new page's title/stem. Add `[[page-stem]]` links to those pages.
+
+- New page: `oauth-migration.md` with title "OAuth Migration"
+- Existing page `auth-overview.md` body mentions "OAuth migration was completed in Q1"
+- After write: "[[oauth-migration]] was completed in Q1"
+
+**Rules:**
+
+- Match longer titles before shorter ones (prevents "Rust" from consuming "Rust Borrow Checker")
+- Only replace the first occurrence of each target page name (multiple different targets can each be linked once in the same page)
+- Skip text already inside `[[...]]` links
+- Case-insensitive matching against title and filename stem (Unicode-safe via regex)
+- Don't link a page to itself
 
 ### `memex read <identifier> ...`
 
@@ -620,41 +355,61 @@ missing-file: old-page (DB row, no file)
 
 `memex write` is the canonical write path. Manual edits are detected by lint, not first-class. `memex write` already reports per-page lint info (linked, backlinked, suggest-create). `memex lint` checks the entire wiki. Disk-level checks (stale index, untracked, missing file) apply to wiki documents only. Embedding checks (model upgrades) apply to all documents (wiki and source).
 
+### `memex import <agent> [--path <file>] [--quiet]`
+
+Discovers and preprocesses agent session transcripts for one agent. LLM-free — preprocessing only. Agent spawning for distillation is handled by the SessionEnd hook (Section 7), not by this command. See Section 7 for full ingestion design.
+
+```bash
+memex import claude-code            # discover and preprocess Claude Code sessions
+memex import codex                  # discover and preprocess Codex sessions
+memex import gemini                 # discover and preprocess Gemini CLI sessions
+memex import claude-code --path /some/file.jsonl  # single file (used by SessionEnd hook)
+```
+
+```mermaid
+graph TD
+    Start["memex import &lt;agent&gt;"]
+    Start --> Discover["Discover session files<br/>for specified agent<br/>--path for single file"]
+    Discover --> Loop
+
+    subgraph Loop["For each transcript"]
+        Check{"Already ingested?<br/>(file path dedup)"}
+        Check -->|yes| Skip["Skip"]
+        Check -->|no| Filter{"Distillation session?<br/>Non-substantive?"}
+        Filter -->|yes| Skip
+        Filter -->|no| Parse["Parse transcript format"]
+        Parse --> Strip["Strip tool call outputs<br/>Keep: user messages,<br/>assistant reasoning,<br/>tool call metadata"]
+        Strip --> Store["Store cleaned transcript<br/>as source document"]
+    end
+
+    Store --> Report["Report: discovered,<br/>skipped, prepared"]
+```
+
+- `<agent>` specifies which agent's session location to scan (e.g., `claude-code`, `codex`, `gemini`)
+- `--path` processes a single file directly (used by the SessionEnd hook)
+- `--quiet` suppresses progress messages (default: human-readable with progress). Per-file `imported: <docid>\t<path>` lines always print for hook consumption.
+- **Deduplication**: skips already-ingested sessions by tracking original file path (`UNIQUE(collection, path)`)
+- **Distillation session filtering**: skips sessions whose first user message starts with `/memex-distill`
+- **Format version detection**: checks format markers (Claude Code `version` field, Codex `cli_version`), warns on unknown versions
+- **Secret redaction**: scans tool input summaries for common secret patterns (API keys, tokens, passwords), replaces with `[REDACTED]`
+- Skips non-substantive sessions: no assistant messages (aborted), no user messages (never interacted), empty/malformed files
+- Stripping tool outputs reduces a potentially million-token transcript to 10K-50K tokens that fit in a single LLM context window
+- **Error messages**: parse failures include problem + cause + fix suggestion (not just the raw error)
+- **Streaming parse**: JSONL files (Claude Code, Codex) read line-by-line via BufReader (not loaded entirely into memory). Gemini JSON files loaded whole (single object).
+
+### `memex source list --undistilled`
+
+Lists source documents that have been ingested but not yet distilled. Used by `/memex-backfill` to get the list of sources awaiting distillation. Supports retry — if distillation failed on some sources, they remain undistilled and appear on the next run.
+
+### `memex source mark-distilled <identifier>`
+
+Marks a source document as distilled by setting `distilled_at` to the current timestamp. Accepts a docid or an absolute file path. Used by `/memex-distill` after completing distillation of a source.
+
 ---
 
-## 5. Auto Cross-Linking
+## 3. Skills
 
-`memex write` automatically maintains wiki cross-references. No LLM needed.
-
-### Forward linking
-
-On write, scan the body for mentions of existing page titles and filename stems (case-insensitive). Replace the first occurrence with a `[[page-stem]]` wiki link.
-
-- Body: "This covers REST patterns and caching strategies."
-- `rest-patterns.md` and `caching-strategies.md` exist
-- After write: "This covers [[rest-patterns]] and [[caching-strategies]]."
-
-### Backward linking
-
-After writing a new page, scan all existing pages for mentions of the new page's title/stem. Add `[[page-stem]]` links to those pages.
-
-- New page: `oauth-migration.md` with title "OAuth Migration"
-- Existing page `auth-overview.md` body mentions "OAuth migration was completed in Q1"
-- After write: "[[oauth-migration]] was completed in Q1"
-
-### Rules
-
-- Match longer titles before shorter ones (prevents "Rust" from consuming "Rust Borrow Checker")
-- Only replace the first occurrence of each target page name (multiple different targets can each be linked once in the same page)
-- Skip text already inside `[[...]]` links
-- Case-insensitive matching against title and filename stem (Unicode-safe via regex)
-- Don't link a page to itself
-
----
-
-## 6. Skills
-
-Three skills. All cross-platform — same SKILL.md works in any agent that can run shell commands (Claude Code, Codex, Gemini CLI, Cursor, OpenClaw, Hermes, etc.).
+Five skills. All cross-platform — same SKILL.md works in any agent that can run shell commands (Claude Code, Codex, Gemini CLI, Cursor, OpenClaw, Hermes, etc.).
 
 ### `memex-query` — Full retrieval pipeline
 
@@ -752,9 +507,52 @@ graph TD
 
 **Fallback:** if only one CLI is available, single-model brainstorm with persona/temperature variation.
 
+### `memex-distill` — Automatic knowledge extraction
+
+LLM-powered extraction from a single source document. Distills one source into wiki pages — works on session transcripts, articles, notes, or any content stored as a memex source. Used by the SessionEnd hook's spawned agent and by `/memex-backfill` subagents.
+
+```mermaid
+graph TD
+    S1["1. Read source document"]
+    S1 --> S2["2. Extract distinct topics,<br/>decisions, findings, insights"]
+    S2 --> Loop
+
+    subgraph Loop["For each topic"]
+        Search["3. memex search 'topic'"]
+        Search -->|"match found"| Read["Read existing page"]
+        Search -->|"no match"| Create["Create new page<br/>memex write --source"]
+
+        Read --> Merge["Merge new findings<br/>memex write --force --source"]
+    end
+
+    Merge --> Next["Next topic"]
+    Create --> Next
+    Next -->|"more topics"| Search
+    Next -->|"all done"| Summary["4. Generate summary page<br/>(optional, for session audit trail)"]
+```
+
+**Merge strategy:** Preserve existing content structure. Add new findings in context. Update the `updated_at` timestamp. Add the new source to the `sources` list. Don't rewrite content that hasn't changed. Mark source as distilled on completion.
+
+### `memex-backfill` — Batch ingestion and distillation
+
+Discovers, preprocesses, and distills sources in bulk. Handles session backfill (initial onboarding with hundreds of past sessions) and batch distillation of any undistilled sources.
+
+```mermaid
+graph TD
+    S1["1. memex import &lt;agent&gt;<br/>(Rust: discover sessions,<br/>filter, preprocess)"]
+    S1 --> S2["2. memex source list --undistilled<br/>(all undistilled sources,<br/>sessions and non-sessions)"]
+    S2 --> S3{"Sources found?"}
+    S3 -->|none| Done["Nothing to distill"]
+    S3 -->|yes| S4["3. Dispatch parallel subagents"]
+    S4 --> Sub["/memex-distill per source"]
+    Sub --> Done2["Report: N sources distilled"]
+```
+
+Agent-native — works in any agent that supports subagent dispatch.
+
 ---
 
-## 7. Proactive Behavior
+## 4. Proactive Behavior
 
 Defined in `plugin/AGENTS.md` (cross-platform behavioral instructions). Platform-specific files (`plugin/CLAUDE.md`, `plugin/GEMINI.md`) import these triggers. Not a skill — behavioral instructions that any host agent can follow.
 
@@ -780,7 +578,433 @@ When the user asks about wiki health, issues, or maintenance, the agent runs `me
 
 All triggers are opt-in — the agent prompts, the user decides.
 
-Note: No hooks needed. `memex write` output already provides per-page lint information (linked, backlinked, suggest-create). Full wiki `memex lint` is an occasional maintenance command, not an automatic trigger.
+Trigger 1 is also the primary mechanism for session ingestion (Section 7). The agent captures significant findings to memex during the session via AGENTS.md instructions: search memex, create or update wiki pages. Zero additional LLM cost — the agent is already running. This also serves as compaction recovery — when context is compacted, the agent queries memex to recover earlier findings it captured. Session lifecycle hooks (Section 7) handle automated post-session distillation as a secondary safety net.
+
+---
+
+## 5. SQLite Schema
+
+Follows QMD's content-addressable document model. All text lives in a single `content` table keyed by SHA-256 hash. The `documents` table stores all metadata (path, title, docid, tags, summary) and points to content via hash.
+
+```mermaid
+erDiagram
+    documents ||--o| content : "hash FK"
+    content ||--o{ chunks : "hash FK"
+    chunks ||--|| chunks_vec : "hash_seq PK"
+    documents ||--o{ documents_fts : "triggers"
+
+    documents {
+        int id PK
+        text collection
+        text path
+        text title
+        text hash FK
+        text docid UK
+        text tags
+        text summary
+        text created_at
+        text updated_at
+        text distilled_at
+    }
+    content {
+        text hash PK
+        text doc
+        text created_at
+    }
+    chunks {
+        text hash FK
+        int seq
+        text chunk_text
+        text model
+    }
+    chunks_vec {
+        text hash_seq PK
+        float768 embedding
+    }
+```
+
+### Content table
+
+Single source of truth for all document text. Content-addressable: identical text inserted twice is deduplicated.
+
+**Hashed payload**: for wiki pages, the hash is computed over the **complete .md file** (frontmatter + body, exactly as written to disk). For source documents, the hash is computed over the full source file content at ingestion time. `lint --fix` detects stale wiki indexes by comparing the on-disk file hash against the stored hash (source documents are SQLite-only and not checked against disk).
+
+```sql
+CREATE TABLE IF NOT EXISTS content (
+    hash       TEXT PRIMARY KEY,           -- SHA-256 of complete file content
+    doc        TEXT NOT NULL,              -- full document text (frontmatter + body)
+    created_at TEXT NOT NULL               -- ISO 8601 timestamp
+);
+```
+
+### Documents table
+
+Maps filesystem paths and collections to content hashes. A document is a wiki page or a source.
+
+```sql
+CREATE TABLE IF NOT EXISTS documents (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection  TEXT NOT NULL,             -- 'wiki' or 'source'
+    path        TEXT NOT NULL,             -- filesystem path (wiki: relative, source: absolute local path)
+    title       TEXT NOT NULL,             -- extracted from frontmatter (wiki) or filename (source)
+    hash        TEXT NOT NULL REFERENCES content(hash),
+    docid       TEXT NOT NULL,             -- short content hash (6+ chars)
+    tags        TEXT NOT NULL DEFAULT '',  -- wiki: from frontmatter; source: empty
+    summary     TEXT NOT NULL DEFAULT '',  -- wiki: frontmatter summary if present, else first 120 chars of body; source: empty
+    created_at  TEXT NOT NULL,              -- ISO 8601 timestamp
+    updated_at  TEXT NOT NULL,             -- ISO 8601 timestamp
+    distilled_at TEXT,                     -- NULL = not yet distilled, ISO 8601 = when distilled
+    UNIQUE(collection, path)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_docid ON documents(docid) WHERE docid != '';
+```
+
+**`path` for sources:** The `UNIQUE(collection, path)` constraint means the absolute local path serves as the dedup key. `memex import` stores the original transcript path (e.g., `~/.claude/projects/myproject/sessions/abc123.jsonl`), so re-running skips already-ingested files.
+
+**`distilled_at`:** NULL on ingest, set to ISO 8601 timestamp when `/memex-distill` completes. `memex source list --undistilled` queries `WHERE collection = 'source' AND distilled_at IS NULL`.
+
+### FTS5 virtual table
+
+Single FTS5 table indexing all documents. Searched with collection-filtered queries.
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+    path,
+    title,
+    tags,
+    body,
+    content='',                              -- contentless: triggers manage content
+    tokenize='porter unicode61'
+);
+```
+
+Contentless FTS (`content=''`) because the `body` column comes from a join with `content` table, not from `documents` directly. Triggers manage all inserts/deletes. This avoids the column mismatch that `content='documents'` would cause on FTS rebuild.
+
+FTS5 triggers join `documents` with `content` to populate the virtual table. The `body` value is the **body only** (after stripping YAML frontmatter), not the full .md file. This prevents frontmatter fields from being double-indexed (title and tags are already separate FTS columns). The same stripping applies to chunking and embedding.
+
+```sql
+CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
+    INSERT INTO documents_fts(rowid, path, title, tags, body)
+    VALUES (
+        new.id, new.path, new.title, new.tags,
+        (SELECT strip_frontmatter(doc) FROM content WHERE hash = new.hash)
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
+    INSERT INTO documents_fts(documents_fts, rowid, path, title, tags, body)
+    VALUES ('delete', old.id, old.path, old.title, old.tags,
+        (SELECT strip_frontmatter(doc) FROM content WHERE hash = old.hash)
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
+    INSERT INTO documents_fts(documents_fts, rowid, path, title, tags, body)
+    VALUES ('delete', old.id, old.path, old.title, old.tags,
+        (SELECT strip_frontmatter(doc) FROM content WHERE hash = old.hash)
+    );
+    INSERT INTO documents_fts(rowid, path, title, tags, body)
+    VALUES (
+        new.id, new.path, new.title, new.tags,
+        (SELECT strip_frontmatter(doc) FROM content WHERE hash = new.hash)
+    );
+END;
+```
+
+`strip_frontmatter()` is a Rust function registered as a SQLite application-defined function. It strips YAML frontmatter (text between `---` delimiters at the start of the document) and returns the body only. Source documents without frontmatter are returned as-is.
+
+### Vector search tables
+
+Content-hash-based storage. Embeddings are keyed by content hash + chunk sequence. Survive renames and deduplicate naturally.
+
+```sql
+CREATE TABLE IF NOT EXISTS chunks (
+    hash        TEXT NOT NULL REFERENCES content(hash),
+    seq         INTEGER NOT NULL,          -- chunk index within document
+    chunk_text  TEXT NOT NULL,             -- chunk text (body only, frontmatter stripped)
+    pos         INTEGER NOT NULL,          -- character offset in body
+    len         INTEGER NOT NULL,          -- character length of chunk
+    model       TEXT NOT NULL,             -- embedding model name
+    embedded_at TEXT NOT NULL,             -- ISO 8601 timestamp
+    PRIMARY KEY(hash, seq)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+    hash_seq TEXT PRIMARY KEY,             -- "{hash}_{seq}"
+    embedding float[768] distance_metric=cosine
+);
+```
+
+### Mutation ordering invariant
+
+All operations that change `documents.hash` (wiki overwrite via `--force`, backlink rewrite, `lint --fix` reindex, source upsert) or delete a document follow this order:
+
+```mermaid
+graph TD
+    File["File: write .md to disk"]
+    File --> Begin["BEGIN TRANSACTION"]
+
+    Begin --> S1["1. Insert new content hash"]
+    S1 --> S2["2. Chunk + embed into chunks / chunks_vec"]
+    S2 --> S3["3. Update/delete documents row<br/>(FTS5 triggers fire here)"]
+    S3 --> S4{"Old hash orphaned?"}
+    S4 -->|yes| S5["4. Orphan cleanup:<br/>DELETE FROM chunks WHERE hash = old<br/>DELETE FROM chunks_vec WHERE hash_seq LIKE old_%<br/>DELETE FROM content WHERE hash = old"]
+    S4 -->|no| Commit
+    S5 --> Commit["COMMIT"]
+
+    Commit --> Del["File: delete .md from disk (if delete op)"]
+```
+
+Filesystem writes happen **outside** the transaction: file written before BEGIN, deleted after COMMIT. If crash occurs between file and DB, `lint --fix` detects the mismatch (untracked file or missing file).
+
+This ordering ensures: FTS triggers have access to content during step 3 (old + new content rows both exist), vector search never sees a document without embeddings (step 2 before step 3), and stale data is cleaned last (step 4). The SQLite transaction guarantees crash safety — partial mutations are rolled back.
+
+### Docid
+
+Short identifier for each document. Every document (wiki and source) gets a docid.
+
+- **Primary**: first 6 characters of the content hash. Extend to 7, 8, ... if another document already has that prefix.
+- **Fallback**: if two documents have identical content (same full hash, different paths), the content-hash prefix can never disambiguate. In this case, hash `collection + path` and use a 6+ char prefix of that instead. This is rare (duplicate content across different paths).
+- Most documents get 6-char content-hash docids (16.7M possibilities, collisions unlikely below ~5,000 documents)
+- **Stability**: content-hash docids change when content is edited. Path-hash fallback docids are stable only while the duplicate-content condition persists; if a document is later edited so its content hash becomes unique, the docid reverts to content-hash-based on next recompute. In all cases, docids should be treated as short-lived lookup handles, not permanent identifiers. Agents should use filename stems in citations and cross-references. Wiki links (`[[page-stem]]`) are filename-based for this reason.
+- Stored in `documents` table with unique index for O(1) lookup
+- Computed on write, collision check is a single `WHERE docid = ?` query per attempt
+- `memex read` and `memex delete` accept any identifier form (docid, stem, path, or title) — see identifier resolution in CLI Commands
+
+### Summary
+
+Frontmatter `summary` field if present; otherwise, first 120 characters of the body (after stripping frontmatter). Stored in `documents.summary`. Available for agent use via `memex read` output; not included in search output (search returns docid + score + stem + chunk snippet).
+
+---
+
+## 6. Search & Ranking
+
+```mermaid
+graph TD
+    Q["Query + optional --lex / --vec / --hyde expansions"]
+
+    subgraph Retrieval["1. Retrieval"]
+        BM25["BM25 FTS5<br/>wiki (2x weight) + source (1x weight)<br/>separate list per query term"]
+        Vec["Vector search (sqlite-vec cosine)<br/>embed each query, search chunks,<br/>collapse to doc-level by max score"]
+    end
+
+    subgraph Fusion["2. Fusion"]
+        RRF["RRF merge all ranked lists (k=60)<br/>reassign scores as 1/rank"]
+    end
+
+    subgraph Selection["3. Selection"]
+        Chunk["Best chunk per doc<br/>(keyword overlap scoring)"]
+        Signal{"Signal detection<br/>(wiki BM25 probe only,<br/>skipped if expansions present)"}
+    end
+
+    Out["Output: signal · docid · collection · score · stem · chunk snippet"]
+
+    Q --> BM25
+    Q --> Vec
+    BM25 --> RRF
+    Vec --> RRF
+    RRF --> Chunk
+    Chunk --> Signal
+    Signal --> Out
+```
+
+Subsections below define each step in this pipeline.
+
+### Embedding model
+
+- **Default**: embedding-gemma-300m (ONNX INT8, ~329MB)
+  - 768 dimensions, 2048 token context, strong code support (90.1 on CodeSearchNet Retrieval)
+- **Bundled**: model pinned by npm package version, downloaded during `postinstall` to `~/.memex/models/`. Model upgrades via `npm update`.
+- **Runtime**: ONNX via `ort` crate (prebuilt binaries, no cmake needed, ~135ms/embed on CPU). GGUF/llama.cpp rejected: ~3s/embed on CPU (20x slower), requires cmake + C++ toolchain.
+
+### Chunking
+
+Documents are split into chunks before embedding:
+- **Max chunk size**: 900 tokens (within embedding-gemma's 2048 limit)
+- **Overlap**: 15% (~135 tokens)
+- **Markdown-aware break points** with scored boundaries: heading h1-h6 (score 100-50), code block (80), paragraph (20), list item (5), newline (1). Higher-scored break points are preferred. Code fence protection prevents splitting inside fenced blocks.
+- **Search window**: 200 tokens around target split point to find the best break point
+- **Both wiki pages and source content are chunked and embedded**
+
+### RRF fusion (following QMD)
+
+Each document $d$ receives an RRF score summed across $n$ ranked lists:
+
+$$\text{RRF}(d) = \sum_{i=1}^{n} \frac{w_i}{k + r_i(d)} + \text{bonus}(r_i(d))$$
+
+where $r_i(d)$ is the **1-based rank** of document $d$ in list $i$ (rank 1 = top result). Documents not in a list are excluded from that list's contribution.
+
+| Parameter | Value | Notes |
+|---|---|---|
+| $k$ | 60 | Smoothing constant |
+| $w_i$ | 2.0 for wiki BM25 lists, 1.0 for all others | By collection, not by position (see below) |
+| $\text{bonus}$ | +0.05 if $r = 1$, +0.02 if $r \in \{2, 3\}$ | Top-rank bonus |
+
+**List weighting**: wiki BM25 lists (from primary query and each `--lex` term) get weight 2.0. Source BM25 lists and all vector lists get weight 1.0. This is **collection-based**, not positional — unlike QMD which weights the first 2 lists by position. Memex uses collection-based weighting because `--lex` expansion creates variable numbers of BM25 lists; positional weighting would incorrectly over-weight whichever list happens to be second.
+
+Post-fusion scores reassigned as $s(d) = 1 / r$ where $r$ is the final rank (rank 1 = 1.0, rank 2 = 0.5, rank 3 = 0.33). No minScore filtering (QMD's `hybridQuery` default is 0).
+
+Note: QMD blends RRF rank with local reranker scores via $s = w_{\text{rrf}} \cdot \frac{1}{r} + (1 - w_{\text{rrf}}) \cdot s_{\text{rerank}}$. Memex returns RRF scores with best-chunk snippets; the agent LLM reranks results using the snippets before reading full documents.
+
+### BM25 column weights
+
+| Collection | SQL | Weights |
+|---|---|---|
+| wiki | `bm25(documents_fts, 1.5, 4.0, 1.5, 1.0)` | path=1.5, title=4.0, tags=1.5, body=1.0 |
+| source | `bm25(documents_fts, 1.5, 4.0, 0.0, 1.0)` | path=1.5, title=4.0, tags=0.0, body=1.0 |
+
+Note: QMD has 3 FTS columns (filepath, title, body) with weights (1.5, 4.0, 1.0); memex adds a tags column. Wiki 2x weighting is applied in the RRF list weighting above, not in BM25 scores.
+
+### Score normalization
+
+Raw FTS5 BM25 scores (negative, lower = better) normalized via sigmoid:
+
+$$s = \frac{|x|}{1 + |x|}$$
+
+Query-independent mapping:
+
+| Raw BM25 | Normalized | Interpretation |
+|---|---|---|
+| $-10$ | $0.91$ | Strong match |
+| $-2$ | $0.67$ | Medium match |
+| $-0.5$ | $0.33$ | Weak match |
+| $0$ | $0$ | No match |
+
+### Signal detection
+
+Runs on the **initial BM25 probe only** (normalized BM25 scores before RRF fusion), not on post-fusion `1/rank` scores. This matches QMD's `hybridQuery()` which probes FTS first, then decides whether to expand.
+
+$$\text{strong} \iff s_1 \geq 0.85 \;\wedge\; (s_1 - s_2) \geq 0.15$$
+
+where $s_1$ and $s_2$ are the top two **normalized BM25 scores** from the wiki collection FTS probe. If fewer than 2 results, $s_2 = 0$. If no results, signal is always weak. When strong, the agent skips query expansion. Source and vector evidence do not participate in signal detection (intentional: the BM25 probe is a fast pre-check, not a full search).
+
+### Best chunk selection
+
+For each result document, the best-matching chunk is selected via keyword overlap scoring (primary query terms weighted 1.0, `--lex` terms weighted 1.0, `--vec`/`--hyde` terms weighted 0.5). The chunk snippet is included in the output for agent reranking.
+
+### Vector search: chunk-to-document collapse
+
+Each `--vec`/`--hyde` query (and the primary query) is embedded and searched via sqlite-vec cosine similarity. Chunk hits are collapsed to document-level: for each document, keep the chunk with the highest cosine score, deduplicate by document, rank by max chunk score. Each query produces one document-level ranked list fed into RRF.
+
+### Configuration
+
+Embedding model is a constant in the binary, pinned by the npm package version. No user-facing configuration. Model upgrades ship with npm package updates; run `memex lint --fix` after upgrade to re-embed (see lint command).
+
+---
+
+## 7. Session Ingestion & Distillation
+
+> **SUPERSEDED** by `2026-04-19-daemon-ingestion-design.md`. The section below describes the original hook-based architecture. The current design uses daemon-based ingestion. Retained for historical context.
+
+AI agent sessions generate knowledge — design decisions, debugging findings, research conclusions — that vanishes when the session ends. Session ingestion captures this knowledge into the wiki automatically.
+
+### Two-Layer Architecture
+
+**Primary — In-session agent capture (Trigger 1 in Section 4).**
+
+**Secondary — Post-session distillation (automated):**
+When a session ends, a background agent processes the session transcript to catch what the primary mechanism missed. Produces a session summary (audit trail) and extracts any findings the in-session agent didn't capture.
+
+**Post-session flow** — SessionEnd hook triggers distillation:
+
+```mermaid
+graph TD
+    End["Session ends → SessionEnd hook"]
+    End --> Guard{"MEMEX_DISTILLING=1?"}
+    Guard -->|yes| Skip["Skip (distillation session)"]
+    Guard -->|no| Ingest["memex import &lt;agent&gt; --path<br/>(Rust: parse, strip, store source)"]
+    Ingest -->|success| Spawn["Spawn background agent"]
+    Ingest -->|fail| Skip
+    Spawn --> Distill["/memex-distill:<br/>extract topics → search memex →<br/>create/merge wiki pages →<br/>generate session summary"]
+```
+
+**Batch backfill** — user runs `/memex-backfill` in any agent session. See Section 3 for the skill's flow diagram.
+
+### Session lifecycle hooks
+
+**SessionStart hook** — injects relevant memex context. Queries memex for wiki pages relevant to the current project/directory, injects a compact index (title, summary, tags). Agent queries full pages on demand — progressive disclosure avoids context pollution (lesson from claude-mem: v3 injected all history at 35K tokens/1.4% relevance, v4 switched to index-first at 100% relevance). **First-run detection:** if the wiki is empty (no search results), shows a one-time onboarding message: "memex installed. Run `/memex-backfill` to import existing sessions, or just keep working — sessions will auto-capture."
+
+### Recursion guard
+
+The distillation agent creates its own session, which would trigger the SessionEnd hook again. Two mechanisms prevent infinite recursion:
+
+1. **Ephemeral sessions:** The distillation agent runs with no session persistence, leaving no transcript on disk.
+
+   | Agent | Ephemeral flag |
+   |---|---|
+   | Claude Code | `--no-session-persistence` |
+   | Codex CLI | `codex exec --ephemeral` |
+   | Gemini CLI | Not available — use env var guard only |
+
+2. **Hook guard (env var):** The hook sets `MEMEX_DISTILLING=1` before spawning the background agent. The hook checks this variable and skips if set.
+
+```bash
+# SessionEnd hook — Claude Code example
+# Hooks receive JSON via stdin: {"session_id":"...","transcript_path":"...","cwd":"..."}
+if [ "$MEMEX_DISTILLING" = "1" ]; then
+  exit 0  # Skip — this is a distillation session
+fi
+
+# Read stdin JSON and extract transcript_path
+INPUT=$(cat)
+TRANSCRIPT=$(echo "$INPUT" | sed -n 's/.*"transcript_path"\s*:\s*"\([^"]*\)".*/\1/p')
+[ -z "$TRANSCRIPT" ] && exit 0
+
+# Import and capture the docid from the imported: line
+DOCID=$(memex import claude-code --path "$TRANSCRIPT" --quiet 2>/dev/null \
+  | grep '^imported:' | head -1 | cut -f1 | sed 's/imported: //')
+[ -z "$DOCID" ] && exit 0
+
+MEMEX_DISTILLING=1 claude --no-session-persistence --permission-mode auto \
+  -p "/memex-distill $DOCID" &
+# For Codex: MEMEX_DISTILLING=1 codex exec --ephemeral --full-auto "/memex-distill $DOCID" &
+# For Gemini: MEMEX_DISTILLING=1 gemini -p --approval-mode yolo "/memex-distill $DOCID" &
+```
+
+Hooks receive JSON via stdin with `session_id`, `transcript_path`, `cwd`, and `hook_event_name`. The hook reads stdin once and extracts `transcript_path` for import. Agent-specific hooks are generated by `postinstall.js` based on the installing agent (Claude Code, Codex, or Gemini).
+
+Agent spawning is in the hook script (shell), not in the Rust binary. This keeps the binary LLM-free and lets users customize the model, flags, and behavior per agent. The distillation agent uses the user's default model — distillation is high-judgment work (topic extraction, merge decisions) where model quality directly determines wiki quality. Each agent uses its auto-approve mode (`--permission-mode auto`, `--full-auto`, `--approval-mode yolo`) so the distillation agent can run memex commands without interactive approval. Recursion is prevented by the `MEMEX_DISTILLING=1` env var guard.
+
+### Agent compatibility
+
+| Agent | Session End Trigger | Session Start | Hook Mechanism |
+|---|---|---|---|
+| Claude Code | SessionEnd | SessionStart | Lifecycle hook |
+| Gemini CLI | SessionEnd | SessionStart | Lifecycle hook |
+| Cursor | sessionEnd | sessionStart | Lifecycle hook |
+| Codex CLI | Stop | SessionStart | Fires when agent finishes task |
+| Amazon Q CLI | Stop | AgentSpawn | Fires when agent finishes task |
+| Cline | N/A | N/A | MCP only — use manual ingestion |
+| Aider | N/A | N/A | No hooks — use manual ingestion |
+
+### Known agent session locations
+
+| Agent | Session location | Format |
+|---|---|---|
+| Claude Code | `~/.claude/projects/*/*.jsonl` | JSONL (one event per line) |
+| Codex CLI | `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | JSONL (one event per line) |
+| Gemini CLI | `~/.gemini/tmp/*/chats/session-*.json` | JSON (single object with messages array) |
+| Web exports | User-provided via `--path` | TBD (future) |
+
+### Data model
+
+Sessions are stored as **source documents** (collection `source`). Cleaned transcripts get the same treatment as any other source: indexed in FTS5, chunked and embedded for vector search, searchable alongside wiki pages (with wiki results boosted 2x in RRF fusion). Wiki pages produced from sessions link back via the `sources` frontmatter field for provenance.
+
+**Distillation output per session:**
+- One wiki page per distinct topic (not one page per session)
+- If a topic already has a wiki page, merge new findings into the existing page
+- Each wiki page links back to its source session(s) for provenance
+- Session summary page for audit trail (goal, findings, outcome, timestamp)
+
+**Evolution tracking:**
+When a session revisits a topic that already has a wiki page, the distillation process updates the existing page, timestamps the update, and links to the new source session. Over time, wiki pages accumulate knowledge from multiple sessions with full provenance.
+
+### Cost model
+
+- **In-session capture:** Zero additional LLM cost
+- **Post-session distillation:** One LLM session per completed session. Input is a cleaned transcript (10K-50K tokens). Uses the same CLI subscription.
+- **Pre-filter:** Non-substantive sessions (aborted, no user interaction, malformed) are skipped before the LLM pass
 
 ---
 
@@ -794,7 +1018,7 @@ memex/
 ├── CLAUDE.md                   # Developer instructions
 ├── AGENTS.md                   # Developer instructions
 ├── core/                       # memex-core library (storage, search, validation)
-├── cli/                        # memex-cli binary (five commands)
+├── cli/                        # memex-cli binary (write, read, search, delete, lint, import, source)
 ├── plugin/                     # Cross-platform agent plugin (published as @memverge/memex)
 │   ├── package.json            # npm package with postinstall script
 │   ├── postinstall.js          # Downloads binary to PATH + model to ~/.memex/models/
@@ -806,10 +1030,14 @@ memex/
 │   ├── CLAUDE.md               # Plugin user instructions + proactive behavior
 │   ├── AGENTS.md
 │   ├── GEMINI.md
-│   └── skills/
-│       ├── memex-query/SKILL.md
-│       ├── memex-ingest/SKILL.md
-│       └── memex-brainstorm/SKILL.md
+│   ├── skills/
+│   │   ├── memex-query/SKILL.md
+│   │   ├── memex-ingest/SKILL.md
+│   │   ├── memex-brainstorm/SKILL.md
+│   │   ├── memex-distill/SKILL.md
+│   │   └── memex-backfill/SKILL.md
+│   └── hooks/
+│       └── hooks.json              # SessionEnd + SessionStart hooks
 └── docs/
 ```
 
@@ -849,9 +1077,19 @@ For developers building from source: `cargo install --path cli` (puts `memex` on
 
 ## 9. Deferred
 
+**Source ingestion:**
 - **PDF/image source extraction**: current design stores text sources only. PDF text extraction and image description generation are future additions.
 - **Source content for URLs**: mechanism for storing web content fetched by the agent. May need a stdin protocol for passing pre-fetched content.
-- **MCP server** — expose memex operations as MCP tools for richer structured integration
+
+**Knowledge management:**
+- **Confidence scoring and decay**: facts from older sessions could carry lower confidence. Deferred until the wiki is large enough for staleness to be a real problem.
+- **Consolidation tiers**: working memory → episodic → semantic → procedural. Interesting for scale, but premature for v1.
+- **Knowledge graph**: entity extraction, typed relationships, graph traversal. Adds value at scale, not needed initially.
+
+**Infrastructure:**
+- **MCP server**: expose memex operations as MCP tools for richer structured integration.
+- **Transcript watching**: file-system watching as an alternative to hooks (used by claude-mem for Codex CLI). Could be added for agents where hooks are unreliable.
+- **Multi-agent coordination**: multiple agents writing to the same wiki simultaneously. Handle when it becomes a real use case.
 
 ---
 
@@ -859,3 +1097,5 @@ For developers building from source: `cargo install --path cli` (puts `memex` on
 
 - Karpathy's LLM-wiki idea: https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
 - QMD (Query Markup Documents): https://github.com/tobi/qmd
+- LLM Wiki v2 (agentmemory patterns): https://gist.github.com/rohitg00/2067ab416f7bbe447c1977edaaa681e2
+- claude-mem (reference implementation): https://github.com/thedotmack/claude-mem

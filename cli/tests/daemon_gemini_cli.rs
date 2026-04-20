@@ -1,15 +1,15 @@
-//! Integration test for the codex worker's synth path.
+//! Integration test for the gemini cli worker's synth path.
 //!
-//! Symlinks `mock-codex.sh` as `codex` on PATH and sets
-//! `MEMEX__DAEMON__WORKER__AGENT=codex` so the daemon spawns the mock.
+//! Symlinks `mock-gemini-cli.sh` as `gemini` on PATH and sets
+//! `MEMEX__DAEMON__WORKER__AGENT=gemini-cli` so the daemon spawns the mock.
 
 mod common;
 
 use tempfile::TempDir;
 
 #[test]
-fn codex_synth_returns_answer_with_citation() {
-    let (_mock, extra_path) = common::mock_on_path("mock-codex.sh", "codex");
+fn gemini_synth_returns_answer_with_citation() {
+    let (_mock, extra_path) = common::mock_on_path("mock-gemini-cli.sh", "gemini");
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("memex");
 
@@ -21,12 +21,8 @@ fn codex_synth_returns_answer_with_citation() {
         "- 2026-04-16: Production rollout begins",
     );
 
-    // Mock defaults to ok mode. Single-page wiki → weak signal → expand job
-    // fires first (mock returns the synth JSON, which parse_expand rejects,
-    // so the handler falls back to un-expanded retrieval). Then the synth
-    // job runs against the mock, returning a valid synth reply.
     let out = common::memex_cmd(&root, Some(&extra_path))
-        .env("MEMEX__DAEMON__WORKER__AGENT", "codex")
+        .env("MEMEX__DAEMON__WORKER__AGENT", "gemini-cli")
         .env("MEMEX__DAEMON__WORKER__MAX_COUNT", "1")
         .args(["query", "when did production rollout begin"])
         .output()
@@ -51,8 +47,8 @@ fn codex_synth_returns_answer_with_citation() {
 }
 
 #[test]
-fn codex_auth_fail_surfaces_auth_failed() {
-    let (_mock, extra_path) = common::mock_on_path("mock-codex.sh", "codex");
+fn gemini_auth_fail_surfaces_auth_failed() {
+    let (_mock, extra_path) = common::mock_on_path("mock-gemini-cli.sh", "gemini");
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("memex");
     common::ingest_page(
@@ -64,9 +60,9 @@ fn codex_auth_fail_surfaces_auth_failed() {
     );
 
     let out = common::memex_cmd(&root, Some(&extra_path))
-        .env("MEMEX__DAEMON__WORKER__AGENT", "codex")
+        .env("MEMEX__DAEMON__WORKER__AGENT", "gemini-cli")
         .env("MEMEX__DAEMON__WORKER__MAX_COUNT", "1")
-        .env("MOCK_CODEX_MODE", "auth_fail")
+        .env("MOCK_GEMINI_MODE", "auth_fail")
         .args(["query", "any question"])
         .output()
         .unwrap();
@@ -81,8 +77,8 @@ fn codex_auth_fail_surfaces_auth_failed() {
 }
 
 #[test]
-fn codex_crash_retries_then_surfaces_subprocess_crashed() {
-    let (_mock, extra_path) = common::mock_on_path("mock-codex.sh", "codex");
+fn gemini_crash_retries_then_surfaces_subprocess_crashed() {
+    let (_mock, extra_path) = common::mock_on_path("mock-gemini-cli.sh", "gemini");
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("memex");
     common::ingest_page(
@@ -93,12 +89,10 @@ fn codex_crash_retries_then_surfaces_subprocess_crashed() {
         "- 2026-04-16: Production rollout begins",
     );
 
-    // Mock exits immediately on every invocation. Worker retries once
-    // (respawn → also crashes) → surfaces SubprocessCrashed.
     let out = common::memex_cmd(&root, Some(&extra_path))
-        .env("MEMEX__DAEMON__WORKER__AGENT", "codex")
+        .env("MEMEX__DAEMON__WORKER__AGENT", "gemini-cli")
         .env("MEMEX__DAEMON__WORKER__MAX_COUNT", "1")
-        .env("MOCK_CODEX_MODE", "crash")
+        .env("MOCK_GEMINI_MODE", "crash")
         .args(["query", "any question"])
         .output()
         .unwrap();

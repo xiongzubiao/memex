@@ -12,6 +12,7 @@ pub mod schema;
 pub mod search;
 pub mod storage;
 pub mod types;
+pub mod transcript;
 pub mod validate;
 pub mod vector;
 
@@ -19,7 +20,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use config::Config;
-use search::{Bm25Search, WikiSearch};
+use search::Bm25Search;
 
 /// Filename for the BM25 + content SQLite database.
 pub const SEARCH_DB_NAME: &str = ".search.db";

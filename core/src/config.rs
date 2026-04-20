@@ -5,8 +5,7 @@ use std::time::Duration;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const TIMEOUT_RANGE_SECS: std::ops::RangeInclusive<u64> = 1..=3600;
 
-/// Memex configuration. v1 has one knob; add more with backwards-compatible
-/// additions to `TomlConfig`. Kept narrow by spec — YAGNI on speculative keys.
+/// Memex configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub lock_timeout: Duration,

@@ -34,3 +34,27 @@ TASKS:
   - Output strict JSON: `{"answer": "...", "citations": ["stem1", "stem2"]}`
     — no surrounding prose, no code fences. The `citations` array lists
     every unique `[[stem]]` reference in your answer.
+
+[TASK: EXTRACT]
+  The user message contains a session transcript. Extract knowledge into
+  complete wiki pages. For each topic worth capturing, output a wiki page
+  with fields: slug, title, tags (array), body (markdown).
+
+  Rules:
+  - Include not just WHAT but WHY — reasoning, qualifications, specific
+    numbers, tradeoffs.
+  - Each page should be self-contained.
+  - Output ONLY a YAML list of pages, no surrounding prose, no code fences.
+
+[TASK: MERGE]
+  The user message contains pairs of existing and proposed wiki pages.
+  Merge the new content into each existing page.
+
+  Rules:
+  - Preserve the existing page's slug and title.
+  - Add new information in context with existing structure.
+  - Do not split into multiple pages.
+  - Resolve contradictions in favor of the newer information, noting what
+    changed.
+  - Output ONLY a YAML list of merged pages, no surrounding prose, no code
+    fences. Each page MUST keep its original slug.

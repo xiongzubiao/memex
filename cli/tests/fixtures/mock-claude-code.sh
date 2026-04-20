@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mock `claude -p --input-format stream-json --output-format stream-json`.
 #
-# Mode selected via MOCK_CLAUDE_MODE:
+# Mode selected via MOCK_CLAUDE_CODE_MODE:
 #   ok (default) — canned JSON answer with one citation
 #   auth_fail    — structured auth error via result.is_error + assistant error
 #   crash        — exit 1 immediately, no output
@@ -16,7 +16,7 @@
 
 set -u
 
-mode="${MOCK_CLAUDE_MODE:-ok}"
+mode="${MOCK_CLAUDE_CODE_MODE:-ok}"
 
 case "$mode" in
   crash)

@@ -10,3 +10,17 @@ pub fn memex_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".memex")
 }
+
+/// Normalize a title to a kebab-case slug for wiki page filenames.
+pub fn slugify(name: &str) -> String {
+    let slug: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    slug.split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+

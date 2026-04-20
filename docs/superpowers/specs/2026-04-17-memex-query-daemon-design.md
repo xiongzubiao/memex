@@ -4,6 +4,9 @@
 **Date**: 2026-04-17
 **Topic**: Design 3b — `memex query` CLI subcommand that delegates retrieval + synthesis to a background daemon holding a persistent agent subprocess (claude / codex app-server / gemini --acp)
 
+> **Scope expansion notice (2026-04-19):**
+> The non-goals "Routing write/delete/lint through the daemon" and "Changing the ingest path" are un-deferred by `2026-04-19-daemon-ingestion-design.md`. The daemon is expanded from read-only query engine to the single mutating engine. All write operations (`write`, `delete`, `lint --fix`, `ingest`) now route through the daemon by default. The daemon also handles session transcript ingestion with an Extract + Merge LLM pipeline (1-2 calls per session). See the 04-19 spec for details.
+
 ## Context and motivation
 
 `memex` currently exposes primitive CLI commands (`search`, `read`, `write`, `lint`, `delete`). The `memex-query` skill orchestrates retrieval and synthesis by having the agent issue multiple `memex search` / `memex read` calls from Bash, then synthesize an answer. This architecture has two practical problems when used by an agent:

@@ -39,7 +39,7 @@ while IFS= read -r line; do
 
   case "$method" in
     initialize)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"agentInfo":{"name":"mock-gemini"},"agentCapabilities":{},"authMethods":[]}}\n' "$id"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"agentInfo":{"name":"mock-gemini-cli"},"agentCapabilities":{},"authMethods":[]}}\n' "$id"
       ;;
     session/new)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"mock-session","modes":{"currentModeId":"default"},"models":{"currentModelId":"gemini-3-flash-preview"}}}\n' "$id"

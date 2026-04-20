@@ -46,7 +46,7 @@ pub fn is_alive(pid: u32) -> bool {
 
 #[cfg(not(unix))]
 pub fn is_alive(_pid: u32) -> bool {
-    false // Plan 1 is Unix-only; Windows is out of scope.
+    false // Unix-only; Windows is out of scope.
 }
 
 #[cfg(test)]

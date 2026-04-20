@@ -20,6 +20,39 @@ pub enum Request {
         top_k: usize,
         memex_root: String,
     },
+
+    // --- Mutations (daemon is the single writer) ---
+    Write {
+        #[serde(default = "default_version")]
+        v: u32,
+        title: String,
+        content: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        sources: Vec<String>,
+        #[serde(default)]
+        force: bool,
+        memex_root: String,
+    },
+    Ingest {
+        #[serde(default = "default_version")]
+        v: u32,
+        transcript_path: String,
+        agent: String,
+        memex_root: String,
+    },
+    Delete {
+        #[serde(default = "default_version")]
+        v: u32,
+        slug: String,
+        memex_root: String,
+    },
+    LintFix {
+        #[serde(default = "default_version")]
+        v: u32,
+        memex_root: String,
+    },
 }
 
 fn default_version() -> u32 {
@@ -39,6 +72,8 @@ pub enum Event {
         started_at: String,
     },
     Queued {
+        #[serde(default)]
+        job_id: String,
         ahead: usize,
     },
     Answer {
@@ -62,6 +97,32 @@ pub enum Event {
     },
     Done {
         status: i32,
+    },
+
+    // --- Mutation responses ---
+    Written {
+        slug: String,
+        docid: String,
+    },
+    Deleted {
+        slug: String,
+    },
+    LintResult {
+        fixed: u32,
+        remaining: u32,
+    },
+    Parsing {
+        job_id: String,
+        transcript_path: String,
+    },
+    Distilling {
+        job_id: String,
+        transcript_path: String,
+    },
+    Stored {
+        job_id: String,
+        source_docid: String,
+        wiki_pages: Vec<String>,
     },
 }
 
@@ -133,6 +194,93 @@ mod tests {
     fn unknown_op_is_rejected() {
         let err = serde_json::from_str::<Request>(r#"{"op":"bogus"}"#).unwrap_err();
         assert!(err.to_string().contains("bogus") || err.to_string().contains("variant"));
+    }
+
+    #[test]
+    fn write_request_deserializes() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"write","title":"Test","content":"body","memex_root":"/x"}"#,
+        )
+        .unwrap();
+        match r {
+            Request::Write { title, content, tags, sources, force, .. } => {
+                assert_eq!(title, "Test");
+                assert_eq!(content, "body");
+                assert!(tags.is_empty());
+                assert!(sources.is_empty());
+                assert!(!force);
+            }
+            _ => panic!("expected Write"),
+        }
+    }
+
+    #[test]
+    fn ingest_request_deserializes() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"ingest","transcript_path":"/tmp/s.jsonl","agent":"claude-code","memex_root":"/x"}"#,
+        )
+        .unwrap();
+        match r {
+            Request::Ingest { transcript_path, agent, memex_root, .. } => {
+                assert_eq!(transcript_path, "/tmp/s.jsonl");
+                assert_eq!(agent, "claude-code");
+                assert_eq!(memex_root, "/x");
+            }
+            _ => panic!("expected Ingest"),
+        }
+    }
+
+    #[test]
+    fn delete_request_deserializes() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"delete","slug":"my-page","memex_root":"/x"}"#,
+        )
+        .unwrap();
+        assert!(matches!(r, Request::Delete { .. }));
+    }
+
+    #[test]
+    fn lint_fix_request_deserializes() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"lint_fix","memex_root":"/x"}"#,
+        )
+        .unwrap();
+        assert!(matches!(r, Request::LintFix { .. }));
+    }
+
+    #[test]
+    fn written_event_serializes() {
+        let e = Event::Written {
+            slug: "my-page".into(),
+            docid: "wiki-abc".into(),
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""type":"written""#));
+        assert!(s.contains(r#""slug":"my-page""#));
+    }
+
+    #[test]
+    fn stored_event_serializes() {
+        let e = Event::Stored {
+            job_id: "job-1".into(),
+            source_docid: "src-abc".into(),
+            wiki_pages: vec!["auth-debugging".into(), "sqlite-config".into()],
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""type":"stored""#));
+        assert!(s.contains(r#""job_id":"job-1""#));
+        assert!(s.contains("auth-debugging"));
+    }
+
+    #[test]
+    fn queued_event_has_job_id() {
+        let e = Event::Queued {
+            job_id: "job-42".into(),
+            ahead: 3,
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""job_id":"job-42""#));
+        assert!(s.contains(r#""ahead":3"#));
     }
 
     #[test]

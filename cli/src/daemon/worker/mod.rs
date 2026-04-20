@@ -1,17 +1,22 @@
 //! Worker pool for agent subprocesses.
 //!
-//! Plan 3: single agent implementation (Claude). Plan 5 adds `codex.rs` and
-//! `gemini.rs` as sibling modules behind the same `WorkerPool` entry.
+//! Each agent (Claude Code, Codex, Gemini CLI) is a sibling module behind
+//! the same `WorkerPool` entry.
 
-pub mod claude;
+pub mod claude_code;
 pub mod codex;
-pub mod gemini;
+pub mod gemini_cli;
 mod jsonrpc;
 pub(crate) mod parse;
 
+/// Maximum accumulated LLM response size (bytes). Prevents OOM from
+/// runaway streaming. The largest model output is ~512KB (128K tokens).
+pub(crate) const MAX_RESPONSE_BYTES: usize = 1_048_576;
+
 use crate::daemon::config::{Agent, WorkerConfig};
 use crate::daemon::queue::{
-    AgentJob, ExpandResult, JobReceiver, JobSender, SynthResult, WorkerError, queue,
+    AgentJob, ExpandResult, IngestResult, JobReceiver, JobSender, MergeResult, SynthResult,
+    WorkerError, queue,
 };
 use anyhow::Result;
 use std::sync::Arc;
@@ -29,8 +34,10 @@ pub(crate) enum TurnOutcome {
 /// Outcome of one job, variant matches the AgentJob that was dispatched.
 #[derive(Debug)]
 pub(super) enum JobOutcome {
-    Synth(SynthResult),
     Expand(ExpandResult),
+    Synth(SynthResult),
+    Ingest(IngestResult),
+    Merge(MergeResult),
 }
 
 /// Configure a subprocess command for an agent worker: sanitize env,
@@ -80,38 +87,38 @@ pub(crate) fn classify_error_text(text: &str) -> TurnOutcome {
 /// struct defined in its own module. Dispatch methods below enable
 /// protocol-agnostic use in `run_job_with_retry`.
 enum Subprocess {
-    Claude(claude::ClaudeSubprocess),
+    ClaudeCode(claude_code::ClaudeSubprocess),
     Codex(codex::CodexSubprocess),
-    Gemini(gemini::GeminiSubprocess),
+    GeminiCli(gemini_cli::GeminiSubprocess),
 }
 
 impl Subprocess {
     async fn spawn(agent: Agent, cfg: &WorkerConfig) -> Result<Self> {
         Ok(match agent {
-            Agent::Claude => Subprocess::Claude(claude::ClaudeSubprocess::spawn(cfg).await?),
+            Agent::ClaudeCode => Subprocess::ClaudeCode(claude_code::ClaudeSubprocess::spawn(cfg).await?),
             Agent::Codex => Subprocess::Codex(codex::CodexSubprocess::spawn(cfg).await?),
-            Agent::Gemini => Subprocess::Gemini(gemini::GeminiSubprocess::spawn(cfg).await?),
+            Agent::GeminiCli => Subprocess::GeminiCli(gemini_cli::GeminiSubprocess::spawn(cfg).await?),
         })
     }
 
     async fn one_turn(&mut self, prompt: &str) -> Result<TurnOutcome> {
         match self {
-            Subprocess::Claude(s) => s.one_turn(prompt).await,
+            Subprocess::ClaudeCode(s) => s.one_turn(prompt).await,
             Subprocess::Codex(s) => s.one_turn(prompt).await,
-            Subprocess::Gemini(s) => s.one_turn(prompt).await,
+            Subprocess::GeminiCli(s) => s.one_turn(prompt).await,
         }
     }
 
     /// Reset state for the restart cadence. Returns `true` if the
     /// subprocess is still usable after the soft reset (codex fresh_thread,
-    /// gemini fresh_session); `false` if the caller should drop and respawn
-    /// on next use (claude — full subprocess restart is the documented
+    /// gemini-cli fresh_session); `false` if the caller should drop and respawn
+    /// on next use (claude code, full subprocess restart is the documented
     /// reset semantic).
     async fn soft_reset(&mut self, cfg: &WorkerConfig) -> bool {
         match self {
-            Subprocess::Claude(_) => false, // full respawn on next job
+            Subprocess::ClaudeCode(_) => false, // full respawn on next job
             Subprocess::Codex(s) => s.fresh_thread(cfg).await.is_ok(),
-            Subprocess::Gemini(s) => s.fresh_session(cfg).await.is_ok(),
+            Subprocess::GeminiCli(s) => s.fresh_session(cfg).await.is_ok(),
         }
     }
 }
@@ -159,7 +166,7 @@ impl WorkerPool {
     ) -> Result<(), async_channel::SendError<AgentJob>> {
         let live = self.live.load(Ordering::Acquire);
         let busy = self.busy.load(Ordering::Acquire);
-        if (self.tx.len() > 0 || busy >= live) && live < self.cfg.max_count {
+        if (!self.tx.is_empty() || busy >= live) && live < self.cfg.max_count {
             self.spawn_extra_worker();
         }
         self.tx.send(job).await
@@ -269,8 +276,10 @@ async fn run(
         // undercounting.
         let counted = !matches!(
             &outcome,
-            JobOutcome::Synth(Err(WorkerError::Crash(_) | WorkerError::Timeout))
-                | JobOutcome::Expand(Err(WorkerError::Crash(_) | WorkerError::Timeout))
+            JobOutcome::Expand(Err(WorkerError::Crash(_) | WorkerError::Timeout))
+                | JobOutcome::Synth(Err(WorkerError::Crash(_) | WorkerError::Timeout))
+                | JobOutcome::Ingest(Err(WorkerError::Crash(_) | WorkerError::Timeout))
+                | JobOutcome::Merge(Err(WorkerError::Crash(_) | WorkerError::Timeout))
         );
         if counted {
             jobs_done = jobs_done.saturating_add(1);
@@ -285,10 +294,16 @@ async fn run(
         // — log and drop the reply rather than panicking the worker (which
         // would kill the min worker and force a cold respawn).
         match (job, outcome) {
+            (AgentJob::Expand(j), JobOutcome::Expand(r)) => {
+                let _ = j.reply.send(r);
+            }
             (AgentJob::Synth(j), JobOutcome::Synth(r)) => {
                 let _ = j.reply.send(r);
             }
-            (AgentJob::Expand(j), JobOutcome::Expand(r)) => {
+            (AgentJob::Ingest(j), JobOutcome::Ingest(r)) => {
+                let _ = j.reply.send(r);
+            }
+            (AgentJob::Merge(j), JobOutcome::Merge(r)) => {
                 let _ = j.reply.send(r);
             }
             _ => {
@@ -324,30 +339,48 @@ async fn run_job_with_retry(
     cfg: &WorkerConfig,
     job: &AgentJob,
 ) -> (JobOutcome, u64) {
-    let (prompt, is_expand) = match job {
+    #[derive(Clone, Copy)]
+    enum JobKind { Expand, Synth, Ingest, Merge }
+
+    let (prompt, kind) = match job {
+        AgentJob::Expand(j) => (
+            format!("[TASK: EXPAND]\n\nQuestion: {}\n", j.question),
+            JobKind::Expand,
+        ),
         AgentJob::Synth(j) => (
             format!(
                 "[TASK: SYNTHESIZE]\n\n{}\n\nQuestion: {}\n",
                 j.context, j.question
             ),
-            false,
+            JobKind::Synth,
         ),
-        AgentJob::Expand(j) => (
-            format!("[TASK: EXPAND]\n\nQuestion: {}\n", j.question),
-            true,
+        AgentJob::Ingest(j) => (
+            format!("[TASK: EXTRACT]\n\n{}\n", j.transcript),
+            JobKind::Ingest,
         ),
+        AgentJob::Merge(j) => {
+            let mut parts = Vec::new();
+            for pair in &j.pages {
+                parts.push(format!(
+                    "--- PAGE: {} ---\nEXISTING:\n{}\n\nNEW CONTENT:\n{}\n",
+                    pair.slug, pair.existing, pair.proposed
+                ));
+            }
+            (
+                format!("[TASK: MERGE]\n\n{}\n", parts.join("\n")),
+                JobKind::Merge,
+            )
+        }
     };
 
     let timeout = std::time::Duration::from_secs(cfg.timeout_sec);
     let mut last_err: WorkerError = WorkerError::Crash("no attempt completed".into());
 
-    // Wrap a provider-shape result as the job-shape JobOutcome variant.
-    let as_err = |e: WorkerError| {
-        if is_expand {
-            JobOutcome::Expand(Err(e))
-        } else {
-            JobOutcome::Synth(Err(e))
-        }
+    let as_err = |e: WorkerError| match kind {
+        JobKind::Expand => JobOutcome::Expand(Err(e)),
+        JobKind::Synth => JobOutcome::Synth(Err(e)),
+        JobKind::Ingest => JobOutcome::Ingest(Err(e)),
+        JobKind::Merge => JobOutcome::Merge(Err(e)),
     };
 
     for attempt in 0..2u32 {
@@ -366,16 +399,31 @@ async fn run_job_with_retry(
 
         match turn {
             Ok(Ok(TurnOutcome::Ok { text, input_tokens })) => {
-                let outcome = if is_expand {
-                    JobOutcome::Expand(parse::parse_expand(&text).map_err(|raw| {
-                        tracing::warn!(raw = %raw, "expand reply didn't parse");
-                        WorkerError::AgentError(raw)
-                    }))
-                } else {
-                    JobOutcome::Synth(parse::parse_reply(&text).map_err(|raw| {
-                        tracing::warn!(raw = %raw, "synth reply didn't parse");
-                        WorkerError::AgentError(raw)
-                    }))
+                let outcome = match kind {
+                    JobKind::Expand => {
+                        JobOutcome::Expand(parse::parse_expand(&text).map_err(|raw| {
+                            tracing::warn!(raw = %raw, "expand reply didn't parse");
+                            WorkerError::AgentError(raw)
+                        }))
+                    }
+                    JobKind::Synth => {
+                        JobOutcome::Synth(parse::parse_reply(&text).map_err(|raw| {
+                            tracing::warn!(raw = %raw, "synth reply didn't parse");
+                            WorkerError::AgentError(raw)
+                        }))
+                    }
+                    JobKind::Ingest => {
+                        JobOutcome::Ingest(parse::parse_ingest(&text).map_err(|raw| {
+                            tracing::warn!(raw = %raw, "ingest reply didn't parse");
+                            WorkerError::AgentError(raw)
+                        }))
+                    }
+                    JobKind::Merge => {
+                        JobOutcome::Merge(parse::parse_merge(&text).map_err(|raw| {
+                            tracing::warn!(raw = %raw, "merge reply didn't parse");
+                            WorkerError::AgentError(raw)
+                        }))
+                    }
                 };
                 return (outcome, input_tokens);
             }
@@ -383,7 +431,7 @@ async fn run_job_with_retry(
                 tracing::warn!(text = %text, "auth failed");
                 // Reset protocol state: the subprocess may have buffered
                 // notifications for the errored turn that would otherwise
-                // arrive as stale IDs on the next turn. For claude,
+                // arrive as stale IDs on the next turn. For claude code,
                 // soft_reset returns false and the next job respawns.
                 if let Some(sp) = subprocess.as_mut()
                     && !sp.soft_reset(cfg).await
@@ -425,7 +473,7 @@ mod tests {
     /// Each keyword exists because at least one provider needs it.
     #[test]
     fn classify_error_text_recognizes_every_keyword() {
-        // codex + gemini: generic auth errors
+        // codex + gemini cli: generic auth errors
         for kw in ["authentication", "unauthorized", "forbidden", "api key"] {
             let out = classify_error_text(&format!("turn failed: {kw} problem"));
             assert!(
@@ -438,7 +486,7 @@ mod tests {
             classify_error_text("please login and retry"),
             TurnOutcome::Auth(_)
         ));
-        // gemini-specific: "credentials"
+        // gemini cli-specific: "credentials"
         assert!(matches!(
             classify_error_text("invalid credentials"),
             TurnOutcome::Auth(_)
@@ -467,7 +515,7 @@ mod tests {
 
     #[test]
     fn context_threshold_resolves_for_each_agent() {
-        for agent in [Agent::Claude, Agent::Codex, Agent::Gemini] {
+        for agent in [Agent::ClaudeCode, Agent::Codex, Agent::GeminiCli] {
             let name = agent.default_model();
             let info = memex_core::model::lookup_model(name);
             assert!(
