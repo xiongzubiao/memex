@@ -79,25 +79,35 @@ pub fn parse_ingest(text: &str) -> Result<IngestReply, ParseFailure> {
     }
 
     let cleaned = strip_code_fences(text);
-    if let Ok(pages) = serde_json::from_str::<Vec<ExtractedPage>>(cleaned) {
+    if let Ok(pages) = serde_json::from_str::<Vec<ExtractedPage>>(cleaned)
+        && !pages.is_empty()
+    {
         return Ok(IngestReply { pages });
     }
-    if let Ok(w) = serde_json::from_str::<WrappedPages>(cleaned) {
+    if let Ok(w) = serde_json::from_str::<WrappedPages>(cleaned)
+        && !w.pages.is_empty()
+    {
         return Ok(IngestReply { pages: w.pages });
     }
     if let Ok(page) = serde_json::from_str::<ExtractedPage>(cleaned) {
         return Ok(IngestReply { pages: vec![page] });
     }
-    if let Ok(pages) = parse_json_with_recovery::<Vec<ExtractedPage>>(cleaned) {
+    if let Ok(pages) = parse_json_with_recovery::<Vec<ExtractedPage>>(cleaned)
+        && !pages.is_empty()
+    {
         return Ok(IngestReply { pages });
     }
-    if let Ok(w) = parse_json_with_recovery::<WrappedPages>(cleaned) {
+    if let Ok(w) = parse_json_with_recovery::<WrappedPages>(cleaned)
+        && !w.pages.is_empty()
+    {
         return Ok(IngestReply { pages: w.pages });
     }
     if let Ok(page) = parse_json_with_recovery::<ExtractedPage>(cleaned) {
         return Ok(IngestReply { pages: vec![page] });
     }
-    if let Ok(pages) = serde_yaml::from_str::<Vec<ExtractedPage>>(cleaned) {
+    if let Ok(pages) = serde_yaml::from_str::<Vec<ExtractedPage>>(cleaned)
+        && !pages.is_empty()
+    {
         return Ok(IngestReply { pages });
     }
     if let Ok(page) = serde_yaml::from_str::<ExtractedPage>(cleaned) {
@@ -105,11 +115,13 @@ pub fn parse_ingest(text: &str) -> Result<IngestReply, ParseFailure> {
     }
     if let Some(idx) = cleaned.find("\n- slug:")
         && let Ok(pages) = serde_yaml::from_str::<Vec<ExtractedPage>>(&cleaned[idx + 1..])
+        && !pages.is_empty()
     {
         return Ok(IngestReply { pages });
     }
     if cleaned.starts_with("- slug:")
         && let Ok(pages) = serde_yaml::from_str::<Vec<ExtractedPage>>(cleaned)
+        && !pages.is_empty()
     {
         return Ok(IngestReply { pages });
     }

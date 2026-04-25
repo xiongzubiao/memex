@@ -12,6 +12,21 @@ categories = ["command-line-utilities", "text-processing"]
 name = "memex"
 path = "src/main.rs"
 
+[[test]]
+name = "harness_smoke_test"
+required-features = ["test-harness"]
+
+[[test]]
+name = "source_add_test"
+required-features = ["test-harness"]
+
+[[test]]
+name = "document_ingest_test"
+required-features = ["test-harness"]
+
+[features]
+test-harness = ["dep:tempfile"]
+
 [dependencies]
 memex-core = { path = "../core", version = "0.1" }
 clap = { version = "4.5", features = ["derive"] }
@@ -33,6 +48,7 @@ thiserror = "2"
 glob = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 async-openai = { version = "0.35", default-features = false, features = ["rustls", "chat-completion"] }
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -2,17 +2,43 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TranscriptAgent {
+    ClaudeCode,
+    Codex,
+    GeminiCli,
+}
+
+impl TranscriptAgent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TranscriptAgent::ClaudeCode => "claude-code",
+            TranscriptAgent::Codex => "codex",
+            TranscriptAgent::GeminiCli => "gemini-cli",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IngestSource {
+    Transcript {
+        path: String,
+        agent: TranscriptAgent,
+    },
+    Document {
+        source_path: String,
+        content: String,
+    },
+}
+
 /// Incoming request. `op` discriminates the variant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    Ping {
-        #[serde(default = "default_version")]
-        v: u32,
-    },
+    Ping {},
     Query {
-        #[serde(default = "default_version")]
-        v: u32,
         question: String,
         #[serde(default)]
         raw: bool,
@@ -25,43 +51,46 @@ pub enum Request {
 
     // --- Mutations (daemon is the single writer) ---
     Write {
-        #[serde(default = "default_version")]
-        v: u32,
         title: String,
         content: String,
         #[serde(default)]
         tags: Vec<String>,
         #[serde(default)]
-        sources: Vec<String>,
+        source: Option<String>,
         #[serde(default)]
         force: bool,
         memex_root: String,
     },
     Ingest {
-        #[serde(default = "default_version")]
-        v: u32,
-        transcript_path: String,
-        agent: String,
+        source: IngestSource,
         #[serde(default)]
         collections: Vec<String>,
         memex_root: String,
     },
+    SourceAdd {
+        source_path: String,
+        content: String,
+        #[serde(default)]
+        collections: Vec<String>,
+        memex_root: String,
+    },
+    SourceDelete {
+        /// `src-...` docid OR `path:<source-path>`
+        #[serde(rename = "ref")]
+        ref_: String,
+        #[serde(default)]
+        force: bool,
+        memex_root: String,
+    },
     Delete {
-        #[serde(default = "default_version")]
-        v: u32,
         slug: String,
         memex_root: String,
     },
     LintFix {
-        #[serde(default = "default_version")]
-        v: u32,
         memex_root: String,
     },
 }
 
-fn default_version() -> u32 {
-    1
-}
 fn default_top_k() -> usize {
     5
 }
@@ -128,9 +157,17 @@ pub enum Event {
         source_docid: String,
         wiki_pages: Vec<String>,
     },
+    SourceAdded {
+        docid: String,
+    },
+    SourceDeleted {
+        docid: String,
+        source_path: String,
+        /// Wiki page slugs whose frontmatter `sources:` field referenced this source.
+        /// They become dangling — `memex lint` reports them.
+        dangling_wiki_pages: Vec<String>,
+    },
 }
-
-pub const SUPPORTED_VERSIONS: &[u32] = &[1];
 
 #[cfg(test)]
 mod tests {
@@ -138,14 +175,8 @@ mod tests {
 
     #[test]
     fn ping_request_deserializes() {
-        let r: Request = serde_json::from_str(r#"{"op":"ping","v":1}"#).unwrap();
-        assert!(matches!(r, Request::Ping { v: 1 }));
-    }
-
-    #[test]
-    fn ping_request_without_v_uses_default() {
         let r: Request = serde_json::from_str(r#"{"op":"ping"}"#).unwrap();
-        assert!(matches!(r, Request::Ping { v: 1 }));
+        assert!(matches!(r, Request::Ping {}));
     }
 
     #[test]
@@ -154,14 +185,12 @@ mod tests {
             serde_json::from_str(r#"{"op":"query","question":"q","memex_root":"/x"}"#).unwrap();
         match r {
             Request::Query {
-                v,
                 question,
                 raw,
                 top_k,
                 collections,
                 memex_root,
             } => {
-                assert_eq!(v, 1);
                 assert_eq!(question, "q");
                 assert!(!raw);
                 assert_eq!(top_k, 5);
@@ -224,17 +253,12 @@ mod tests {
         .unwrap();
         match r {
             Request::Write {
-                title,
-                content,
-                tags,
-                sources,
-                force,
-                ..
+                title, content, tags, source, force, ..
             } => {
                 assert_eq!(title, "Test");
                 assert_eq!(content, "body");
                 assert!(tags.is_empty());
-                assert!(sources.is_empty());
+                assert!(source.is_none());
                 assert!(!force);
             }
             _ => panic!("expected Write"),
@@ -242,21 +266,82 @@ mod tests {
     }
 
     #[test]
-    fn ingest_request_deserializes() {
+    fn write_request_with_source_docid_deserializes() {
         let r: Request = serde_json::from_str(
-            r#"{"op":"ingest","transcript_path":"/tmp/s.jsonl","agent":"claude-code","memex_root":"/x"}"#,
+            r#"{"op":"write","title":"T","content":"b","source":"src-deadbeef","memex_root":"/x"}"#,
         )
         .unwrap();
         match r {
-            Request::Ingest {
-                transcript_path,
-                agent,
-                collections,
-                memex_root,
-                ..
-            } => {
-                assert_eq!(transcript_path, "/tmp/s.jsonl");
-                assert_eq!(agent, "claude-code");
+            Request::Write { source, .. } => assert_eq!(source.as_deref(), Some("src-deadbeef")),
+            _ => panic!("expected Write"),
+        }
+    }
+
+    #[test]
+    fn source_add_request_deserializes() {
+        let r: Request = serde_json::from_str(
+            r##"{"op":"source_add","source_path":"https://x/p","content":"# T\n","memex_root":"/x"}"##,
+        )
+        .unwrap();
+        match r {
+            Request::SourceAdd { source_path, content, .. } => {
+                assert_eq!(source_path, "https://x/p");
+                assert!(content.starts_with("# T"));
+            }
+            _ => panic!("expected SourceAdd"),
+        }
+    }
+
+    #[test]
+    fn source_added_event_serializes() {
+        let e = Event::SourceAdded { docid: "src-abc".into() };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""type":"source_added""#));
+        assert!(s.contains(r#""docid":"src-abc""#));
+    }
+
+    #[test]
+    fn source_delete_request_deserializes() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"source_delete","ref":"src-abc","force":true,"memex_root":"/x"}"#,
+        )
+        .unwrap();
+        match r {
+            Request::SourceDelete { ref_, force, .. } => {
+                assert_eq!(ref_, "src-abc");
+                assert!(force);
+            }
+            _ => panic!("expected SourceDelete"),
+        }
+    }
+
+    #[test]
+    fn source_deleted_event_serializes() {
+        let e = Event::SourceDeleted {
+            docid: "src-abc".into(),
+            source_path: "https://x/p".into(),
+            dangling_wiki_pages: vec!["my-page".into()],
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""type":"source_deleted""#));
+        assert!(s.contains(r#""dangling_wiki_pages":["my-page"]"#));
+    }
+
+    #[test]
+    fn ingest_request_transcript_deserializes() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"ingest","source":{"kind":"transcript","path":"/tmp/s.jsonl","agent":"claude-code"},"memex_root":"/x"}"#,
+        )
+        .unwrap();
+        match r {
+            Request::Ingest { source, collections, memex_root } => {
+                match source {
+                    IngestSource::Transcript { path, agent } => {
+                        assert_eq!(path, "/tmp/s.jsonl");
+                        assert_eq!(agent, TranscriptAgent::ClaudeCode);
+                    }
+                    _ => panic!("expected Transcript"),
+                }
                 assert!(collections.is_empty());
                 assert_eq!(memex_root, "/x");
             }
@@ -265,14 +350,21 @@ mod tests {
     }
 
     #[test]
-    fn ingest_request_deserializes_with_collections() {
+    fn ingest_request_document_deserializes() {
         let r: Request = serde_json::from_str(
-            r#"{"op":"ingest","transcript_path":"/tmp/s.jsonl","agent":"claude-code","collections":["default","project-a"],"memex_root":"/x"}"#,
+            r##"{"op":"ingest","source":{"kind":"document","source_path":"https://example.com/post","content":"# Title\n\nbody\n"},"collections":["team-a"],"memex_root":"/x"}"##,
         )
         .unwrap();
         match r {
-            Request::Ingest { collections, .. } => {
-                assert_eq!(collections, vec!["default", "project-a"]);
+            Request::Ingest { source, collections, .. } => {
+                match source {
+                    IngestSource::Document { source_path, content } => {
+                        assert_eq!(source_path, "https://example.com/post");
+                        assert!(content.starts_with("# Title"));
+                    }
+                    _ => panic!("expected Document"),
+                }
+                assert_eq!(collections, vec!["team-a"]);
             }
             _ => panic!("expected Ingest"),
         }

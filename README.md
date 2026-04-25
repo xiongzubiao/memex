@@ -26,8 +26,27 @@ EOF
 memex backfill claude-code
 memex backfill codex --collection team-a --collection incidents
 
-# Ingest one hook transcript into specific collections
-echo '{"transcript_path":"/abs/path/session.jsonl"}' | memex ingest --agent codex --collection team-a
+# Ingest one transcript by path (hooks fire automatically for new sessions)
+memex ingest --agent codex /abs/path/session.jsonl --collection team-a
+
+# Or let memex infer the agent from the transcript content:
+memex ingest /abs/path/session.jsonl --collection team-a
+
+# Ingest a web page or any document via a converter
+markitdown https://example.com/post | memex ingest --source https://example.com/post
+
+# Or use the interactive skill (propose pages, approve, write each)
+# /memex-ingest https://example.com/post
+```
+
+For one-off captures via the skill, the underlying flow chains
+`source add` and `write`:
+
+```bash
+# Manually capture a URL into one or more wiki pages:
+content=$(markitdown https://example.com/post)
+docid=$(printf '%s' "$content" | memex source add https://example.com/post)
+printf '...page body...' | memex write my-page --source "$docid"
 ```
 
 ## How it works
@@ -68,6 +87,19 @@ No `--collection` behavior:
   `~/.memex/models/embedding-gemma-300m.onnx`. Without it, memex falls
   back to hash-based embedding (BM25 still works, vector retrieval is
   degraded).
+- **Optional**: any HTML→Markdown / PDF→Markdown / document-to-Markdown
+  converter, for ingesting non-text sources via `memex ingest --source`.
+  [`markitdown`](https://github.com/microsoft/markitdown) is a convenient
+  one-stop choice — install with `uv tool install 'markitdown[all]'`. The
+  `[all]` extras pull in support for PDF, DOCX, PPTX, XLSX, audio (with
+  transcription), and YouTube. `uv` installs the tool in an isolated
+  environment with its bin on PATH, avoids PEP 668 issues on
+  Debian/Ubuntu, and is much faster than pipx. Get `uv` from
+  https://github.com/astral-sh/uv. Memex itself does not fetch or
+  convert; it expects pre-cleaned Markdown on stdin.
+- **Optional for JS-rendered or authenticated pages**: `agent-browser`
+  (and `setup-browser-cookies` for login-walled pages). Used by the
+  `/memex-ingest` skill when markitdown returns an empty/skeleton output.
 
 ### Build from source
 

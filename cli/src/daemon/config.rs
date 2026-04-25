@@ -9,11 +9,17 @@ use serde::Deserialize;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// Default cap on ingest content size, shared by every reader so a
+/// payload accepted by one component is accepted by the others. The
+/// `ingest.fetch_max_bytes` config field is configurable up to 500MB.
+pub const INGEST_MAX_BYTES: usize = 100 * 1024 * 1024;
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub daemon: DaemonConfig,
     pub query: QueryConfig,
+    pub ingest: IngestConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,6 +67,26 @@ impl Default for WorkerConfig {
             idle_reap_sec: 600,
             restart_after_jobs: 100,
             timeout_sec: 300,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IngestConfig {
+    pub fetch_max_bytes: usize,
+    pub chunk_target_tokens: usize,
+    pub chunk_hard_cap_tokens: usize,
+    pub max_chunks: usize,
+}
+
+impl Default for IngestConfig {
+    fn default() -> Self {
+        Self {
+            fetch_max_bytes: INGEST_MAX_BYTES,
+            chunk_target_tokens: 30_000,
+            chunk_hard_cap_tokens: 50_000,
+            max_chunks: 20,
         }
     }
 }
@@ -165,6 +191,28 @@ impl Config {
         if !(1..=20).contains(&q.top_k) {
             bail!("query.top_k = {} out of range 1..=20", q.top_k);
         }
+        let i = &self.ingest;
+        if !(1024..=500 * 1024 * 1024).contains(&i.fetch_max_bytes) {
+            bail!(
+                "ingest.fetch_max_bytes = {} out of range 1024..=524288000",
+                i.fetch_max_bytes
+            );
+        }
+        if !(1_000..=200_000).contains(&i.chunk_target_tokens) {
+            bail!(
+                "ingest.chunk_target_tokens = {} out of range 1000..=200000",
+                i.chunk_target_tokens
+            );
+        }
+        if !(i.chunk_target_tokens..=400_000).contains(&i.chunk_hard_cap_tokens) {
+            bail!(
+                "ingest.chunk_hard_cap_tokens = {} must be ≥ chunk_target_tokens and ≤ 400000",
+                i.chunk_hard_cap_tokens
+            );
+        }
+        if !(1..=200).contains(&i.max_chunks) {
+            bail!("ingest.max_chunks = {} out of range 1..=200", i.max_chunks);
+        }
         Ok(())
     }
 }
@@ -262,5 +310,30 @@ top_k = 999
             full_error.contains("top_k"),
             "expected 'top_k' in error chain, got: {full_error}"
         );
+    }
+
+    #[test]
+    fn ingest_defaults() {
+        let c = Config::default();
+        assert_eq!(c.ingest.fetch_max_bytes, INGEST_MAX_BYTES);
+        assert_eq!(c.ingest.chunk_target_tokens, 30_000);
+        assert_eq!(c.ingest.chunk_hard_cap_tokens, 50_000);
+        assert_eq!(c.ingest.max_chunks, 20);
+    }
+
+    #[test]
+    fn ingest_rejects_inverted_thresholds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = write_config(
+            &tmp,
+            r#"
+[ingest]
+chunk_target_tokens = 50000
+chunk_hard_cap_tokens = 10000
+"#,
+        );
+        let err = Config::load(&path).unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(msg.contains("chunk_hard_cap_tokens"), "got: {msg}");
     }
 }

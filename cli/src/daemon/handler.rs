@@ -6,7 +6,7 @@
 
 use crate::daemon::error::DaemonError;
 use crate::daemon::memex_cache::MemexCache;
-use crate::daemon::protocol::{Event, Request, SUPPORTED_VERSIONS};
+use crate::daemon::protocol::{Event, Request};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,6 +33,7 @@ pub struct HandlerState {
     /// map itself (brief lock); the inner TokioMutex is held across the
     /// long-running MERGE LLM call via `.await`.
     pub slug_locks: Arc<StdMutex<HashMap<SlugKey, Arc<TokioMutex<()>>>>>,
+    pub config: Arc<crate::daemon::config::Config>,
 }
 
 /// Acquire per-slug locks for a batch, in sorted order to avoid deadlock
@@ -321,54 +322,6 @@ fn embed_ingested(
     Ok(())
 }
 
-/// Canonicalize a user-supplied source path, store its content in the DB,
-/// and embed it. A missing file logs a warning and returns `Ok(())` — we
-/// treat sources as best-effort enrichment, not a hard requirement.
-async fn store_additional_source(
-    search: &memex_core::search::Bm25Search,
-    model: &mut memex_core::embed::EmbeddingModel,
-    source_path_str: &str,
-    now: &str,
-) -> Result<(), DaemonError> {
-    let source_path = std::path::PathBuf::from(source_path_str);
-    let Ok(source_path) = tokio::fs::canonicalize(&source_path).await else {
-        tracing::warn!(path = source_path_str, "source not found; skipping");
-        return Ok(());
-    };
-    let Ok(source_content) = tokio::fs::read_to_string(&source_path).await else {
-        tracing::warn!(path = %source_path.display(), "source read failed; skipping");
-        return Ok(());
-    };
-    let source_abs = source_path.to_string_lossy().to_string();
-    let source_title = source_path
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let source_summary = memex_core::index::extract_summary(&source_content, 120);
-    let source_hash = search
-        .insert_content(&source_content)
-        .map_err(|e| DaemonError::Internal(format!("insert_content failed: {e}")))?;
-    let source_docid =
-        memex_core::docid::allocate_docid(&source_hash, "source", &source_abs, &[]);
-    search
-        .upsert_document(
-            "source",
-            &source_abs,
-            &source_title,
-            &source_hash,
-            &source_docid,
-            "",
-            &source_summary,
-            now,
-            now,
-        )
-        .map_err(|e| DaemonError::Internal(format!("upsert_document failed: {e}")))?;
-    memex_core::retrieval::embed_document(search, &source_hash, &source_content, model)
-        .map_err(|e| DaemonError::Internal(format!("embed source {source_abs}: {e}")))?;
-    Ok(())
-}
-
 /// Atomically write every wiki record to disk, in parallel. Failures are
 /// logged (the DB row already exists; `memex lint` detects the gap).
 async fn write_wiki_files(wiki_dir: &Path, records: &[memex_core::search::IngestWikiPage]) {
@@ -397,12 +350,7 @@ async fn write_wiki_files(wiki_dir: &Path, records: &[memex_core::search::Ingest
 /// The final event is always `Event::Done { status }`.
 pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
     match req {
-        Request::Ping { v } => {
-            if !SUPPORTED_VERSIONS.contains(&v) {
-                return error_events(DaemonError::VersionMismatch {
-                    supported: SUPPORTED_VERSIONS.to_vec(),
-                });
-            }
+        Request::Ping {} => {
             vec![
                 Event::Pong {
                     pid: state.pid,
@@ -412,18 +360,12 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
             ]
         }
         Request::Query {
-            v,
             question,
             raw,
             top_k,
             collections,
             memex_root,
         } => {
-            if !SUPPORTED_VERSIONS.contains(&v) {
-                return error_events(DaemonError::VersionMismatch {
-                    supported: SUPPORTED_VERSIONS.to_vec(),
-                });
-            }
             // Retrieval: dispatch to the retrieval actor. Shared by raw + synth.
             use crate::daemon::retrieval::{RetrievalError, RetrievalReq};
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -594,44 +536,57 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
         }
 
         Request::Ingest {
-            v,
-            transcript_path,
-            agent,
+            source,
             collections,
             memex_root,
-        } => {
-            if !SUPPORTED_VERSIONS.contains(&v) {
-                return error_events(DaemonError::VersionMismatch {
-                    supported: SUPPORTED_VERSIONS.to_vec(),
-                });
+        } => match source {
+            crate::daemon::protocol::IngestSource::Transcript { path, agent } => {
+                handle_ingest_transcript(
+                    path,
+                    agent.as_str().to_string(),
+                    collections,
+                    memex_root,
+                    state,
+                )
+                .await
             }
-            handle_ingest(transcript_path, agent, collections, memex_root, state).await
-        }
+            crate::daemon::protocol::IngestSource::Document {
+                source_path,
+                content,
+            } => {
+                handle_ingest_document(source_path, content, collections, memex_root, state).await
+            }
+        },
 
         Request::Write {
-            v,
             title,
             content,
             tags,
-            sources,
+            source,
             force,
             memex_root,
         } => {
-            if !SUPPORTED_VERSIONS.contains(&v) {
-                return error_events(DaemonError::VersionMismatch {
-                    supported: SUPPORTED_VERSIONS.to_vec(),
-                });
-            }
-            handle_write(title, content, tags, sources, force, memex_root, state).await
+            handle_write(title, content, tags, source, force, memex_root, state).await
         }
 
-        // Delete and LintFix — stubs
-        Request::Delete { v, .. } | Request::LintFix { v, .. } => {
-            if !SUPPORTED_VERSIONS.contains(&v) {
-                return error_events(DaemonError::VersionMismatch {
-                    supported: SUPPORTED_VERSIONS.to_vec(),
-                });
-            }
+        Request::SourceAdd {
+            source_path,
+            content,
+            collections,
+            memex_root,
+        } => {
+            handle_source_add(source_path, content, collections, memex_root, state).await
+        }
+
+        Request::SourceDelete {
+            ref_,
+            force,
+            memex_root,
+        } => handle_source_delete(ref_, force, memex_root, state).await,
+
+        // Delete, LintFix — stubs
+        Request::Delete { .. }
+        | Request::LintFix { .. } => {
             vec![
                 Event::Error {
                     code: "not_implemented".into(),
@@ -650,7 +605,7 @@ async fn handle_write(
     title: String,
     content: String,
     tags: Vec<String>,
-    sources: Vec<String>,
+    source: Option<String>,
     force: bool,
     memex_root: String,
     state: &HandlerState,
@@ -676,6 +631,42 @@ async fn handle_write(
         return error_events(DaemonError::BadRequest("title produces empty slug".into()));
     }
 
+    // Resolve --source <docid> if provided, then inject it into frontmatter.
+    let final_content = if let Some(source_docid) = source.as_deref() {
+        // 1. Cheap docid format check.
+        let looks_like_docid = source_docid.starts_with("src-")
+            || source_docid.starts_with("source-")
+            || source_docid.starts_with("wiki-")
+            // 6-char hex docids (allocate_docid output) — accept too.
+            || (source_docid.len() >= 6
+                && source_docid.chars().all(|c| c.is_ascii_hexdigit()));
+        if !looks_like_docid {
+            return error_events(DaemonError::BadRequest(format!(
+                "--source value '{source_docid}' is not a docid (expected 'src-...' or 'source-...'). \
+                 To attach a local file, run `memex source add` first to get a docid."
+            )));
+        }
+        // 2. Resolve to confirm the source exists and get its source_path.
+        let docs = match search.resolve_ref_documents(source_docid) {
+            Ok(d) => d,
+            Err(e) => {
+                return error_events(DaemonError::Internal(format!("resolve source: {e}")));
+            }
+        };
+        let source_doc = match docs.iter().find(|d| d.doc_type == "source") {
+            Some(d) => d.clone(),
+            None => {
+                return error_events(DaemonError::BadRequest(format!(
+                    "--source docid '{source_docid}' not found. Run `memex source add` first."
+                )));
+            }
+        };
+        // 3. Inject `sources: [<source_path>]` into the page's frontmatter.
+        inject_source_into_frontmatter(&content, &source_doc.path)
+    } else {
+        content.clone()
+    };
+
     // Check for existing page
     if !force {
         let wiki_path = memex.wiki_dir().join(format!("{slug}.md"));
@@ -687,7 +678,7 @@ async fn handle_write(
     }
 
     // Store content
-    let hash = match search.insert_content(&content) {
+    let hash = match search.insert_content(&final_content) {
         Ok(h) => h,
         Err(e) => {
             return error_events(DaemonError::Internal(format!("insert_content failed: {e}")));
@@ -710,7 +701,7 @@ async fn handle_write(
     let wiki_dir = memex.wiki_dir();
     let _ = tokio::fs::create_dir_all(&wiki_dir).await;
     let page_path = wiki_dir.join(format!("{slug}.md"));
-    if let Err(e) = async_atomic_write(page_path, content.as_bytes().to_vec()).await {
+    if let Err(e) = async_atomic_write(page_path, final_content.as_bytes().to_vec()).await {
         return error_events(e);
     }
 
@@ -721,31 +712,293 @@ async fn handle_write(
             return error_events(DaemonError::Internal(format!("{e}")));
         }
     };
-    if let Err(e) = memex_core::retrieval::embed_document(search, &hash, &content, &mut model) {
+    if let Err(e) = memex_core::retrieval::embed_document(search, &hash, &final_content, &mut model)
+    {
         return error_events(DaemonError::Internal(format!("embed wiki page: {e}")));
-    }
-
-    for source_path_str in &sources {
-        if let Err(e) =
-            store_additional_source(search, &mut model, source_path_str, &now).await
-        {
-            return error_events(e);
-        }
     }
 
     vec![Event::Written { slug, docid }, Event::Done { status: 0 }]
 }
 
+/// Append `<source_path>` to the page's `sources:` frontmatter list. If the
+/// page has no frontmatter, prepend a minimal frontmatter block that includes it.
+/// Idempotent — duplicate entries are not added. Falls back to a textual
+/// inject (preserving the existing frontmatter verbatim) if the frontmatter
+/// can't be parsed by the strict `PageFrontmatter` schema — agent-authored
+/// pages frequently omit `created_at`/`updated_at`.
+fn inject_source_into_frontmatter(content: &str, source_path: &str) -> String {
+    let trimmed = content.trim_start();
+    let has_frontmatter = trimmed.starts_with("---");
+    if !has_frontmatter {
+        return format!(
+            "---\nsources:\n  - {}\n---\n\n{}",
+            yaml_quote(source_path),
+            content
+        );
+    }
+    // Try strict parse first so we can de-dup against existing entries.
+    if let Ok((mut fm, body)) = memex_core::validate::parse_frontmatter(content) {
+        if !fm.sources.iter().any(|s| s == source_path) {
+            fm.sources.push(source_path.to_string());
+        }
+        if let Ok(yaml) = serde_yaml::to_string(&fm) {
+            return format!("---\n{yaml}---\n\n{}", body.trim_start());
+        }
+    }
+    // Fallback: text-level inject without parsing the YAML schema. Splits
+    // on the closing `---` and appends a `sources:` entry just before it.
+    inject_source_textual(content, source_path)
+}
+
+/// Best-effort textual injection of a `sources:` entry into the YAML
+/// frontmatter block. Used when the strict `PageFrontmatter` schema fails
+/// (commonly because `created_at`/`updated_at` are missing in agent-emitted
+/// drafts). Preserves the existing frontmatter bytes verbatim and only
+/// rewrites the `sources:` field.
+fn inject_source_textual(content: &str, source_path: &str) -> String {
+    // Locate frontmatter delimiters on their own lines.
+    let after_first = match content.strip_prefix("---\n").or_else(|| content.strip_prefix("---")) {
+        Some(rest) => rest,
+        None => return content.to_string(),
+    };
+    let close_idx = match after_first.find("\n---") {
+        Some(i) => i,
+        None => return content.to_string(),
+    };
+    let yaml_block = &after_first[..close_idx];
+    // After the closing `---` line, the body follows on the next line.
+    let after_close = &after_first[close_idx + "\n---".len()..];
+    let body = after_close.strip_prefix('\n').unwrap_or(after_close);
+
+    // Detect existing sources: entries that contain `source_path`. Cheap
+    // heuristic: substring match. Avoids duplicate writes on retry.
+    if yaml_block.contains(source_path) {
+        return content.to_string();
+    }
+
+    // Append `sources:\n  - <quoted>` to the YAML block. If `sources:` is
+    // already present, just add another item under it.
+    let mut new_yaml = String::with_capacity(yaml_block.len() + 64);
+    new_yaml.push_str(yaml_block.trim_end_matches('\n'));
+    if !new_yaml.ends_with('\n') {
+        new_yaml.push('\n');
+    }
+    if yaml_block.lines().any(|l| l.trim_start().starts_with("sources:")) {
+        new_yaml.push_str(&format!("  - {}\n", yaml_quote(source_path)));
+    } else {
+        new_yaml.push_str(&format!("sources:\n  - {}\n", yaml_quote(source_path)));
+    }
+    format!("---\n{new_yaml}---\n{body}")
+}
+
+/// YAML scalar quoting — wrap in double quotes if the value contains
+/// anything other than `[a-zA-Z0-9./-:_]`.
+fn yaml_quote(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '-' | ':' | '_'))
+    {
+        s.to_string()
+    } else {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+async fn handle_source_add(
+    source_path: String,
+    content: String,
+    collections: Vec<String>,
+    memex_root: String,
+    state: &HandlerState,
+) -> Vec<Event> {
+    use std::path::PathBuf;
+
+    if let Err(e) = validate_source_path(&source_path) {
+        return error_events(DaemonError::BadRequest(e));
+    }
+    let cfg = state.config.ingest.clone();
+    let redacted = match validate_and_redact_inbound_content(&content, cfg.fetch_max_bytes) {
+        Ok(r) => r,
+        Err(e) => return error_events(e),
+    };
+
+    let root = PathBuf::from(&memex_root);
+    let memex = match get_or_open_memex(&state.memex_cache, &root) {
+        Ok(m) => m,
+        Err(e) => return error_events(e),
+    };
+    let search = memex.search();
+    let effective_collections = memex_core::search::normalize_collections(&collections);
+
+    // Store content; idempotent on repeated identical content.
+    let hash = match search.insert_content(&redacted) {
+        Ok(h) => h,
+        Err(e) => {
+            return error_events(DaemonError::Internal(format!("insert_content: {e}")));
+        }
+    };
+
+    // Look up existing source document by hash; reuse docid if present.
+    let existing_docid = search.lookup_source_docid_by_hash(&hash).unwrap_or(None);
+    let is_new = existing_docid.is_none();
+    let docid = if let Some(d) = existing_docid {
+        d
+    } else {
+        let existing = search.existing_docids().unwrap_or_default();
+        let existing_vec: Vec<String> = existing.into_iter().collect();
+        let title = derive_source_title(&redacted, &source_path);
+        let summary = memex_core::index::extract_summary(&redacted, 120);
+        let now = memex_core::search::now_rfc3339();
+        let docid =
+            memex_core::docid::allocate_docid(&hash, "source", &source_path, &existing_vec);
+        if let Err(e) = search.upsert_document(
+            "source",
+            &source_path,
+            &title,
+            &hash,
+            &docid,
+            "",
+            &summary,
+            &now,
+            &now,
+        ) {
+            return error_events(DaemonError::Internal(format!("upsert_document: {e}")));
+        }
+        match memex_core::retrieval::load_default_model() {
+            Ok(mut model) => {
+                if let Err(e) =
+                    memex_core::retrieval::embed_document(search, &hash, &redacted, &mut model)
+                {
+                    return error_events(DaemonError::Internal(format!("embed: {e}")));
+                }
+            }
+            Err(e) => return error_events(DaemonError::Internal(format!("load_model: {e}"))),
+        }
+        docid
+    };
+
+    // Apply collections for new sources, and for re-adds with an explicit
+    // --collection. Plain `memex source add` against existing content
+    // leaves collections alone (idempotent on metadata).
+    if is_new || !collections.is_empty() {
+        if let Err(e) = search.set_document_collections_by_path(
+            "source",
+            &source_path,
+            &effective_collections,
+        ) {
+            return error_events(DaemonError::Internal(format!(
+                "set_document_collections_by_path: {e}"
+            )));
+        }
+    }
+
+    vec![Event::SourceAdded { docid }, Event::Done { status: 0 }]
+}
+
+async fn handle_source_delete(
+    ref_: String,
+    force: bool,
+    memex_root: String,
+    state: &HandlerState,
+) -> Vec<Event> {
+    use std::path::PathBuf;
+
+    let root = PathBuf::from(&memex_root);
+    let memex = match get_or_open_memex(&state.memex_cache, &root) {
+        Ok(m) => m,
+        Err(e) => return error_events(e),
+    };
+    let search = memex.search();
+
+    // Resolve ref_ → source document.
+    let source_doc = match resolve_source_ref(search, &ref_) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return error_events(DaemonError::BadRequest(format!(
+                "source not found: '{ref_}'. Use 'src-...' for docid or 'path:<source-path>'."
+            )));
+        }
+        Err(e) => return error_events(DaemonError::Internal(format!("resolve: {e}"))),
+    };
+
+    // Find wiki pages referencing this source's path.
+    let referencing: Vec<String> = search
+        .wiki_pages_referencing_source(&source_doc.path)
+        .unwrap_or_default();
+
+    if !referencing.is_empty() && !force {
+        return error_events(DaemonError::BadRequest(format!(
+            "{} wiki pages reference this source: {}. Pass --force to delete anyway \
+             (the references will become dangling and 'memex lint' will report them).",
+            referencing.len(),
+            referencing.join(", ")
+        )));
+    }
+
+    // Delete the source document row + cleanup orphaned content.
+    let path_str = source_doc.path.clone();
+    let docid = source_doc.docid.clone();
+    if let Err(e) = search.delete_document_with_cleanup(&path_str) {
+        return error_events(DaemonError::Internal(format!("delete: {e}")));
+    }
+
+    vec![
+        Event::SourceDeleted {
+            docid,
+            source_path: path_str,
+            dangling_wiki_pages: referencing,
+        },
+        Event::Done { status: 0 },
+    ]
+}
+
+/// Resolve a source ref ("src-..." docid or "path:<source-path>") to a source
+/// document row. Returns Ok(None) if not found, Err on lookup error.
+fn resolve_source_ref(
+    search: &memex_core::search::Bm25Search,
+    ref_: &str,
+) -> Result<Option<memex_core::types::Document>, memex_core::error::MemexError> {
+    if let Some(rest) = ref_.strip_prefix("path:") {
+        return search.lookup_source_by_path(rest);
+    }
+    let docs = search.resolve_ref_documents(ref_)?;
+    Ok(docs.into_iter().find(|d| d.doc_type == "source"))
+}
+
+/// First H1 line, falling back to URL last segment / file stem / verbatim.
+fn derive_source_title(content: &str, source_path: &str) -> String {
+    if let Some(line) = content.lines().next() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            let t = rest.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    if (source_path.starts_with("http://") || source_path.starts_with("https://"))
+        && let Some(stem) = source_path.rsplit('/').find(|s| !s.is_empty())
+    {
+        return crate::slugify(stem);
+    }
+    if let Some(stem) = std::path::Path::new(source_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+    {
+        return stem.to_string();
+    }
+    source_path.to_string()
+}
+
 /// Handle an ingest request: validate, dedup, parse, filter, dispatch to
 /// worker, dedup search, optional merge, validate output, store atomically.
-async fn handle_ingest(
+async fn handle_ingest_transcript(
     transcript_path: String,
     agent: String,
     collections: Vec<String>,
     memex_root: String,
     state: &HandlerState,
 ) -> Vec<Event> {
-    use crate::daemon::queue::{BackendJob, IngestJob, MergeJob};
+    use crate::daemon::queue::{BackendJob, IngestJob};
     use memex_core::transcript::SessionFilter;
     use std::hash::{Hash, Hasher};
     use std::path::PathBuf;
@@ -762,8 +1015,8 @@ async fn handle_ingest(
         ));
     }
 
-    const MAX_TRANSCRIPT_BYTES: u64 = 50 * 1024 * 1024;
-    let raw_content = match read_file_capped(&path, MAX_TRANSCRIPT_BYTES).await {
+    let raw_content =
+        match read_file_capped(&path, crate::daemon::config::INGEST_MAX_BYTES as u64).await {
         Ok(c) => c,
         Err(e) => return error_events(e),
     };
@@ -824,10 +1077,12 @@ async fn handle_ingest(
     // INSERT OR IGNORE dedupes concurrent ingests of the same transcript.
     if let Err(e) = search.insert_ingest_job(
         &job_id,
+        memex_core::search::JobType::Transcript,
         &transcript_path,
+        Some(&agent),
         &content_hash,
-        &agent,
         &memex_root,
+        &effective_collections,
     ) {
         return error_events(DaemonError::Internal(format!(
             "insert_ingest_job failed: {e}"
@@ -845,9 +1100,23 @@ async fn handle_ingest(
         transcript_path: transcript_path.clone(),
     });
 
+    let segments: Vec<crate::daemon::queue::ExtractSegment> = transcript
+        .turns
+        .iter()
+        .enumerate()
+        .map(|(i, t)| crate::daemon::queue::ExtractSegment {
+            index: Some(i + 1),
+            role: Some(t.role.clone()),
+            timestamp: t.timestamp.clone(),
+            text: t.text.clone(),
+        })
+        .collect();
+
     let extracted = match run_worker_job(state, |reply| {
         BackendJob::Ingest(IngestJob {
-            turns: transcript.turns.clone(),
+            segments,
+            source: transcript_path.clone(),
+            chunk: None,
             reply,
         })
     })
@@ -866,34 +1135,112 @@ async fn handle_ingest(
         return events;
     }
 
-    let valid_pages = validate_extracted_pages(extracted.pages);
+    let title = memex_core::transcript::truncate(&transcript.first_user_message, 80);
+    let summary = memex_core::index::extract_summary(&canonical_transcript, 120);
 
-    let _ = search.update_ingest_job_status(&job_id, "processing", None);
+    let stored_event = match store_extracted_pages(
+        extracted.pages,
+        &canonical_transcript,
+        &transcript_path,
+        &title,
+        &summary,
+        &effective_collections,
+        &memex_root,
+        &job_id,
+        state,
+    )
+    .await
+    {
+        Ok(e) => e,
+        Err(err_events) => return err_events,
+    };
 
-    // Serialize dedup-read → MERGE → write for this batch's slugs.
-    // Locks the EXTRACT-proposed slugs; if dedup later routes to a
-    // different existing slug (title-similarity match with a different
-    // slug), that edge case still races. Covers the common same-person
-    // slug stability case that caused >half of john.md's sources to be
-    // silently dropped on LoCoMo conv6.
+    let _ = search.update_ingest_job_status(&job_id, "completed", None);
+
+    tracing::info!(
+        job_id = %job_id,
+        transcript = %transcript_path,
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "ingest job completed"
+    );
+
+    events.push(stored_event);
+    events.push(Event::Done { status: 0 });
+    events
+}
+
+/// Run the post-Extract pipeline: validate pages → dedup search → optional
+/// wiki-side Merge → transactional store via `store_ingest_batch` → embed →
+/// filesystem writes. Used by both transcript and document ingest paths.
+///
+/// Pre-conditions:
+/// - `source_text` is the cleaned/redacted source content. The helper
+///   passes it to `store_ingest_batch`, which uses `INSERT OR IGNORE` on
+///   content; it's safe to call even when the content row already exists
+///   (the document path inserts content earlier for hash-dedup; transcript
+///   does not).
+/// - `source_title` and `source_summary` are caller-derived strings.
+///
+/// Returns `Ok(Event::Stored)` on success, or `Err(Vec<Event>)` containing
+/// error+done events on any failure. Caller is responsible for prepending
+/// per-source progress events (Parsing, Distilling) and for flushing the
+/// trailing `Done` after the returned `Stored` event.
+#[allow(clippy::too_many_arguments)]
+async fn store_extracted_pages(
+    pages: Vec<crate::daemon::queue::ExtractedPage>,
+    source_text: &str,
+    source_path: &str,
+    source_title: &str,
+    source_summary: &str,
+    collections: &[String],
+    memex_root: &str,
+    job_id: &str,
+    state: &HandlerState,
+) -> Result<Event, Vec<Event>> {
+    use crate::daemon::queue::{BackendJob, MergeJob};
+    use std::path::PathBuf;
+
+    let root_path = PathBuf::from(memex_root);
+    let memex = match get_or_open_memex(&state.memex_cache, &root_path) {
+        Ok(m) => m,
+        Err(e) => return Err(error_events(e)),
+    };
+    let search = memex.search();
+    let wiki_dir = memex.wiki_dir();
+
+    // 1. Validate the extracted pages.
+    let valid_pages = validate_extracted_pages(pages);
+    if valid_pages.is_empty() {
+        let _ = search.update_ingest_job_status(job_id, "completed", None);
+        return Ok(Event::Stored {
+            job_id: job_id.to_string(),
+            source_docid: String::new(),
+            wiki_pages: Vec::new(),
+        });
+    }
+
+    let _ = search.update_ingest_job_status(job_id, "processing", None);
+
+    // 2. Acquire per-slug write locks.
     let lock_slugs: Vec<String> = valid_pages.iter().map(|p| p.slug.clone()).collect();
-    let _slug_guards = acquire_slug_locks(state, &memex_root, lock_slugs).await;
+    let _slug_guards = acquire_slug_locks(state, memex_root, lock_slugs).await;
 
-    // Dedup: title-BM25 + vector rerank to decide new-page vs merge-with-existing.
+    // 3. Load embedding model once for dedup-search reranking + final embed.
     let mut model = match memex_core::retrieval::load_default_model() {
         Ok(m) => m,
         Err(e) => {
-            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
-            return error_events(DaemonError::Internal(format!("{e}")));
+            let _ = search.update_ingest_job_status(job_id, "failed", Some(&e.to_string()));
+            return Err(error_events(DaemonError::Internal(format!("{e}"))));
         }
     };
-    let wiki_dir = memex.wiki_dir();
+
+    // 4. Dedup search against existing wiki pages.
     let (mut new_pages, merge_pairs) =
         match dedup_against_existing(search, &wiki_dir, &valid_pages, &mut model).await {
             Ok(r) => r,
             Err(e) => {
-                let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
-                return error_events(e);
+                let _ = search.update_ingest_job_status(job_id, "failed", Some(&e.to_string()));
+                return Err(error_events(e));
             }
         };
 
@@ -902,7 +1249,9 @@ async fn handle_ingest(
         merge = merge_pairs.len(),
         "dedup search complete"
     );
-    let mut merged_pages = Vec::new();
+
+    // 5. Optional wiki-side merge.
+    let mut merged_pages: Vec<crate::daemon::queue::ExtractedPage> = Vec::new();
     if !merge_pairs.is_empty() {
         let merge_result = run_worker_job(state, |reply| {
             BackendJob::Merge(MergeJob {
@@ -913,8 +1262,6 @@ async fn handle_ingest(
         .await;
         match merge_result {
             Ok(reply) => {
-                // Force merged pages to use the existing slugs, not whatever
-                // the LLM returned. The merge should update the existing page.
                 for (i, pair) in merge_pairs.iter().enumerate() {
                     if let Some(page) = reply.merged_pages.get(i) {
                         merged_pages.push(crate::daemon::queue::ExtractedPage {
@@ -940,68 +1287,288 @@ async fn handle_ingest(
         }
     }
 
+    // 6. Build wiki records.
     let now_dt = chrono::Utc::now();
     let now = now_dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let title = memex_core::transcript::truncate(&transcript.first_user_message, 80);
-    let summary = memex_core::index::extract_summary(&canonical_transcript, 120);
-
     let all_pages: Vec<_> = new_pages.iter().chain(merged_pages.iter()).collect();
-    let wiki_pages = build_wiki_records(
-        &all_pages,
-        &wiki_dir,
-        &transcript_path,
-        &effective_collections,
-        now_dt,
-    )
-    .await;
+    let wiki_pages =
+        build_wiki_records(&all_pages, &wiki_dir, source_path, collections, now_dt).await;
 
+    // 7. Transactional store.
     let batch_result = match search.store_ingest_batch(
-        &canonical_transcript,
-        &transcript_path,
-        &title,
-        &summary,
+        source_text,
+        source_path,
+        source_title,
+        source_summary,
         &wiki_pages,
-        &effective_collections,
+        collections,
         &now,
     ) {
         Ok(r) => r,
         Err(e) => {
-            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
-            return error_events(DaemonError::Internal(format!("storage failed: {e}")));
+            let _ = search.update_ingest_job_status(job_id, "failed", Some(&e.to_string()));
+            return Err(error_events(DaemonError::Internal(format!(
+                "storage failed: {e}"
+            ))));
         }
     };
 
-    // File writes run after DB commit because they can't be rolled back;
-    // lint detects any DB row without its file.
+    // 8. File writes after DB commit. Failures are logged; lint detects gaps.
     write_wiki_files(&wiki_dir, &wiki_pages).await;
 
-    if let Err(e) = embed_ingested(
-        search,
-        &batch_result,
-        &canonical_transcript,
-        &wiki_pages,
-        &mut model,
-    ) {
-        let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
-        return error_events(e);
+    // 9. Embed source + wiki pages.
+    if let Err(e) = embed_ingested(search, &batch_result, source_text, &wiki_pages, &mut model) {
+        let _ = search.update_ingest_job_status(job_id, "failed", Some(&e.to_string()));
+        return Err(error_events(e));
     }
+
+    Ok(Event::Stored {
+        job_id: job_id.to_string(),
+        source_docid: batch_result.source_docid,
+        wiki_pages: batch_result.wiki_hashes.into_iter().map(|(s, _)| s).collect(),
+    })
+}
+
+/// Handle a document-ingest request. Validates content, hashes it for
+/// dedup, chunks long documents at H1/H2 boundaries, dispatches one Extract
+/// per chunk concurrently, fragment-merges pages that share a slug across
+/// chunks, then hands off to the shared post-Extract pipeline.
+async fn handle_ingest_document(
+    source_path: String,
+    content: String,
+    collections: Vec<String>,
+    memex_root: String,
+    state: &HandlerState,
+) -> Vec<Event> {
+    use crate::daemon::queue::{
+        BackendJob, ChunkPosition, ExtractSegment, IngestJob, MergeJob, MergePair,
+    };
+    use std::path::PathBuf;
+
+    let cfg = state.config.ingest.clone();
+
+    // ─── Validation ───────────────────────────────────────────────────
+    if let Err(e) = validate_source_path(&source_path) {
+        return error_events(DaemonError::BadRequest(e));
+    }
+    let redacted = match validate_and_redact_inbound_content(&content, cfg.fetch_max_bytes) {
+        Ok(r) => r,
+        Err(e) => return error_events(e),
+    };
+
+    // ─── Open memex + dedup on content hash ───────────────────────────
+    let root_path = PathBuf::from(&memex_root);
+    let memex = match get_or_open_memex(&state.memex_cache, &root_path) {
+        Ok(m) => m,
+        Err(e) => return error_events(e),
+    };
+    let search = memex.search();
+    let effective_collections = memex_core::search::normalize_collections(&collections);
+
+    let content_hash = memex_core::storage::content_hash(redacted.as_bytes());
+    if search.content_exists(&content_hash).unwrap_or(false) {
+        return vec![Event::Done { status: 0 }];
+    }
+
+    // ─── Job ID + persist content + persist job row (pre-Extract) ────
+    let job_id = format!(
+        "doc-{}",
+        memex_core::storage::content_hash(
+            format!("{source_path}\0{content_hash}").as_bytes()
+        )
+    );
+    if let Err(e) = search.insert_content(&redacted) {
+        return error_events(DaemonError::Internal(format!("insert_content: {e}")));
+    }
+    if let Err(e) = search.insert_ingest_job(
+        &job_id,
+        memex_core::search::JobType::Document,
+        &source_path,
+        None,
+        &content_hash,
+        &memex_root,
+        &effective_collections,
+    ) {
+        return error_events(DaemonError::Internal(format!("insert_ingest_job: {e}")));
+    }
+
+    let mut events = vec![
+        Event::Parsing {
+            job_id: job_id.clone(),
+            transcript_path: source_path.clone(),
+        },
+        Event::Distilling {
+            job_id: job_id.clone(),
+            transcript_path: source_path.clone(),
+        },
+    ];
+
+    // ─── Chunk ────────────────────────────────────────────────────────
+    let chunks = match memex_core::chunk::chunk_markdown(
+        &redacted,
+        cfg.chunk_target_tokens,
+        cfg.chunk_hard_cap_tokens,
+        cfg.max_chunks,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
+            return error_events(DaemonError::BadRequest(e.to_string()));
+        }
+    };
+    let total_chunks = chunks.len();
+    tracing::info!(job_id = %job_id, total_chunks, "dispatching document chunks");
+
+    // ─── Dispatch chunks concurrently ─────────────────────────────────
+    let mut receivers = Vec::with_capacity(total_chunks);
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let job = BackendJob::Ingest(IngestJob {
+            segments: vec![ExtractSegment {
+                index: None,
+                role: None,
+                timestamp: None,
+                text: chunk,
+            }],
+            source: source_path.clone(),
+            chunk: Some(ChunkPosition {
+                index: idx,
+                total: total_chunks,
+            }),
+            reply: tx,
+        });
+        if state.jobs.submit(job).await.is_err() {
+            let _ = search.update_ingest_job_status(&job_id, "failed", Some("worker queue closed"));
+            return error_events(DaemonError::Internal("worker queue closed".into()));
+        }
+        receivers.push(rx);
+    }
+
+    // ─── Gather chunk results ─────────────────────────────────────────
+    let mut all_pages: Vec<crate::daemon::queue::ExtractedPage> = Vec::new();
+    for rx in receivers {
+        match rx.await {
+            Ok(Ok(reply)) => all_pages.extend(reply.pages),
+            Ok(Err(e)) => {
+                let de: DaemonError = e.into();
+                let _ = search.update_ingest_job_status(&job_id, "failed", Some(&de.message()));
+                return error_events(de);
+            }
+            Err(_) => {
+                let _ = search.update_ingest_job_status(
+                    &job_id,
+                    "failed",
+                    Some("worker dropped reply"),
+                );
+                return error_events(DaemonError::Internal("worker dropped reply".into()));
+            }
+        }
+    }
+
+    // ─── Cross-chunk fragment-merge: same slug from multiple chunks ──
+    let mut by_slug: std::collections::BTreeMap<
+        String,
+        Vec<crate::daemon::queue::ExtractedPage>,
+    > = std::collections::BTreeMap::new();
+    for p in all_pages {
+        if p.slug.is_empty() || p.title.is_empty() || p.body.is_empty() {
+            continue;
+        }
+        let slug = crate::slugify(&p.slug);
+        if slug.is_empty() {
+            continue;
+        }
+        by_slug.entry(slug).or_default().push(p);
+    }
+
+    let mut merged_pages: Vec<crate::daemon::queue::ExtractedPage> = Vec::new();
+    for (slug, fragments) in by_slug {
+        if fragments.len() == 1 {
+            let mut p = fragments.into_iter().next().unwrap();
+            p.slug = slug;
+            merged_pages.push(p);
+            continue;
+        }
+        // ≥ 2 fragments — chain MergeJobs sequentially.
+        let title = fragments[0].title.clone();
+        let tags: Vec<String> = fragments
+            .iter()
+            .flat_map(|p| p.tags.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut accum_body = fragments[0].body.clone();
+        for next in fragments.into_iter().skip(1) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let job = BackendJob::Merge(MergeJob {
+                pages: vec![MergePair {
+                    slug: slug.clone(),
+                    proposed: next.body.clone(),
+                    existing: accum_body.clone(),
+                }],
+                reply: tx,
+            });
+            if state.jobs.submit(job).await.is_err() {
+                let _ =
+                    search.update_ingest_job_status(&job_id, "failed", Some("merge queue closed"));
+                return error_events(DaemonError::Internal("merge queue closed".into()));
+            }
+            match rx.await {
+                Ok(Ok(reply)) => {
+                    if let Some(merged) = reply.merged_pages.into_iter().next() {
+                        accum_body = merged.body;
+                    }
+                }
+                Ok(Err(e)) => {
+                    // Cross-chunk merge failed; keep accum_body and append divider.
+                    tracing::warn!(?e, slug = %slug, "fragment-merge worker error; concatenating with divider");
+                    accum_body.push_str("\n\n---\n\n");
+                    accum_body.push_str(&next.body);
+                }
+                Err(_) => {
+                    tracing::warn!(slug = %slug, "fragment-merge dropped reply; concatenating with divider");
+                    accum_body.push_str("\n\n---\n\n");
+                    accum_body.push_str(&next.body);
+                }
+            }
+        }
+        merged_pages.push(crate::daemon::queue::ExtractedPage {
+            slug,
+            title,
+            tags,
+            body: memex_core::transcript::truncate(&accum_body, 20_000),
+        });
+    }
+
+    if merged_pages.is_empty() {
+        let _ = search.update_ingest_job_status(&job_id, "completed", None);
+        events.push(Event::Done { status: 0 });
+        return events;
+    }
+
+    // ─── Hand off to shared post-Extract pipeline ─────────────────────
+    let source_title = derive_source_title(&redacted, &source_path);
+    let source_summary = memex_core::index::extract_summary(&redacted, 120);
+    let stored_event = match store_extracted_pages(
+        merged_pages,
+        &redacted,
+        &source_path,
+        &source_title,
+        &source_summary,
+        &effective_collections,
+        &memex_root,
+        &job_id,
+        state,
+    )
+    .await
+    {
+        Ok(e) => e,
+        Err(err_events) => return err_events,
+    };
 
     let _ = search.update_ingest_job_status(&job_id, "completed", None);
 
-    tracing::info!(
-        job_id = %job_id,
-        transcript = %transcript_path,
-        new = new_pages.len(),
-        merged = merged_pages.len(),
-        elapsed_ms = t0.elapsed().as_millis() as u64,
-        "ingest job completed"
-    );
-
-    events.push(Event::Stored {
-        job_id,
-        source_docid: batch_result.source_docid,
-        wiki_pages: batch_result.wiki_hashes.into_iter().map(|(s, _)| s).collect(),
-    });
+    events.push(stored_event);
     events.push(Event::Done { status: 0 });
     events
 }
@@ -1048,6 +1615,53 @@ fn error_events(err: DaemonError) -> Vec<Event> {
     ]
 }
 
+/// Reject source identifiers that are too long or contain control chars
+/// that would corrupt frontmatter / logs / IPC line framing.
+fn validate_source_path(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("source path is empty".into());
+    }
+    if s.len() > 2048 {
+        return Err(format!("source path too long: {} chars (max 2048)", s.len()));
+    }
+    for c in s.chars() {
+        let cu = c as u32;
+        if cu == 0 || (cu < 0x20 && c != '\t') {
+            return Err(format!("source path contains control char (U+{:04X})", cu));
+        }
+    }
+    Ok(())
+}
+
+/// Validate inbound document content: size cap, non-empty after redaction,
+/// then apply secret redaction. Returns the redacted bytes or a typed error.
+///
+/// **Empty-check is post-redaction by design** — a body that's entirely a
+/// redacted secret would otherwise pass the empty-check and reach Extract
+/// with an empty payload. This catches that edge case.
+fn validate_and_redact_inbound_content(
+    content: &str,
+    max_bytes: usize,
+) -> Result<String, DaemonError> {
+    if content.len() > max_bytes {
+        return Err(DaemonError::BadRequest(format!(
+            "content too large: {} bytes (max {})",
+            content.len(),
+            max_bytes
+        )));
+    }
+    let redacted = memex_core::transcript::redact_secrets(content);
+    if redacted.trim().is_empty() {
+        return Err(DaemonError::BadRequest(
+            "empty content on stdin. The upstream converter probably exited with no \
+             output. Try running it standalone first (e.g. `markitdown <url>`), or use \
+             `set -o pipefail` so converter failures propagate."
+                .into(),
+        ));
+    }
+    Ok(redacted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1061,25 +1675,17 @@ mod tests {
             jobs: Arc::new(crate::daemon::worker::WorkerPool::new_inert_for_test()),
             memex_cache: MemexCache::new(),
             slug_locks: Arc::new(StdMutex::new(HashMap::new())),
+            config: Arc::new(crate::daemon::config::Config::default()),
         }
     }
 
     #[tokio::test]
     async fn ping_returns_pong_then_done() {
         let state = test_state();
-        let events = handle(Request::Ping { v: 1 }, &state).await;
+        let events = handle(Request::Ping {}, &state).await;
         assert_eq!(events.len(), 2);
         assert!(matches!(&events[0], Event::Pong { pid, .. } if *pid == 1234));
         assert!(matches!(&events[1], Event::Done { status: 0 }));
-    }
-
-    #[tokio::test]
-    async fn unsupported_version_returns_version_mismatch() {
-        let state = test_state();
-        let events = handle(Request::Ping { v: 999 }, &state).await;
-        assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], Event::Error { code, .. } if code == "version_mismatch"));
-        assert!(matches!(&events[1], Event::Done { status: 1 }));
     }
 
     #[tokio::test]
@@ -1093,10 +1699,10 @@ mod tests {
             jobs: Arc::new(crate::daemon::worker::WorkerPool::new_inert_for_test()),
             memex_cache: MemexCache::new(),
             slug_locks: Arc::new(StdMutex::new(HashMap::new())),
+            config: Arc::new(crate::daemon::config::Config::default()),
         };
         let events = handle(
             Request::Query {
-                v: 1,
                 question: "q".into(),
                 raw: true,
                 top_k: 5,
@@ -1108,5 +1714,69 @@ mod tests {
         .await;
         assert!(matches!(&events[0], Event::Error { code, .. } if code == "internal"));
         assert!(matches!(&events[1], Event::Done { status: 1 }));
+    }
+
+    #[test]
+    fn source_path_validator_accepts_url() {
+        super::validate_source_path("https://example.com/post").unwrap();
+    }
+
+    #[test]
+    fn source_path_validator_accepts_filesystem_path() {
+        super::validate_source_path("/abs/path/to/file.md").unwrap();
+    }
+
+    #[test]
+    fn source_path_validator_rejects_empty() {
+        assert!(super::validate_source_path("").is_err());
+    }
+
+    #[test]
+    fn source_path_validator_rejects_overlong() {
+        let s = "a".repeat(2049);
+        assert!(super::validate_source_path(&s).is_err());
+    }
+
+    #[test]
+    fn source_path_validator_rejects_newline() {
+        assert!(super::validate_source_path("https://x/p\ninjected").is_err());
+    }
+
+    #[test]
+    fn source_path_validator_rejects_null() {
+        assert!(super::validate_source_path("path\0null").is_err());
+    }
+
+    #[test]
+    fn source_path_validator_accepts_tab() {
+        super::validate_source_path("a\tb").unwrap();
+    }
+
+    #[test]
+    fn validate_and_redact_passes_normal_content() {
+        let r = super::validate_and_redact_inbound_content("# Title\n\nbody", 10_000).unwrap();
+        assert!(r.contains("# Title"));
+        assert!(r.contains("body"));
+    }
+
+    #[test]
+    fn validate_and_redact_rejects_oversize() {
+        let big = "a".repeat(1001);
+        let err = super::validate_and_redact_inbound_content(&big, 1000).unwrap_err();
+        assert!(matches!(err, super::DaemonError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_and_redact_rejects_post_redaction_empty() {
+        // A 50-char string of all whitespace — empty after trim post-redaction.
+        let r = super::validate_and_redact_inbound_content("   \n\t  \n  ", 1000);
+        assert!(r.is_err(), "expected empty-content error, got: {r:?}");
+    }
+
+    #[test]
+    fn validate_and_redact_strips_secrets_in_output() {
+        let content = "see token sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA in body";
+        let r = super::validate_and_redact_inbound_content(content, 10_000).unwrap();
+        assert!(!r.contains("sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {r}");
     }
 }

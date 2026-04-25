@@ -16,6 +16,8 @@ pub mod protocol;
 pub mod queue;
 pub mod retrieval;
 pub mod server;
+#[cfg(any(test, feature = "test-harness"))]
+pub mod test_harness;
 pub mod worker;
 
 use crate::memex_root;
@@ -226,7 +228,7 @@ pub fn status() -> Result<i32> {
                     Instant::now() + Duration::from_secs(2),
                 )
                 .await?;
-                let events = client::request(stream, &protocol::Request::Ping { v: 1 }).await?;
+                let events = client::request(stream, &protocol::Request::Ping {}).await?;
                 anyhow::Ok(events)
             });
             match result {
@@ -264,12 +266,19 @@ pub async fn ingest_async(
         Instant::now() + Duration::from_secs(5),
     )
     .await?;
+    let agent_enum = match agent {
+        "claude-code" => protocol::TranscriptAgent::ClaudeCode,
+        "codex" => protocol::TranscriptAgent::Codex,
+        "gemini-cli" => protocol::TranscriptAgent::GeminiCli,
+        other => anyhow::bail!("unknown agent: {other}"),
+    };
     let events = client::request(
         stream,
         &protocol::Request::Ingest {
-            v: 1,
-            transcript_path: transcript_path.to_string(),
-            agent: agent.to_string(),
+            source: protocol::IngestSource::Transcript {
+                path: transcript_path.to_string(),
+                agent: agent_enum,
+            },
             collections,
             memex_root: root.to_string(),
         },
@@ -339,7 +348,6 @@ pub fn query_raw(
         let events = client::request(
             stream,
             &protocol::Request::Query {
-                v: 1,
                 question: question.to_string(),
                 raw: true,
                 top_k,
@@ -419,7 +427,6 @@ pub fn query_synth(
         let events = client::request(
             stream,
             &protocol::Request::Query {
-                v: 1,
                 question: question.to_string(),
                 raw: false,
                 top_k,

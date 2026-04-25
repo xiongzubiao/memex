@@ -97,6 +97,7 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
     }
 
     let pool = crate::daemon::worker::WorkerPool::new(cfg.daemon.worker.clone());
+    let cfg = Arc::new(cfg);
     let state = Arc::new(HandlerState {
         pid,
         started_at: Utc::now(),
@@ -104,6 +105,7 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
         jobs: Arc::new(pool),
         memex_cache,
         slug_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        config: cfg.clone(),
     });
 
     // 5. Accept loop with idle timeout + SIGTERM.
@@ -210,7 +212,10 @@ async fn serve_connection(stream: UnixStream, state: &HandlerState) -> Result<()
     let mut line = String::new();
 
     // One request per connection. Read the first line, parse, dispatch.
-    let n = timeout(Duration::from_secs(5), reader.read_line(&mut line))
+    // 30 s ceiling covers a 5 MB content payload over a slow Unix socket with
+    // comfortable margin; small requests aren't taxed (timeout fires only if
+    // the read actually takes that long).
+    let n = timeout(Duration::from_secs(30), reader.read_line(&mut line))
         .await
         .context("timed out waiting for request")??;
     if n == 0 {

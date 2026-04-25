@@ -134,16 +134,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
     embedding float[768] distance=cosine
 );
 
-CREATE TABLE IF NOT EXISTS ingest_jobs (
-    job_id          TEXT PRIMARY KEY,
-    transcript_path TEXT NOT NULL,
-    content_hash    TEXT NOT NULL,
-    agent           TEXT NOT NULL,
-    memex_root      TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL,
-    error           TEXT
+DROP TABLE IF EXISTS ingest_jobs;
+CREATE TABLE ingest_jobs (
+    job_id        TEXT PRIMARY KEY,
+    job_type      TEXT NOT NULL CHECK (job_type IN ('transcript', 'document')),
+    source_path   TEXT NOT NULL,
+    agent         TEXT,
+    content_hash  TEXT NOT NULL,
+    memex_root    TEXT NOT NULL,
+    collections   TEXT NOT NULL DEFAULT '[]',
+    status        TEXT NOT NULL DEFAULT 'pending',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    error         TEXT
 );
 "#;
 

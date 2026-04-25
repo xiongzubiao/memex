@@ -177,87 +177,130 @@ TASKS:
   every unique `[[id]]` reference in your answer.
 
 [TASK: EXTRACT]
-  The user message contains a JSON object for one session transcript.
-  Input format: `{"turns":[...]}`
-  Each turn has `turn_index`, `role` (speaker identity; often `user`/`assistant`),
-  optional
-  `timestamp` (ISO 8601), and `text`.
+  The user message contains a JSON object describing source material to
+  extract wiki knowledge from.
+
+  Input format:
+    `{"segments":[...], "source", "chunk_index"?, "total_chunks"?}`
+
+  Each segment has:
+    - `text` (string, required) — the segment body.
+    - `role` (string, optional) — speaker identity ("user", "assistant",
+      etc.) when the segment is a turn from a conversation transcript.
+    - `timestamp` (string, optional) — ISO 8601 timestamp for this segment.
+    - `index` (integer, optional) — ordering hint; array position is
+      canonical when absent.
+
+  Top-level fields:
+    - `source` (required) — provenance identifier (URL, file path,
+      transcript path).
+    - `chunk_index` / `total_chunks` (optional) — set together when this
+      call covers one chunk of a multi-chunk document. When `total_chunks > 1`:
+      extract only subjects fully or substantially covered within this
+      chunk; do not emit "overview of the document" pages — later chunks
+      covering the same subject will be merged.
+
+  Two extraction modes, identified by whether segments carry `role`:
+
+  ─── Mode A — TRANSCRIPT (segments have `role`) ────────────────────
+  This is a conversation transcript. Apply Mode A rules in addition to
+  the common rules below.
+
+  - Scan segment by segment. For EVERY segment where a speaker mentions
+    an event — "I went", "I attended", "I signed up", "I ran", "I bought",
+    "I finished", "I gave a talk", "I'm going to", "I'm planning to",
+    "we did", "yesterday I", "last week I", "the week before",
+    "next Friday", "I met them N years ago" — emit a Timeline entry
+    for the subject of that event. Under-extraction is the most common
+    failure mode; err on the side of including marginal events. Expect
+    many entries in a substantive session.
+  - If the transcript covers two people talking, emit ONE page per
+    person (e.g. slug `alice`, slug `bob`), each containing only facts
+    about that person. If a fact is about both, put it on both pages.
+  - Resolve relative dates. Prefer each segment's explicit `timestamp`
+    field when present (derive the calendar date from it). Some
+    transcripts also include date markers inside segment text
+    (e.g. `[2023-05-08] Caroline: ...`) — use that if needed. When a
+    segment uses a relative reference ("yesterday", "last Tuesday",
+    "three days ago", "next week"), compute the absolute date from that
+    segment's `timestamp`. If the segment has no `timestamp`, fall back
+    to the most recent prior segment that did, then to the latest
+    timestamp anywhere in the input. Distinguish past tense ("I went
+    yesterday" = completed event) from future/planned tense ("I'm going
+    tomorrow" = intent, not yet an event). Write dates as ISO 8601
+    (YYYY-MM-DD) when day-precision is known; fall back to month
+    (YYYY-MM) or year (YYYY) only when the transcript doesn't support
+    finer precision.
+  - Every subject page with any dated mentions MUST include a
+    `## Timeline` H2 section that EXHAUSTIVELY enumerates dated events —
+    do not curate for "importance." The Timeline is the retrieval
+    handle for "when" questions; a minor dated event becomes critical
+    when someone later asks about it.
+
+  ─── Mode B — DOCUMENT (no `role` on any segment) ─────────────────
+  This is a document (web page, article, PDF-derived markdown, etc.).
+  Apply Mode B rules in addition to the common rules below.
+
+  - Use Markdown headings (H1/H2) as the primary signal for page
+    boundaries. A subject substantially confined to one section
+    becomes one page anchored on that subject.
+  - Documents are typically third-person/expository. Do NOT force a
+    `## Timeline` H2 onto static reference material. Include a
+    `## Timeline` ONLY when the document IS event-narrative
+    (changelogs, news articles, meeting minutes, retrospectives,
+    incident postmortems) AND has dated events.
+  - The "one page per speaker" rule does not apply.
+  - When `source` is present, treat it as provenance context for
+    titling/slugging only. Do not put the URL or file path into the
+    slug or title.
+
+  ─── Common rules (both modes) ────────────────────────────────────
   Extract knowledge into wiki pages organized around STABLE SUBJECTS —
   a person, a project, a concept, a tool, a place. The slug names the
   subject, not a specific event or date.
 
-  Rules:
   - Prefer fewer, larger pages. If information is about a subject that
     warrants a page, capture it as H2 sections on that subject's page —
     don't create a new page for every event, date, or anecdote.
-  - Split into a separate page only when a sub-topic is substantial and
-    self-contained enough to stand on its own across future sessions.
+  - Split into a separate page only when a sub-topic is substantial
+    and self-contained enough to stand on its own across future
+    sessions.
   - The slug describes EXACTLY ONE subject (e.g. `alice`,
-    `oauth-migration`, `memex-daemon`). Never join two subjects in a slug,
-    never include an event or date in a slug. Forbidden patterns:
+    `oauth-migration`, `memex-daemon`). Never join two subjects in a
+    slug, never include an event or date in a slug. Forbidden patterns:
     * Multi-subject: `alice-bob-*`, `alice-bob-conversation`
     * Date-bearing: `*-2023-08`, `*-july-2023`, `*-october`
     * Episode words: anywhere `conversation`, `session`, `meeting`,
       `episode`, `trip`, `outing`, `roadtrip` appears as a slug segment
     * Event-specific: `alice-stained-glass-church`,
       `bob-grand-canyon-trip-oct`, `oauth-token-bug-tuesday`
-    If a session covers two people talking, emit ONE page per person
-    (e.g. slug `alice`, slug `bob`), each containing only facts about
-    that person. If a fact is about both, put it on both pages.
-  - Preserve specific facts: dates, times, numbers, names, places, direct
-    quotes. These are the retrieval handles for later queries — losing
-    them is an extraction failure.
-  - Resolve relative dates. Prefer each turn's explicit `timestamp` field
-    when present (derive the calendar date from it). Some transcripts also
-    include date markers inside turn text
-    (e.g. `[2023-05-08] Caroline: ...`) — use that if needed. When a turn
-    uses a relative reference ("yesterday", "last Tuesday", "three days
-    ago", "next week"), compute the absolute date from the turn/session
-    date. Distinguish past tense ("I went yesterday" = completed event)
-    from future/planned tense ("I'm going tomorrow" = intent, not yet an
-    event). Write dates as ISO 8601 (YYYY-MM-DD) when day-precision is
-    known; fall back to month (YYYY-MM) or year (YYYY) only when the
-    transcript doesn't support finer precision.
-  - Every subject page with any dated mentions MUST include a `## Timeline`
-    H2 section that EXHAUSTIVELY enumerates dated events — do not curate
-    for "importance." The Timeline is the retrieval handle for "when"
-    questions; a minor dated event becomes critical when someone later
-    asks about it.
-
-    Scan the transcript turn by turn. For EVERY turn where a speaker
-    mentions an event — "I went", "I attended", "I signed up", "I ran",
-    "I bought", "I finished", "I gave a talk", "I'm going to", "I'm
-    planning to", "we did", "yesterday I", "last week I", "the week
-    before", "next Friday", "I met them N years ago" — emit a Timeline
-    entry for the subject of that event. Under-extraction is the most
-    common failure mode; err on the side of including marginal events.
-    Expect many entries in a substantive session.
-
-    Include:
-    * Completed events (things that happened): no suffix.
-    * Planned or future events (the subject said they would do X on date Y):
-      append ` [planned]`. Keep planning in the Timeline so "when is X
-      going to do Y?" questions are answerable.
-    * Ongoing or recurring commitments: append ` [ongoing]` when relevant.
-    * Durations anchored to an event ("met friends 4 years ago") — record
-      as the inferred event date AND, separately on the subject's page,
-      a narrative sentence giving the duration explicitly.
-
+  - Preserve specific facts: dates, times, numbers, names, places,
+    direct quotes. These are the retrieval handles for later queries —
+    losing them is an extraction failure.
+  - When emitting a `## Timeline` section (always for transcripts with
+    dated events; for documents only when applicable):
     Enumerate every date-tagged item: classes signed up for, meetings,
     appointments, speeches, races, purchases, trips, milestones, calls,
     workshops, conferences, outings, relocations, first-meetings.
-    Duplication with narrative sections is fine — do not omit a Timeline
-    line just because the body mentions the event.
-
+    Duplication with narrative sections is fine — do not omit a
+    Timeline line just because the body mentions the event.
     Format: `- YYYY-MM-DD — short description [planned|ongoing]?`.
     Use lower-precision forms (`~YYYY-MM` for "early July 2023",
-    `~YYYY` for "around 2019") only when the transcript doesn't support
+    `~YYYY` for "around 2019") only when the source doesn't support
     a specific day.
+    * Completed events (things that happened): no suffix.
+    * Planned or future events (the subject said they would do X on
+      date Y): append ` [planned]`. Keep planning in the Timeline so
+      "when is X going to do Y?" questions are answerable.
+    * Ongoing or recurring commitments: append ` [ongoing]` when relevant.
+    * Durations anchored to an event ("met friends 4 years ago") —
+      record as the inferred event date AND, separately on the
+      subject's page, a narrative sentence giving the duration explicitly.
   - Use `[[other-slug]]` cross-references ONLY to other pages you are
     emitting in this same batch, or to a very obviously stable subject.
     When in doubt, use plain text rather than inventing a link target.
   - Each page should be self-contained: a reader should understand the
-    subject without the original transcript.
+    subject without needing the original source.
   - Output strict JSON: `{"pages":[{"slug":"...","title":"...","tags":[],"body":"..."}]}`
     — no surrounding prose, no code fences.
 

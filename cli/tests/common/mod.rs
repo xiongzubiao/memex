@@ -75,3 +75,7 @@ pub fn stop_daemon(root: &Path, extra_path: Option<&Path>) {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[cfg(feature = "test-harness")]
+#[allow(unused_imports)]
+pub use memex_cli::daemon::test_harness::DaemonHarness;

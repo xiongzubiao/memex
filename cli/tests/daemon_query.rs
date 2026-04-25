@@ -98,6 +98,7 @@ fn test_state(
         )),
         memex_cache: MemexCache::new(),
         slug_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        config: Arc::new(memex_cli::daemon::config::Config::default()),
     }
 }
 
@@ -119,7 +120,6 @@ async fn query_raw_returns_indexed_entry() {
 
     let events = handle(
         Request::Query {
-            v: 1,
             question: "production rollout begins 2026".into(),
             raw: true,
             top_k: 5,
@@ -169,7 +169,6 @@ async fn query_raw_with_default_collection_excludes_non_default_docs() {
 
     let events = handle(
         Request::Query {
-            v: 1,
             question: "shared query target".into(),
             raw: true,
             top_k: 5,
@@ -220,7 +219,6 @@ async fn query_raw_with_explicit_collection_includes_only_matching_docs() {
 
     let events = handle(
         Request::Query {
-            v: 1,
             question: "shared query target".into(),
             raw: true,
             top_k: 5,
