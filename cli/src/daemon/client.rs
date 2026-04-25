@@ -43,11 +43,7 @@ pub async fn connect_with_retry(socket: &Path, deadline: Instant) -> Result<Unix
 /// means another client or daemon already holds it, so we skip the spawn
 /// and just retry. This dedupes the spawn-storm when N parallel clients
 /// all see a cold socket at once.
-pub async fn connect_or_spawn(
-    socket: &Path,
-    lock: &Path,
-    deadline: Instant,
-) -> Result<UnixStream> {
+pub async fn connect_or_spawn(socket: &Path, lock: &Path, deadline: Instant) -> Result<UnixStream> {
     // Fast path.
     if let Ok(s) = UnixStream::connect(socket).await {
         return Ok(s);
@@ -65,13 +61,16 @@ pub async fn connect_or_spawn(
             // extra daemon just exits cleanly via its own flock check.
             drop(guard);
             let exe = std::env::current_exe().context("getting current exe path")?;
-            let _ = std::process::Command::new(&exe)
+            let mut child = std::process::Command::new(&exe)
                 .args(["daemon", "start"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .with_context(|| format!("spawning {exe:?} daemon start"))?;
+            // Wait for the daemon to fork and exit, so we don't leave zombies.
+            // The daemon will detach itself via setsid() in start_background.
+            let _ = child.wait();
         }
     }
     connect_with_retry(socket, deadline).await

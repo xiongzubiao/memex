@@ -1,37 +1,107 @@
-//! Worker pool for agent subprocesses.
+//! Worker pool for agent workers.
 //!
-//! Each agent (Claude Code, Codex, Gemini CLI) is a sibling module behind
+//! Each agent implementation (Claude Code, Codex, Gemini CLI, OpenAI API) is a sibling module behind
 //! the same `WorkerPool` entry.
 
 pub mod claude_code;
 pub mod codex;
 pub mod gemini_cli;
 mod jsonrpc;
+pub mod openai_api;
 pub(crate) mod parse;
 
 /// Maximum accumulated LLM response size (bytes). Prevents OOM from
 /// runaway streaming. The largest model output is ~512KB (128K tokens).
 pub(crate) const MAX_RESPONSE_BYTES: usize = 1_048_576;
 
-use crate::daemon::config::{Agent, WorkerConfig};
+use crate::daemon::config::{Backend, WorkerConfig};
 use crate::daemon::queue::{
-    AgentJob, ExpandResult, IngestResult, JobReceiver, JobSender, MergeResult, SynthResult,
+    BackendJob, ExpandResult, IngestResult, JobReceiver, JobSender, MergeResult, SynthResult,
     WorkerError, queue,
 };
+use crate::memex_root;
 use anyhow::Result;
+use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-/// Outcome of a single turn. All three providers produce this shape.
+/// Outcome of a single turn. All providers produce this shape.
+///
+/// A single `BackendError` variant covers every non-success path:
+/// model-not-found (HTTP 404), auth failure, rate limit, schema-invalid
+/// reply, etc. `code` carries the backend-native identifier when
+/// available (`api_error_status` for Claude Code, `kind` for Codex,
+/// OpenAI error `code` / type, `rpc=<n>` for JSON-RPC) so the caller can
+/// log it and forward it untouched into the propagated error message.
+/// No variant-level auth specialization — a user seeing
+/// `[authentication_failed] ...` knows what to do.
 #[derive(Debug)]
 pub(crate) enum TurnOutcome {
-    Ok { text: String, input_tokens: u64 },
-    Auth(String),
-    Structured(String),
+    Ok {
+        text: String,
+        input_tokens: u64,
+    },
+    BackendError {
+        message: String,
+        code: Option<String>,
+    },
 }
 
-/// Outcome of one job, variant matches the AgentJob that was dispatched.
+impl TurnOutcome {
+    pub(super) fn backend_err(message: impl Into<String>, code: impl Into<String>) -> Self {
+        TurnOutcome::BackendError {
+            message: message.into(),
+            code: Some(code.into()),
+        }
+    }
+
+    pub(super) fn backend_err_no_code(message: impl Into<String>) -> Self {
+        TurnOutcome::BackendError {
+            message: message.into(),
+            code: None,
+        }
+    }
+}
+
+/// Worker prompt shared by every backend (extract / merge / expand /
+/// synthesize task instructions). Each backend embeds it as
+/// `baseInstructions` / `--system-prompt` / equivalent on session start.
+pub(super) const WORKER_PROMPT: &str = include_str!("prompt.txt");
+
+/// Spawn the configured command and detach its stdin / stdout. Uniform
+/// error messages across backends; centralizes the stdin/stdout-take
+/// dance that was duplicated in claude_code / codex / gemini_cli.
+pub(super) fn spawn_with_pipes(
+    cmd: &mut tokio::process::Command,
+    label: &'static str,
+) -> Result<(
+    tokio::process::Child,
+    tokio::process::ChildStdin,
+    tokio::process::ChildStdout,
+)> {
+    use anyhow::{Context, anyhow};
+    let mut child = cmd.spawn().context(label)?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("{label}: missing stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("{label}: missing stdout"))?;
+    Ok((child, stdin, stdout))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskKind {
+    Expand,
+    Synthesize,
+    Extract,
+    Merge,
+}
+
+/// Outcome of one job, variant matches the BackendJob that was dispatched.
 #[derive(Debug)]
 pub(super) enum JobOutcome {
     Expand(ExpandResult),
@@ -41,7 +111,7 @@ pub(super) enum JobOutcome {
 }
 
 /// Configure a subprocess command for an agent worker: sanitize env,
-/// pipe stdio, enable kill-on-drop, and set cwd to `~/.memex` (a neutral
+/// pipe stdio, enable kill-on-drop, and set cwd to MEMEX_ROOT (neutral
 /// dir that prevents picking up the user's project-local CLAUDE.md /
 /// GEMINI.md). `allowlist` names the env vars to inherit from the parent;
 /// all `LC_*` locale vars are forwarded unconditionally.
@@ -55,57 +125,67 @@ pub(super) fn prepare_agent_cmd(cmd: &mut tokio::process::Command, allowlist: &[
     for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("LC_")) {
         cmd.env(k, v);
     }
-    if let Some(home) = dirs::home_dir() {
-        cmd.current_dir(home.join(".memex"));
-    }
+    cmd.current_dir(memex_root());
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 }
 
-/// Classify an error message heuristically by keyword match. Used when
-/// the underlying agent protocol doesn't provide a structured error kind
-/// and we need to decide between `TurnOutcome::Auth` and
-/// `TurnOutcome::Structured`.
-pub(crate) fn classify_error_text(text: &str) -> TurnOutcome {
-    let lc = text.to_ascii_lowercase();
-    if lc.contains("auth")
-        || lc.contains("unauthorized")
-        || lc.contains("forbidden")
-        || lc.contains("api key")
-        || lc.contains("credentials")
-        || lc.contains("login")
-    {
-        TurnOutcome::Auth(text.to_string())
-    } else {
-        TurnOutcome::Structured(text.to_string())
-    }
+/// Drain stderr from a (crashed) child subprocess up to `max_bytes`.
+/// Called on spawn/init failure so the real diagnostic reaches the CLI
+/// instead of a generic "subprocess crashed" message. Never blocks — if
+/// reading stderr stalls for more than 1s we return what we have.
+pub(super) async fn drain_stderr(
+    stderr: Option<tokio::process::ChildStderr>,
+    max_bytes: usize,
+) -> String {
+    let Some(s) = stderr else {
+        return String::new();
+    };
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::with_capacity(max_bytes);
+    let mut capped = s.take(max_bytes as u64);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        capped.read_to_end(&mut buf),
+    )
+    .await;
+    String::from_utf8_lossy(&buf).trim().to_string()
 }
 
 /// Variant-wrapped subprocess. Each variant holds the provider-specific
 /// struct defined in its own module. Dispatch methods below enable
 /// protocol-agnostic use in `run_job_with_retry`.
 enum Subprocess {
-    ClaudeCode(claude_code::ClaudeSubprocess),
+    ClaudeCode(claude_code::ClaudeCodeSubprocess),
     Codex(codex::CodexSubprocess),
-    GeminiCli(gemini_cli::GeminiSubprocess),
+    GeminiCli(gemini_cli::GeminiCliSubprocess),
+    OpenAiApi(openai_api::OpenAiApiSubprocess),
 }
 
 impl Subprocess {
-    async fn spawn(agent: Agent, cfg: &WorkerConfig) -> Result<Self> {
-        Ok(match agent {
-            Agent::ClaudeCode => Subprocess::ClaudeCode(claude_code::ClaudeSubprocess::spawn(cfg).await?),
-            Agent::Codex => Subprocess::Codex(codex::CodexSubprocess::spawn(cfg).await?),
-            Agent::GeminiCli => Subprocess::GeminiCli(gemini_cli::GeminiSubprocess::spawn(cfg).await?),
+    async fn spawn(backend: Backend, cfg: &WorkerConfig) -> Result<Self> {
+        Ok(match backend {
+            Backend::ClaudeCode => {
+                Subprocess::ClaudeCode(claude_code::ClaudeCodeSubprocess::spawn(cfg).await?)
+            }
+            Backend::Codex => Subprocess::Codex(codex::CodexSubprocess::spawn(cfg).await?),
+            Backend::GeminiCli => {
+                Subprocess::GeminiCli(gemini_cli::GeminiCliSubprocess::spawn(cfg).await?)
+            }
+            Backend::OpenAiApi => {
+                Subprocess::OpenAiApi(openai_api::OpenAiApiSubprocess::spawn(cfg).await?)
+            }
         })
     }
 
-    async fn one_turn(&mut self, prompt: &str) -> Result<TurnOutcome> {
+    async fn one_turn(&mut self, prompt: &str, task_kind: TaskKind) -> Result<TurnOutcome> {
         match self {
-            Subprocess::ClaudeCode(s) => s.one_turn(prompt).await,
-            Subprocess::Codex(s) => s.one_turn(prompt).await,
-            Subprocess::GeminiCli(s) => s.one_turn(prompt).await,
+            Subprocess::ClaudeCode(s) => s.one_turn(prompt, task_kind).await,
+            Subprocess::Codex(s) => s.one_turn(prompt, task_kind).await,
+            Subprocess::GeminiCli(s) => s.one_turn(prompt, task_kind).await,
+            Subprocess::OpenAiApi(s) => s.one_turn(prompt, task_kind).await,
         }
     }
 
@@ -119,6 +199,7 @@ impl Subprocess {
             Subprocess::ClaudeCode(_) => false, // full respawn on next job
             Subprocess::Codex(s) => s.fresh_thread(cfg).await.is_ok(),
             Subprocess::GeminiCli(s) => s.fresh_session(cfg).await.is_ok(),
+            Subprocess::OpenAiApi(_) => true, // stateless requests
         }
     }
 }
@@ -162,8 +243,8 @@ impl WorkerPool {
     /// headroom under `max_count`.
     pub async fn submit(
         &self,
-        job: AgentJob,
-    ) -> Result<(), async_channel::SendError<AgentJob>> {
+        job: BackendJob,
+    ) -> Result<(), async_channel::SendError<BackendJob>> {
         let live = self.live.load(Ordering::Acquire);
         let busy = self.busy.load(Ordering::Acquire);
         if (!self.tx.is_empty() || busy >= live) && live < self.cfg.max_count {
@@ -215,14 +296,17 @@ async fn run(
     is_min: bool,
     busy: Arc<AtomicUsize>,
 ) {
-    let span = tracing::info_span!("worker", id = worker_id, agent = ?cfg.agent);
+    let span = tracing::info_span!("worker", id = worker_id, backend = ?cfg.backend);
     let _enter = span.enter();
 
     let mut subprocess: Option<Subprocess> = None;
     let mut jobs_done: u32 = 0;
     let mut cumulative_input_tokens: u64 = 0;
 
-    let model_name = cfg.model.as_deref().unwrap_or_else(|| cfg.agent.default_model());
+    let model_name = cfg
+        .model
+        .as_deref()
+        .unwrap_or_else(|| cfg.backend.default_model());
     let max_input = memex_core::model::lookup_model(model_name).max_input_tokens as u64;
     let context_threshold = max_input * 7 / 10;
 
@@ -290,24 +374,24 @@ async fn run(
         // run_job_with_retry's outcome variant matches the job's variant
         // (the prompt construction branch drives both), so the catch-all
         // should be unreachable. If it ever fires — e.g., a future editor
-        // adds a new AgentJob variant without extending run_job_with_retry
+        // adds a new BackendJob variant without extending run_job_with_retry
         // — log and drop the reply rather than panicking the worker (which
         // would kill the min worker and force a cold respawn).
         match (job, outcome) {
-            (AgentJob::Expand(j), JobOutcome::Expand(r)) => {
+            (BackendJob::Expand(j), JobOutcome::Expand(r)) => {
                 let _ = j.reply.send(r);
             }
-            (AgentJob::Synth(j), JobOutcome::Synth(r)) => {
+            (BackendJob::Synth(j), JobOutcome::Synth(r)) => {
                 let _ = j.reply.send(r);
             }
-            (AgentJob::Ingest(j), JobOutcome::Ingest(r)) => {
+            (BackendJob::Ingest(j), JobOutcome::Ingest(r)) => {
                 let _ = j.reply.send(r);
             }
-            (AgentJob::Merge(j), JobOutcome::Merge(r)) => {
+            (BackendJob::Merge(j), JobOutcome::Merge(r)) => {
                 let _ = j.reply.send(r);
             }
             _ => {
-                tracing::error!("internal type mismatch between AgentJob and JobOutcome");
+                tracing::error!("internal type mismatch between BackendJob and JobOutcome");
                 debug_assert!(false, "job type mismatch");
             }
         }
@@ -337,55 +421,53 @@ impl Drop for CountGuard {
 async fn run_job_with_retry(
     subprocess: &mut Option<Subprocess>,
     cfg: &WorkerConfig,
-    job: &AgentJob,
+    job: &BackendJob,
 ) -> (JobOutcome, u64) {
-    #[derive(Clone, Copy)]
-    enum JobKind { Expand, Synth, Ingest, Merge }
-
     let (prompt, kind) = match job {
-        AgentJob::Expand(j) => (
+        BackendJob::Expand(j) => (
             format!("[TASK: EXPAND]\n\nQuestion: {}\n", j.question),
-            JobKind::Expand,
+            TaskKind::Expand,
         ),
-        AgentJob::Synth(j) => (
+        BackendJob::Synth(j) => (
             format!(
                 "[TASK: SYNTHESIZE]\n\n{}\n\nQuestion: {}\n",
                 j.context, j.question
             ),
-            JobKind::Synth,
+            TaskKind::Synthesize,
         ),
-        AgentJob::Ingest(j) => (
-            format!("[TASK: EXTRACT]\n\n{}\n", j.transcript),
-            JobKind::Ingest,
-        ),
-        AgentJob::Merge(j) => {
-            let mut parts = Vec::new();
-            for pair in &j.pages {
-                parts.push(format!(
-                    "--- PAGE: {} ---\nEXISTING:\n{}\n\nNEW CONTENT:\n{}\n",
-                    pair.slug, pair.existing, pair.proposed
-                ));
-            }
-            (
-                format!("[TASK: MERGE]\n\n{}\n", parts.join("\n")),
-                JobKind::Merge,
-            )
-        }
+        BackendJob::Ingest(j) => (build_extract_prompt(&j.turns), TaskKind::Extract),
+        BackendJob::Merge(j) => (build_merge_prompt(&j.pages), TaskKind::Merge),
     };
 
     let timeout = std::time::Duration::from_secs(cfg.timeout_sec);
     let mut last_err: WorkerError = WorkerError::Crash("no attempt completed".into());
 
     let as_err = |e: WorkerError| match kind {
-        JobKind::Expand => JobOutcome::Expand(Err(e)),
-        JobKind::Synth => JobOutcome::Synth(Err(e)),
-        JobKind::Ingest => JobOutcome::Ingest(Err(e)),
-        JobKind::Merge => JobOutcome::Merge(Err(e)),
+        TaskKind::Expand => JobOutcome::Expand(Err(e)),
+        TaskKind::Synthesize => JobOutcome::Synth(Err(e)),
+        TaskKind::Extract => JobOutcome::Ingest(Err(e)),
+        TaskKind::Merge => JobOutcome::Merge(Err(e)),
+    };
+
+    // Schema-parse failures: agent gave us text, but it wasn't the JSON
+    // we asked for. Surface raw text with no code.
+    let parse_err = |e: parse::ParseFailure, stage: &str| -> WorkerError {
+        tracing::warn!(
+            parse_error = %e.reason,
+            raw_len = e.raw.len(),
+            raw_preview = %e.preview(400),
+            "{} reply didn't parse",
+            stage,
+        );
+        WorkerError::Backend {
+            message: e.raw,
+            code: None,
+        }
     };
 
     for attempt in 0..2u32 {
         if subprocess.is_none() {
-            match Subprocess::spawn(cfg.agent, cfg).await {
+            match Subprocess::spawn(cfg.backend, cfg).await {
                 Ok(s) => *subprocess = Some(s),
                 Err(e) => {
                     tracing::warn!(attempt, ?e, "spawn failed");
@@ -395,40 +477,27 @@ async fn run_job_with_retry(
             }
         }
         let sp = subprocess.as_mut().expect("spawned above");
-        let turn = tokio::time::timeout(timeout, sp.one_turn(&prompt)).await;
+        let turn = tokio::time::timeout(timeout, sp.one_turn(&prompt, kind)).await;
 
         match turn {
             Ok(Ok(TurnOutcome::Ok { text, input_tokens })) => {
                 let outcome = match kind {
-                    JobKind::Expand => {
-                        JobOutcome::Expand(parse::parse_expand(&text).map_err(|raw| {
-                            tracing::warn!(raw = %raw, "expand reply didn't parse");
-                            WorkerError::AgentError(raw)
-                        }))
-                    }
-                    JobKind::Synth => {
-                        JobOutcome::Synth(parse::parse_reply(&text).map_err(|raw| {
-                            tracing::warn!(raw = %raw, "synth reply didn't parse");
-                            WorkerError::AgentError(raw)
-                        }))
-                    }
-                    JobKind::Ingest => {
-                        JobOutcome::Ingest(parse::parse_ingest(&text).map_err(|raw| {
-                            tracing::warn!(raw = %raw, "ingest reply didn't parse");
-                            WorkerError::AgentError(raw)
-                        }))
-                    }
-                    JobKind::Merge => {
-                        JobOutcome::Merge(parse::parse_merge(&text).map_err(|raw| {
-                            tracing::warn!(raw = %raw, "merge reply didn't parse");
-                            WorkerError::AgentError(raw)
-                        }))
-                    }
+                    TaskKind::Expand => JobOutcome::Expand(
+                        parse::parse_expansion(&text).map_err(|e| parse_err(e, "expand")),
+                    ),
+                    TaskKind::Synthesize => JobOutcome::Synth(
+                        parse::parse_synthesis(&text).map_err(|e| parse_err(e, "synth")),
+                    ),
+                    TaskKind::Extract => JobOutcome::Ingest(
+                        parse::parse_ingest(&text).map_err(|e| parse_err(e, "ingest")),
+                    ),
+                    TaskKind::Merge => JobOutcome::Merge(
+                        parse::parse_merge(&text).map_err(|e| parse_err(e, "merge")),
+                    ),
                 };
                 return (outcome, input_tokens);
             }
-            Ok(Ok(TurnOutcome::Auth(text))) => {
-                tracing::warn!(text = %text, "auth failed");
+            Ok(Ok(TurnOutcome::BackendError { message, code })) => {
                 // Reset protocol state: the subprocess may have buffered
                 // notifications for the errored turn that would otherwise
                 // arrive as stale IDs on the next turn. For claude code,
@@ -438,16 +507,10 @@ async fn run_job_with_retry(
                 {
                     *subprocess = None;
                 }
-                return (as_err(WorkerError::AuthFailed(text)), 0);
-            }
-            Ok(Ok(TurnOutcome::Structured(text))) => {
-                tracing::warn!(text = %text, "structured error");
-                if let Some(sp) = subprocess.as_mut()
-                    && !sp.soft_reset(cfg).await
-                {
-                    *subprocess = None;
-                }
-                return (as_err(WorkerError::AgentError(text)), 0);
+                // No log here: the handler logs this as
+                // `ERROR "handler error" code=backend_unavailable` with
+                // the backend-native code prefixed into the message.
+                return (as_err(WorkerError::Backend { message, code }), 0);
             }
             Ok(Err(e)) => {
                 tracing::warn!(attempt, ?e, "turn crash; retrying");
@@ -464,64 +527,80 @@ async fn run_job_with_retry(
     (as_err(last_err), 0)
 }
 
+fn build_extract_prompt(turns: &[memex_core::transcript::TranscriptTurn]) -> String {
+    let payload = json!({
+        "turns": turns
+            .iter()
+            .enumerate()
+            .map(|(i, t)| json!({
+                "turn_index": i + 1,
+                "role": t.role,
+                "timestamp": t.timestamp,
+                "text": t.text,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    format!("[TASK: EXTRACT]\n\n{}\n", payload)
+}
+
+fn build_merge_prompt(pages: &[crate::daemon::queue::MergePair]) -> String {
+    let payload = json!({
+        "pages": pages
+            .iter()
+            .map(|p| json!({
+                "slug": p.slug,
+                "existing": p.existing,
+                "proposed": p.proposed,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    format!("[TASK: MERGE]\n\n{}\n", payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Pin each keyword in the union to prevent silent regressions if
-    /// someone later trims the list thinking a keyword is unused.
-    /// Each keyword exists because at least one provider needs it.
-    #[test]
-    fn classify_error_text_recognizes_every_keyword() {
-        // codex + gemini cli: generic auth errors
-        for kw in ["authentication", "unauthorized", "forbidden", "api key"] {
-            let out = classify_error_text(&format!("turn failed: {kw} problem"));
-            assert!(
-                matches!(out, TurnOutcome::Auth(_)),
-                "expected Auth for keyword {kw:?}, got {out:?}"
-            );
-        }
-        // codex-specific: "login" (e.g., "Not logged in · Please run /login")
-        assert!(matches!(
-            classify_error_text("please login and retry"),
-            TurnOutcome::Auth(_)
-        ));
-        // gemini cli-specific: "credentials"
-        assert!(matches!(
-            classify_error_text("invalid credentials"),
-            TurnOutcome::Auth(_)
-        ));
-    }
-
-    #[test]
-    fn classify_error_text_defaults_to_structured() {
-        assert!(matches!(
-            classify_error_text("overloaded, try again later"),
-            TurnOutcome::Structured(_)
-        ));
-        assert!(matches!(
-            classify_error_text("rate limit exceeded"),
-            TurnOutcome::Structured(_)
-        ));
-    }
-
-    #[test]
-    fn classify_error_text_is_case_insensitive() {
-        assert!(matches!(
-            classify_error_text("AUTHENTICATION FAILED"),
-            TurnOutcome::Auth(_)
-        ));
-    }
 
     #[test]
     fn context_threshold_resolves_for_each_agent() {
-        for agent in [Agent::ClaudeCode, Agent::Codex, Agent::GeminiCli] {
-            let name = agent.default_model();
+        for backend in [
+            Backend::ClaudeCode,
+            Backend::Codex,
+            Backend::GeminiCli,
+            Backend::OpenAiApi,
+        ] {
+            let name = backend.default_model();
             let info = memex_core::model::lookup_model(name);
             assert!(
                 info.max_input_tokens > 0,
                 "expected non-zero max_input_tokens for {name}"
             );
         }
+    }
+
+    #[test]
+    fn build_extract_prompt_uses_structured_turns_with_timestamp() {
+        let turns = vec![
+            memex_core::transcript::TranscriptTurn {
+                role: "user".to_string(),
+                timestamp: Some("2026-04-23T12:00:00Z".to_string()),
+                text: "hello".to_string(),
+            },
+            memex_core::transcript::TranscriptTurn {
+                role: "assistant".to_string(),
+                timestamp: Some("2026-04-23T12:00:01Z".to_string()),
+                text: "world".to_string(),
+            },
+        ];
+        let p = build_extract_prompt(&turns);
+        assert!(p.contains("\"timestamp\":\"2026-04-23T12:00:00Z\""));
+        assert!(p.contains("\"timestamp\":\"2026-04-23T12:00:01Z\""));
+    }
+
+    #[test]
+    fn build_extract_prompt_handles_empty_turns() {
+        let p = build_extract_prompt(&[]);
+        assert!(p.contains("\"turns\":[]"));
     }
 }

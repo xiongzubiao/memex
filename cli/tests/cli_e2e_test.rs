@@ -1,3 +1,4 @@
+use memex_core::schema::register_sqlite_vec_once;
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
@@ -30,6 +31,42 @@ fn search_empty_wiki() {
 }
 
 #[test]
+fn ingest_and_backfill_help_show_collection_flag() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("memex");
+
+    let ingest_help = memex_cmd(&root)
+        .args(["ingest", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        ingest_help.status.success(),
+        "ingest --help should succeed, stderr: {}",
+        String::from_utf8_lossy(&ingest_help.stderr)
+    );
+    let ingest_stdout = String::from_utf8_lossy(&ingest_help.stdout);
+    assert!(
+        ingest_stdout.contains("--collection"),
+        "ingest help should show --collection flag, got: {ingest_stdout}"
+    );
+
+    let backfill_help = memex_cmd(&root)
+        .args(["backfill", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        backfill_help.status.success(),
+        "backfill --help should succeed, stderr: {}",
+        String::from_utf8_lossy(&backfill_help.stderr)
+    );
+    let backfill_stdout = String::from_utf8_lossy(&backfill_help.stdout);
+    assert!(
+        backfill_stdout.contains("--collection"),
+        "backfill help should show --collection flag, got: {backfill_stdout}"
+    );
+}
+
+#[test]
 fn search_with_content() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("memex");
@@ -56,11 +93,7 @@ fn search_with_content() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(
-        stdout.trim(),
-        "caching",
-        "should print slug, got: {stdout}"
-    );
+    assert_eq!(stdout.trim(), "caching", "should print slug, got: {stdout}");
 }
 
 #[test]
@@ -872,6 +905,7 @@ fn write_populates_chunks_table() {
     // Open the search DB and verify chunks were stored.
     let db_path = root.join(".search.db");
     assert!(db_path.exists(), "search DB should exist");
+    register_sqlite_vec_once();
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let chunk_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
@@ -884,7 +918,7 @@ fn write_populates_chunks_table() {
     // Verify the chunk has a non-null embedding blob.
     let has_embedding: bool = conn
         .query_row(
-            "SELECT COUNT(*) > 0 FROM chunks WHERE embedding IS NOT NULL",
+            "SELECT COUNT(*) > 0 FROM chunks_vec WHERE embedding IS NOT NULL",
             [],
             |row| row.get(0),
         )
@@ -1157,11 +1191,7 @@ fn search_probe_includes_vector() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(
-        stdout.trim(),
-        "caching",
-        "should print slug, got: {stdout}"
-    );
+    assert_eq!(stdout.trim(), "caching", "should print slug, got: {stdout}");
 }
 
 // ---------------------------------------------------------------------------

@@ -1,8 +1,9 @@
 //! Daemon config schema + loader.
 //!
-//! Loads from `~/.memex/config.toml` (override via `MEMEX_CONFIG`), layered
+//! Loads from `${MEMEX_ROOT}/config.toml` (override via `MEMEX_CONFIG`), layered
 //! with env vars (`MEMEX_<SECTION>__<FIELD>`, double-underscore separator).
 
+use crate::memex_root;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::Path;
@@ -27,7 +28,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             idle_timeout_min: 15,
-            log_file: expand_tilde("~/.memex/daemon.log"),
+            log_file: memex_root().join("daemon.log"),
             worker: WorkerConfig::default(),
         }
     }
@@ -36,7 +37,7 @@ impl Default for DaemonConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct WorkerConfig {
-    pub agent: Agent,
+    pub backend: Backend,
     pub model: Option<String>,
     pub max_count: usize,
     pub idle_reap_sec: u64,
@@ -54,35 +55,37 @@ impl Default for WorkerConfig {
             .map(|n| n.get())
             .unwrap_or(1);
         Self {
-            agent: Agent::ClaudeCode,
+            backend: Backend::ClaudeCode,
             model: None,
             max_count: cpus,
             idle_reap_sec: 600,
             restart_after_jobs: 100,
-            timeout_sec: 60,
+            timeout_sec: 300,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum Agent {
+pub enum Backend {
     ClaudeCode,
     Codex,
     GeminiCli,
+    #[serde(rename = "openai-api")]
+    OpenAiApi,
 }
 
-impl Agent {
-    /// Default model name for the agent. Used both as the `--model` arg
+impl Backend {
+    /// Default model name for the backend. Used both as the `--model` arg
     /// passed to the subprocess and as the lookup key for
     /// `memex_core::model::lookup_model`, which resolves
-    /// `max_input_tokens` for the context-restart threshold. All three
-    /// provider CLIs accept the canonical catalog name.
+    /// `max_input_tokens` for the context-restart threshold.
     pub fn default_model(&self) -> &'static str {
         match self {
-            Agent::ClaudeCode => "claude-sonnet-4-6",
-            Agent::Codex => "gpt-5.4-mini",
-            Agent::GeminiCli => "gemini-3-flash-preview",
+            Backend::ClaudeCode => "claude-sonnet-4-6",
+            Backend::Codex => "gpt-5.4-mini",
+            Backend::GeminiCli => "gemini-3-flash-preview",
+            Backend::OpenAiApi => "gpt-5.4-mini",
         }
     }
 }
@@ -115,11 +118,12 @@ impl Config {
                 .separator("__")
                 .try_parsing(true),
         );
-        let cfg: Config = builder
+        let mut cfg: Config = builder
             .build()
             .context("building config")?
             .try_deserialize()
             .context("deserializing config")?;
+        cfg.daemon.log_file = resolve_memex_path(&cfg.daemon.log_file);
         cfg.validate().context("config validation")?;
         Ok(cfg)
     }
@@ -165,13 +169,17 @@ impl Config {
     }
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
+fn resolve_memex_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if let Some(s) = path.to_str()
+        && let Some(rest) = s.strip_prefix("~/")
         && let Some(home) = dirs::home_dir()
     {
         return home.join(rest);
     }
-    PathBuf::from(path)
+    memex_root().join(path)
 }
 
 #[cfg(test)]
@@ -191,12 +199,13 @@ mod tests {
     fn default_values_match_spec() {
         let c = Config::default();
         assert_eq!(c.daemon.idle_timeout_min, 15);
-        assert_eq!(c.daemon.worker.agent, Agent::ClaudeCode);
+        assert_eq!(c.daemon.log_file, memex_root().join("daemon.log"));
+        assert_eq!(c.daemon.worker.backend, Backend::ClaudeCode);
         assert_eq!(c.daemon.worker.model, None);
         assert!(c.daemon.worker.max_count >= 1);
         assert_eq!(c.daemon.worker.idle_reap_sec, 600);
         assert_eq!(c.daemon.worker.restart_after_jobs, 100);
-        assert_eq!(c.daemon.worker.timeout_sec, 60);
+        assert_eq!(c.daemon.worker.timeout_sec, 300);
         assert_eq!(c.query.top_k, 5);
     }
 
@@ -221,18 +230,20 @@ mod tests {
             r#"
 [daemon]
 idle_timeout_min = 30
+log_file = "logs/custom.log"
 
 [daemon.worker]
-agent = "codex"
+backend = "codex"
 model = "gpt-5.4-mini"
 max_count = 4
 "#,
         );
         let c = Config::load(&path).unwrap();
         assert_eq!(c.daemon.idle_timeout_min, 30);
-        assert_eq!(c.daemon.worker.agent, Agent::Codex);
+        assert_eq!(c.daemon.worker.backend, Backend::Codex);
         assert_eq!(c.daemon.worker.model, Some("gpt-5.4-mini".to_string()));
         assert_eq!(c.daemon.worker.max_count, 4);
+        assert_eq!(c.daemon.log_file, memex_root().join("logs/custom.log"));
     }
 
     #[test]

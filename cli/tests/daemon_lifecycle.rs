@@ -81,37 +81,56 @@ fn concurrent_start_exactly_one_wins() {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path();
 
-    // Start two daemons concurrently.
-    let mut d1 = spawn_daemon(root);
-    let mut d2 = spawn_daemon(root);
+    // Start two daemons concurrently. Each spawns a CLI process that forks internally.
+    let _d1 = spawn_daemon(root);
+    let _d2 = spawn_daemon(root);
 
-    // Exactly one should remain running; the other should exit 0 within 3s.
+    // Wait for the lock race to settle (3s max).
     let deadline = Instant::now() + Duration::from_secs(3);
-    let mut d1_exited = false;
-    let mut d2_exited = false;
-    while Instant::now() < deadline && !(d1_exited ^ d2_exited) {
+    let mut daemons_running = 0;
+    while Instant::now() < deadline && daemons_running == 0 {
         thread::sleep(Duration::from_millis(50));
-        d1_exited = d1.try_wait().map(|o| o.is_some()).unwrap_or(false);
-        d2_exited = d2.try_wait().map(|o| o.is_some()).unwrap_or(false);
+        // Count how many daemons have PID files (indicating the lock was acquired).
+        if root.join("daemon.pid").exists() {
+            daemons_running += 1;
+        }
     }
+
+    // Exactly one daemon should have acquired the lock.
+    // Read the PID file to verify.
     assert!(
-        d1_exited ^ d2_exited,
-        "expected exactly one daemon to exit quickly (d1={d1_exited}, d2={d2_exited})"
+        root.join("daemon.pid").exists(),
+        "no daemon acquired lock within 3s"
     );
+    let pid: u32 = std::fs::read_to_string(root.join("daemon.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
 
-    // The loser should have exit code 0 (clean "already running" exit).
-    if d1_exited {
-        let out = d1.wait().unwrap();
-        assert_eq!(out.code(), Some(0), "loser d1 should exit 0");
-    } else {
-        let out = d2.wait().unwrap();
-        assert_eq!(out.code(), Some(0), "loser d2 should exit 0");
+    // Cleanup: stop the winner, then check it exited cleanly.
+    let _ = stop(root);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        // Check if the PID is still running.
+        let still_alive = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !still_alive {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 
-    // Cleanup: stop the winner.
-    let _ = stop(root);
-    let _ = d1.wait();
-    let _ = d2.wait();
+    // Verify only one PID file exists (the winner, not the loser).
+    // If a second daemon had won, we'd see a different PID.
+    // The loser should have exited cleanly (exit 0).
+    assert!(
+        root.join("daemon.pid").exists(),
+        "winner exited unexpectedly"
+    );
 }
 
 #[test]

@@ -7,7 +7,8 @@ TASKS:
   The user message contains the user's question. Your job is to produce
   three short rewrites that help broaden retrieval:
     - `lex` — one keyword or compact phrase (1-3 words) a lexical search
-      might match. Prefer nouns/named entities. If the question already
+      might match. Prefer distinctive nouns/named entities/unique
+      multi-word phrases from the question. If the question already
       contains good keywords, pick a synonym or related term, not a copy.
     - `vec` — one semantic reformulation (6-12 words) a vector search
       might match. Rephrase the question in different words, same intent.
@@ -15,46 +16,275 @@ TASKS:
       wiki contained the answer. Don't assert truth; write what the
       answer's sentence would sound like.
 
+  For temporal questions ("when did / when is / how long ago / how long
+  has"), shape the expansions to hit Timeline sections:
+    - `lex` → the most distinctive noun phrase from the question, without
+      the "when"/"what date" verb shell. For "when did Caroline meet
+      friends, family, and mentors?" use `lex: "friends family mentors"`.
+    - `hyde` → phrase it like a Timeline entry so it matches the wiki's
+      `## Timeline` format. For the same question use
+      `hyde: "2023-06-02 — Caroline met up with her friends, family,
+      and mentors"`. The date is a placeholder; vector similarity picks
+      up the `YYYY-MM-DD — <description>` shape.
+
   Output strict JSON: `{"lex": "...", "vec": "...", "hyde": "..."}` —
   no surrounding prose, no code fences, each value a single string.
 
 [TASK: SYNTHESIZE]
-  The user message contains a context block (retrieved pages, each tagged
-  with its rank, collection, and signal strength) followed by the user's
-  question. Produce a short answer grounded in the pages.
+  The user message contains a context block followed by the user's
+  question. The context block is a JSON array of entries. Each entry
+  has fields:
+    - `rank` (integer) — retrieval rank, lower is more relevant
+    - `doc_type` (string) — `wiki` (a curated subject page distilled
+      from one or more source documents) or `source` (a raw ingested
+      document: could be a conversation transcript, a note, a report,
+      an article, or any other original file). WIKI pages are
+      LLM-distilled summaries and may OMIT specific facts. SOURCE
+      entries are the authoritative originals and contain every detail
+      — dates, quotes, names, numbers, code, measurements — exactly as
+      written. If a wiki entry doesn't answer the question, the answer
+      is often inside a source entry.
+    - `signal` (string) — `strong` or `weak` retrieval confidence
+    - `id` (string) — the canonical citable identifier for this entry;
+      always unique across the memex
+    - `title` (string) — a human-readable label (wiki slug or a short
+      excerpt for source); for orientation only, not guaranteed unique
+    - `body` (string) — the entry content
+  Both doc_types are first-class evidence. Produce a short answer
+  grounded in the context by following the reasoning steps below IN
+  ORDER.
 
-  Rules:
-  - Prefer higher-ranked sources when facts conflict.
-  - Treat weak-signal top results with skepticism; if two pages disagree
-    and both have weak signal, say so rather than picking one.
-  - Cite every factual claim with a `[[page-stem]]` link (the stem is the
-    heading text after the rank/collection/signal markers).
-  - If no page answers the question, reply: "The wiki doesn't have this
-    information." No citations in that case.
-  - Output strict JSON: `{"answer": "...", "citations": ["stem1", "stem2"]}`
-    — no surrounding prose, no code fences. The `citations` array lists
-    every unique `[[stem]]` reference in your answer.
+  ## Step 1: SCAN ALL ENTRIES
+  Read EVERY entry below from first to last, including both wiki and
+  source entries. Note any that contain information relevant to the
+  question. Do NOT stop after finding the first relevant entry —
+  important details are often scattered across many entries, including
+  ones far down the list. Give equal weight to ALL entries regardless
+  of rank — a low-ranked entry is just as likely to contain the answer
+  as a high-ranked one.
+
+  CRITICAL: do NOT skim source entries. When wiki entries don't
+  directly answer the question, SEARCH the source entries line-by-line
+  for the specific fact, date, name, number, or quote requested. The
+  wiki is a summary; the source is the authoritative record. Read
+  source entries carefully for the exact passage, not just the gist.
+
+  ## Step 2: ENTITY VERIFICATION
+  Confirm each relevant entry is about the correct person/entity. If
+  the question asks about Person A and an entry attributes an action
+  to Person B, check the attribution is correct before using it.
+
+  ## Step 3: COMBINE AND CROSS-REFERENCE
+  - COMBINE facts from multiple entries about the same topic.
+  - For listing/counting questions, extract EVERY distinct fact from
+    ALL entries, enumerate them explicitly with dates or context,
+    THEN count. Do not estimate.
+  - Before enumerating, sketch the ANSWER SHAPE the question implies:
+    what kinds of items could answer it? Example: "what did they do
+    on the trip?" → activities, meals, places visited, purchases, or
+    people met. Then re-scan each entry specifically for each kind.
+    A single entry may contain multiple items across kinds.
+  - DECOMPOSE complex sentences into distinct facts.
+  - Connect related facts across entries (e.g., "nearby lake" in one
+    entry + "Lake Tahoe is great" in another → the nearby lake is
+    Lake Tahoe).
+
+  ## Step 4: SELECT THE BEST ANSWER
+  - Do NOT assume the highest-ranked entry is correct. Compare each
+    candidate's relevance to the SPECIFIC question, not its rank.
+  - ALWAYS choose the MOST SPECIFIC detail. Rate each candidate as
+    HIGH specificity (proper name, title, exact number, specific
+    activity) or LOW specificity (generic description, "a person",
+    "a place"), and prefer HIGH.
+  - Report what someone actually DID, not what was offered to them.
+  - Treat weak-signal top results with skepticism; if two entries
+    disagree and both have weak signal, prefer the more specific one.
+
+  ## Step 5: TEMPORAL GROUNDING
+  For "when" / "what date" / "how long ago" / "how long has X"
+  questions:
+  - FIRST establish the reference date — the most recent explicit
+    date found across the retrieved entries. Relative references in
+    the question ("recent", "now", "last week") anchor to it.
+  - Use dates EXPLICITLY stated in entries. Do not invent or estimate
+    dates. Never output a year outside the evidence's range (e.g. if
+    all entries are dated 2022–2024, do not output 2025 or 2026).
+  - For "how long" or duration questions, find the start and end
+    dates explicitly, THEN compute the duration. Do not guess. If
+    only a start date is present and the end is implied as "now",
+    compute against the reference date established above.
+  - Resolve relative references against session dates. Example:
+    "last Saturday" in a session dated 2023-07-08 → 2023-07-01.
+  - Context Timeline entry "~2019 — met current friend group" and
+    question "how long have they been friends?" at a reference date
+    of mid-2023 → "about 4 years."
+  - Context "[planned] 2023-07-15 — attending conference" and question
+    "when is she going?" → "2023-07-15" (do not treat future/planned
+    events as unknown).
+  - When multiple candidate dates exist, enumerate them all. If the
+    question uses past tense + "the" → pick the instance closest to
+    (and before) the reference date. Do not default to first-mentioned.
+
+  ## Step 6: INCLUSION CHECK (for lists and counts)
+  If you found facts during reasoning that you're tempted to exclude —
+  STOP. Include them unless you have STRONG evidence they are wrong.
+  More facts is better than fewer when evidence supports them.
+  - The question usually assumes something happened. Find WHAT
+    happened; do not say nothing happened when any evidence exists.
+
+  ## Step 7: COMMIT AND ANSWER
+  Give a direct, specific answer. NEVER say "not specified", "not
+  mentioned", "no record", or "the context doesn't contain this
+  information" when ANY retrieved entry has relevant information. No
+  hedging, no caveats.
+  - For open-domain/opinion questions ("Would X do Y?", "Is X Z?"):
+    follow DIRECT causal reasoning in the entries, do NOT construct
+    elaborate counter-arguments.
+    * "Would X do Y again soon?" — if the most recent attempt involved
+      a bad experience (accident, scare, trauma), answer "likely no."
+      A recent negative experience outweighs historical positive
+      patterns.
+    * For trait questions ("Is X considered Z?"): weigh ALL evidence
+      including symbolic/indirect references. If there is SOME but not
+      strong evidence, answer with a qualified degree ("somewhat")
+      rather than flat "no."
+  - NEVER generate specific names, titles, places, or dates that do
+    not appear in any retrieved entry.
+  - Cite every factual claim with a `[[id]]` link where `id` is the
+    value of the `id` field from the corresponding entry.
+  - ONLY reply "The available context doesn't contain this information"
+    when NO retrieved entry contains any information relevant to the
+    question. No citations in that case. Before refusing, re-read
+    EVERY source entry's body for the specific fact — wikis are
+    summaries and frequently omit details the source documents
+    clearly contain.
+
+  ## Reasoning aids (applied throughout the steps above)
+  - Make reasonable deductions from the evidence. Example: an entry
+    describing a shop with many workers implies the shop employs
+    many people.
+  - If an entry describes something recognizable (e.g. "romantic
+    drama about memory and relationships"), you may name it
+    (e.g. "Eternal Sunshine of the Spotless Mind") when the match
+    is clear.
+  - Use domain knowledge to connect facts. Examples: a game exclusive
+    to one platform implies ownership of that platform; an unnamed
+    deal can link to a previously stated brand preference; a city
+    implies its country.
+
+  Output strict JSON: `{"answer": "...", "citations": ["id1", "id2"]}`
+  — no surrounding prose, no code fences. The `citations` array lists
+  every unique `[[id]]` reference in your answer.
 
 [TASK: EXTRACT]
-  The user message contains a session transcript. Extract knowledge into
-  complete wiki pages. For each topic worth capturing, output a wiki page
-  with fields: slug, title, tags (array), body (markdown).
+  The user message contains a JSON object for one session transcript.
+  Input format: `{"turns":[...]}`
+  Each turn has `turn_index`, `role` (speaker identity; often `user`/`assistant`),
+  optional
+  `timestamp` (ISO 8601), and `text`.
+  Extract knowledge into wiki pages organized around STABLE SUBJECTS —
+  a person, a project, a concept, a tool, a place. The slug names the
+  subject, not a specific event or date.
 
   Rules:
-  - Include not just WHAT but WHY — reasoning, qualifications, specific
-    numbers, tradeoffs.
-  - Each page should be self-contained.
-  - Output ONLY a YAML list of pages, no surrounding prose, no code fences.
+  - Prefer fewer, larger pages. If information is about a subject that
+    warrants a page, capture it as H2 sections on that subject's page —
+    don't create a new page for every event, date, or anecdote.
+  - Split into a separate page only when a sub-topic is substantial and
+    self-contained enough to stand on its own across future sessions.
+  - The slug describes EXACTLY ONE subject (e.g. `alice`,
+    `oauth-migration`, `memex-daemon`). Never join two subjects in a slug,
+    never include an event or date in a slug. Forbidden patterns:
+    * Multi-subject: `alice-bob-*`, `alice-bob-conversation`
+    * Date-bearing: `*-2023-08`, `*-july-2023`, `*-october`
+    * Episode words: anywhere `conversation`, `session`, `meeting`,
+      `episode`, `trip`, `outing`, `roadtrip` appears as a slug segment
+    * Event-specific: `alice-stained-glass-church`,
+      `bob-grand-canyon-trip-oct`, `oauth-token-bug-tuesday`
+    If a session covers two people talking, emit ONE page per person
+    (e.g. slug `alice`, slug `bob`), each containing only facts about
+    that person. If a fact is about both, put it on both pages.
+  - Preserve specific facts: dates, times, numbers, names, places, direct
+    quotes. These are the retrieval handles for later queries — losing
+    them is an extraction failure.
+  - Resolve relative dates. Prefer each turn's explicit `timestamp` field
+    when present (derive the calendar date from it). Some transcripts also
+    include date markers inside turn text
+    (e.g. `[2023-05-08] Caroline: ...`) — use that if needed. When a turn
+    uses a relative reference ("yesterday", "last Tuesday", "three days
+    ago", "next week"), compute the absolute date from the turn/session
+    date. Distinguish past tense ("I went yesterday" = completed event)
+    from future/planned tense ("I'm going tomorrow" = intent, not yet an
+    event). Write dates as ISO 8601 (YYYY-MM-DD) when day-precision is
+    known; fall back to month (YYYY-MM) or year (YYYY) only when the
+    transcript doesn't support finer precision.
+  - Every subject page with any dated mentions MUST include a `## Timeline`
+    H2 section that EXHAUSTIVELY enumerates dated events — do not curate
+    for "importance." The Timeline is the retrieval handle for "when"
+    questions; a minor dated event becomes critical when someone later
+    asks about it.
+
+    Scan the transcript turn by turn. For EVERY turn where a speaker
+    mentions an event — "I went", "I attended", "I signed up", "I ran",
+    "I bought", "I finished", "I gave a talk", "I'm going to", "I'm
+    planning to", "we did", "yesterday I", "last week I", "the week
+    before", "next Friday", "I met them N years ago" — emit a Timeline
+    entry for the subject of that event. Under-extraction is the most
+    common failure mode; err on the side of including marginal events.
+    Expect many entries in a substantive session.
+
+    Include:
+    * Completed events (things that happened): no suffix.
+    * Planned or future events (the subject said they would do X on date Y):
+      append ` [planned]`. Keep planning in the Timeline so "when is X
+      going to do Y?" questions are answerable.
+    * Ongoing or recurring commitments: append ` [ongoing]` when relevant.
+    * Durations anchored to an event ("met friends 4 years ago") — record
+      as the inferred event date AND, separately on the subject's page,
+      a narrative sentence giving the duration explicitly.
+
+    Enumerate every date-tagged item: classes signed up for, meetings,
+    appointments, speeches, races, purchases, trips, milestones, calls,
+    workshops, conferences, outings, relocations, first-meetings.
+    Duplication with narrative sections is fine — do not omit a Timeline
+    line just because the body mentions the event.
+
+    Format: `- YYYY-MM-DD — short description [planned|ongoing]?`.
+    Use lower-precision forms (`~YYYY-MM` for "early July 2023",
+    `~YYYY` for "around 2019") only when the transcript doesn't support
+    a specific day.
+  - Use `[[other-slug]]` cross-references ONLY to other pages you are
+    emitting in this same batch, or to a very obviously stable subject.
+    When in doubt, use plain text rather than inventing a link target.
+  - Each page should be self-contained: a reader should understand the
+    subject without the original transcript.
+  - Output strict JSON: `{"pages":[{"slug":"...","title":"...","tags":[],"body":"..."}]}`
+    — no surrounding prose, no code fences.
 
 [TASK: MERGE]
-  The user message contains pairs of existing and proposed wiki pages.
-  Merge the new content into each existing page.
+  The user message contains a JSON object:
+  `{"pages":[{"slug","existing","proposed"},...]}`
+  Merge each proposed page's content into its paired existing page.
 
   Rules:
-  - Preserve the existing page's slug and title.
-  - Add new information in context with existing structure.
-  - Do not split into multiple pages.
-  - Resolve contradictions in favor of the newer information, noting what
-    changed.
-  - Output ONLY a YAML list of merged pages, no surrounding prose, no code
-    fences. Each page MUST keep its original slug.
+  - Preserve each existing page's slug and title.
+  - Integrate new information by extending existing H2 sections or adding
+    new ones. Keep the existing structure recognizable.
+  - Do not create new pages; do not split an existing page.
+  - Preserve specific facts from both sides: dates, times, numbers, names,
+    places, direct quotes. Lost details are merge failures — these are
+    the retrieval handles for later queries.
+  - Preserve the `## Timeline` section as a strict union of both inputs.
+    If the existing page has Timeline entries A, B, C and the proposed
+    page has X, Y, Z, the merged Timeline must contain all six (sorted
+    chronologically). Never drop a Timeline line during merge. Dedupe
+    only when two entries refer to the exact same event at the same date;
+    otherwise keep both.
+  - Resolve contradictions in favor of the newer information, noting the
+    change inline when non-trivial.
+  - Keep `[[other-slug]]` cross-references only if you are confident the
+    target page exists in the final wiki. Prefer plain text over guessing.
+  - Output strict JSON:
+    `{"pages":[{"slug":"...","title":"...","tags":[],"body":"..."}]}`
+    — no surrounding prose, no code fences. Each page MUST keep its
+    original slug.

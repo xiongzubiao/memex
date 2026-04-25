@@ -209,9 +209,9 @@ pub(crate) fn is_issue_still_present(
             Ok(!full_path.exists())
         }
         // Report-only kinds: always "present" (no auto-fix path).
-        LintIssueKind::DanglingLink
-        | LintIssueKind::MissingLink
-        | LintIssueKind::UntrackedFile => Ok(true),
+        LintIssueKind::DanglingLink | LintIssueKind::MissingLink | LintIssueKind::UntrackedFile => {
+            Ok(true)
+        }
     }
 }
 
@@ -230,26 +230,23 @@ pub(crate) fn apply_fix_inner(
             let content = std::fs::read_to_string(&full_path)?;
             let old_hash = search.get_document_hash(&issue.target)?.unwrap_or_default();
             search.reindex_page_from_content(&issue.target, &content, &old_hash)?;
-            // Re-embed the new content. Skipped if ONNX model unavailable.
-            if let Some(ref mut model) = crate::retrieval::load_default_model() {
-                let new_hash = search.get_document_hash(&issue.target)?.unwrap_or_default();
-                let body = crate::validate::parse_frontmatter(&content)
-                    .map(|(_, b)| b)
-                    .unwrap_or_else(|_| content.clone());
-                crate::retrieval::embed_document(search, &new_hash, &body, model);
-            }
+            let mut model = crate::retrieval::load_default_model()?;
+            let new_hash = search.get_document_hash(&issue.target)?.unwrap_or_default();
+            let body = crate::validate::parse_frontmatter(&content)
+                .map(|(_, b)| b)
+                .unwrap_or_else(|_| content.clone());
+            crate::retrieval::embed_document(search, &new_hash, &body, &mut model)?;
             Ok(())
         }
         LintIssueKind::OutdatedEmbedding => {
-            if let Some(ref mut model) = crate::retrieval::load_default_model() {
-                let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
-                for hash in &outdated {
-                    let full_content = search.get_content(hash)?;
-                    let body = crate::validate::parse_frontmatter(&full_content)
-                        .map(|(_, b)| b)
-                        .unwrap_or(full_content);
-                    crate::retrieval::embed_document(search, hash, &body, model);
-                }
+            let mut model = crate::retrieval::load_default_model()?;
+            let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
+            for hash in &outdated {
+                let full_content = search.get_content(hash)?;
+                let body = crate::validate::parse_frontmatter(&full_content)
+                    .map(|(_, b)| b)
+                    .unwrap_or(full_content);
+                crate::retrieval::embed_document(search, hash, &body, &mut model)?;
             }
             Ok(())
         }
@@ -285,6 +282,13 @@ mod tests {
         let memex = crate::Memex::open_writer(root.to_path_buf()).unwrap();
         memex.reindex().unwrap();
         memex
+    }
+
+    /// Fixture embedding used only to populate chunk rows in lint tests.
+    /// The tests assert on model names, not on similarity, so any non-empty
+    /// 768-dim vector suffices.
+    fn fixture_embedding() -> Vec<f32> {
+        vec![0.1f32; crate::embed::EMBEDDING_DIM]
     }
 
     #[test]
@@ -494,7 +498,7 @@ mod tests {
 
         // Insert a content row so the FK is satisfied, then insert a chunk
         // with model="old-model".
-        let embedding = crate::embed::hash_embedding("Some content for embedding.");
+        let embedding = fixture_embedding();
         search
             .with_connection(|conn| {
                 crate::vector::store_chunk(
@@ -565,7 +569,7 @@ mod tests {
         assert!(!result, "no outdated chunks => issue not present");
 
         // Insert a chunk with an outdated model name.
-        let embedding = crate::embed::hash_embedding("Some content.");
+        let embedding = fixture_embedding();
         search
             .with_connection(|conn| {
                 crate::vector::store_chunk(
@@ -607,7 +611,7 @@ mod tests {
             .unwrap()
             .expect("document should have a hash");
 
-        let embedding = crate::embed::hash_embedding("Content.");
+        let embedding = fixture_embedding();
         search
             .with_connection(|conn| {
                 crate::vector::store_chunk(

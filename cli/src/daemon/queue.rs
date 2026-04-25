@@ -1,27 +1,33 @@
-//! Agent job queue. Producers (connection handlers) send `AgentJob` onto a
+//! Agent job queue. Producers (connection handlers) send `BackendJob` onto a
 //! bounded async-channel; consumers (worker tasks) pull jobs and run one LLM
 //! turn per job.
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-/// Outcome of a worker's attempt. Error variants are typed so the handler
-/// can map them to the right `DaemonError` code.
+/// Outcome of a worker's attempt. Applies to every backend —
+/// subprocess-based (Claude Code, Codex, Gemini CLI) and direct-API
+/// (OpenAI API).
 #[derive(Debug)]
 pub enum WorkerError {
     /// Subprocess crashed (EOF before terminal result, non-zero exit with
     /// no structured signal, write error). Retried once before surfacing.
+    /// Subprocess-only — the OpenAI API backend never produces this.
     Crash(String),
-    /// Subprocess read exceeded `daemon.worker.timeout_sec`. Retried once
+    /// Read/request exceeded `daemon.worker.timeout_sec`. Retried once
     /// before surfacing.
     Timeout,
-    /// Claude returned `is_error=true` with `error=authentication_failed`.
-    /// Not retried — user needs to re-auth.
-    AuthFailed(String),
-    /// Claude returned `is_error=true` for any other reason, OR the
-    /// assistant text didn't parse as our expected JSON reply. Raw text
-    /// is surfaced so the user can see what Claude said.
-    AgentError(String),
+    /// Backend returned an error OR produced text that didn't parse as
+    /// the expected JSON reply. `code` carries the backend-native
+    /// identifier when available — e.g. `authentication_failed` / `404`
+    /// from Claude Code, `unauthorized` from Codex, `invalid_api_key`
+    /// from OpenAI, `rpc=<n>` for JSON-RPC. Forwarded into the CLI error
+    /// message as `[code] message` so the full diagnostic reaches the
+    /// user without special-casing any particular failure mode.
+    Backend {
+        message: String,
+        code: Option<String>,
+    },
 }
 
 /// Reply from a worker for an expansion job. Each term is a single string
@@ -84,8 +90,8 @@ pub type IngestResult = Result<IngestReply, WorkerError>;
 /// Ingest extraction job: cleaned transcript → wiki pages.
 #[derive(Debug)]
 pub struct IngestJob {
-    /// Cleaned transcript text (user + assistant + tool summaries).
-    pub transcript: String,
+    /// Structured turns from the parser with role/timestamp/text.
+    pub turns: Vec<memex_core::transcript::TranscriptTurn>,
     /// Worker sends the extracted pages here.
     pub reply: oneshot::Sender<IngestResult>,
 }
@@ -117,7 +123,7 @@ pub type MergeResult = Result<MergeReply, WorkerError>;
 
 /// Job enqueued onto the worker pool. Workers dispatch by variant.
 #[derive(Debug)]
-pub enum AgentJob {
+pub enum BackendJob {
     Expand(ExpandJob),
     Synth(SynthJob),
     Ingest(IngestJob),
@@ -126,11 +132,11 @@ pub enum AgentJob {
 
 /// Sender half. Cloneable; each producer clones one. Senders block
 /// (`.send().await`) when the queue is full — backpressure.
-pub type JobSender = async_channel::Sender<AgentJob>;
+pub type JobSender = async_channel::Sender<BackendJob>;
 
 /// Receiver half. Cloneable; each worker clones one. Receivers block
 /// (`.recv().await`) when the queue is empty.
-pub type JobReceiver = async_channel::Receiver<AgentJob>;
+pub type JobReceiver = async_channel::Receiver<BackendJob>;
 
 /// Create a bounded job queue with `capacity` = workers × 4.
 pub fn queue(workers: usize) -> (JobSender, JobReceiver) {
@@ -145,7 +151,7 @@ mod tests {
     async fn queue_send_recv_roundtrip() {
         let (tx, rx) = queue(2);
         let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(AgentJob::Synth(SynthJob {
+        tx.send(BackendJob::Synth(SynthJob {
             context: "ctx".into(),
             question: "q".into(),
             reply: reply_tx,
@@ -154,7 +160,7 @@ mod tests {
         .unwrap();
         let got = rx.recv().await.unwrap();
         match got {
-            AgentJob::Synth(job) => {
+            BackendJob::Synth(job) => {
                 assert_eq!(job.question, "q");
                 let _ = job.reply.send(Ok(SynthReply {
                     answer: "hi".into(),

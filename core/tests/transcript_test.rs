@@ -1,5 +1,6 @@
 use memex_core::transcript::{
-    parse_claude_code_session, parse_codex_session, parse_gemini_cli_session, SessionFilter,
+    SessionFilter, TranscriptTurn, parse_claude_code_session, parse_codex_session,
+    parse_gemini_cli_session, render_turns,
 };
 use std::io::Cursor;
 
@@ -21,20 +22,21 @@ fn claude_code_sample() -> String {
 #[test]
 fn parse_claude_code_extracts_messages() {
     let t = parse_claude_code_session(Cursor::new(claude_code_sample())).unwrap();
+    let cleaned = render_turns(&t.turns);
 
     // User text present
-    assert!(t.cleaned_text.contains("Fix the auth bug"));
+    assert!(cleaned.contains("Fix the auth bug"));
     // Assistant text present
-    assert!(t.cleaned_text.contains("I found the issue in auth.rs"));
-    assert!(t.cleaned_text.contains("I'll fix the expiry"));
+    assert!(cleaned.contains("I found the issue in auth.rs"));
+    assert!(cleaned.contains("I'll fix the expiry"));
     // Tool name present with summarized input
-    assert!(t.cleaned_text.contains("[Tool: Read"));
-    assert!(t.cleaned_text.contains("file: src/auth.rs"));
+    assert!(cleaned.contains("[Tool: Read"));
+    assert!(cleaned.contains("file: src/auth.rs"));
     // Tool result content (the file body) must NOT appear
-    assert!(!t.cleaned_text.contains("validate_token"));
-    assert!(!t.cleaned_text.contains("200 lines"));
+    assert!(!cleaned.contains("validate_token"));
+    assert!(!cleaned.contains("200 lines"));
     // Thinking block must NOT appear
-    assert!(!t.cleaned_text.contains("Let me look at auth.rs"));
+    assert!(!cleaned.contains("Let me look at auth.rs"));
 }
 
 #[test]
@@ -44,6 +46,40 @@ fn parse_claude_code_metadata() {
     assert_eq!(t.agent, "claude-code");
     assert_eq!(t.first_user_message, "Fix the auth bug");
     assert_eq!(t.filter, SessionFilter::Pass);
+}
+
+#[test]
+fn parse_claude_code_prefixes_turns_with_timestamp() {
+    // Each turn's full `timestamp` (ISO 8601) is surfaced on its
+    // `## User` / `## Assistant` heading.
+    let t = parse_claude_code_session(Cursor::new(claude_code_sample())).unwrap();
+    let cleaned = render_turns(&t.turns);
+    assert!(cleaned.contains("## User [2026-04-15T10:00:00Z]"));
+    assert!(cleaned.contains("## Assistant [2026-04-15T10:00:05Z]"));
+}
+
+#[test]
+fn parse_claude_code_emits_structured_turns_with_timestamp() {
+    let t = parse_claude_code_session(Cursor::new(claude_code_sample())).unwrap();
+    assert!(t.turns.len() >= 3);
+    assert_eq!(t.turns[0].role, "user");
+    assert_eq!(
+        t.turns[0].timestamp.as_deref(),
+        Some("2026-04-15T10:00:00Z")
+    );
+    assert!(t.turns[0].text.contains("Fix the auth bug"));
+}
+
+#[test]
+fn parse_claude_code_uses_message_role_as_turn_role() {
+    let lines = [
+        r#"{"type":"user","message":{"role":"Caroline","content":"Hi"},"timestamp":"2026-04-15T10:00:00Z","sessionId":"locomo-1"}"#,
+        r#"{"type":"assistant","message":{"role":"Melanie","content":[{"type":"text","text":"Hey"}]},"timestamp":"2026-04-15T10:00:01Z","sessionId":"locomo-1"}"#,
+    ];
+    let t = parse_claude_code_session(Cursor::new(lines.join("\n"))).unwrap();
+    assert_eq!(t.turns.len(), 2);
+    assert_eq!(t.turns[0].role, "Caroline");
+    assert_eq!(t.turns[1].role, "Melanie");
 }
 
 // ---------------------------------------------------------------------------
@@ -105,20 +141,46 @@ fn codex_sample() -> String {
 #[test]
 fn parse_codex_extracts_messages() {
     let t = parse_codex_session(Cursor::new(codex_sample())).unwrap();
+    let cleaned = render_turns(&t.turns);
 
     // User prompt present
-    assert!(t.cleaned_text.contains("Fix the auth bug"));
+    assert!(cleaned.contains("Fix the auth bug"));
     // Assistant text present
-    assert!(t.cleaned_text.contains("The auth module uses JWT"));
+    assert!(cleaned.contains("The auth module uses JWT"));
     // Tool call metadata present (function_call parsed as JSON)
-    assert!(t.cleaned_text.contains("[Tool: shell"));
-    assert!(t.cleaned_text.contains("command: cat src/auth.rs"));
+    assert!(cleaned.contains("[Tool: shell"));
+    assert!(cleaned.contains("command: cat src/auth.rs"));
     // function_call_output stripped
-    assert!(!t.cleaned_text.contains("validate_token"));
+    assert!(!cleaned.contains("validate_token"));
 
     assert_eq!(t.session_id, "codex-123");
     assert_eq!(t.agent, "codex");
     assert_eq!(t.filter, SessionFilter::Pass);
+    assert_eq!(
+        t.turns[0].timestamp.as_deref(),
+        Some("2026-04-03T21:15:00Z")
+    );
+}
+
+#[test]
+fn render_turns_formats_headings_from_timestamp() {
+    let turns = vec![
+        TranscriptTurn {
+            role: "user".to_string(),
+            timestamp: Some("2026-04-03T21:15:00Z".to_string()),
+            text: "Fix bug".to_string(),
+        },
+        TranscriptTurn {
+            role: "assistant".to_string(),
+            timestamp: Some("2026-04-03T21:15:02Z".to_string()),
+            text: "Working on it".to_string(),
+        },
+    ];
+    let txt = render_turns(&turns);
+    assert!(txt.contains("## User [2026-04-03T21:15:00Z]"));
+    assert!(txt.contains("## Assistant [2026-04-03T21:15:02Z]"));
+    assert!(txt.contains("Fix bug"));
+    assert!(txt.contains("Working on it"));
 }
 
 // ---------------------------------------------------------------------------
@@ -139,15 +201,16 @@ fn gemini_sample() -> &'static str {
 #[test]
 fn parse_gemini_extracts_messages() {
     let t = parse_gemini_cli_session(gemini_sample()).unwrap();
+    let cleaned = render_turns(&t.turns);
 
     // User text present
-    assert!(t.cleaned_text.contains("Fix the auth bug"));
+    assert!(cleaned.contains("Fix the auth bug"));
     // Gemini content present
-    assert!(t.cleaned_text.contains("The JWT expiry is too long"));
+    assert!(cleaned.contains("The JWT expiry is too long"));
     // Tool call metadata present
-    assert!(t.cleaned_text.contains("[Tool: read_file"));
+    assert!(cleaned.contains("[Tool: read_file"));
     // Tool type messages stripped
-    assert!(!t.cleaned_text.contains("validate_token"));
+    assert!(!cleaned.contains("validate_token"));
 
     assert_eq!(t.session_id, "gemini-456");
     assert_eq!(t.agent, "gemini-cli");
@@ -165,7 +228,10 @@ fn malformed_json_recovery() {
     let result = parse_claude_code_session(Cursor::new("not json\n"));
     assert!(result.is_ok());
     let transcript = result.unwrap();
-    assert_eq!(transcript.filter, memex_core::transcript::SessionFilter::NonSubstantive);
+    assert_eq!(
+        transcript.filter,
+        memex_core::transcript::SessionFilter::NonSubstantive
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -179,12 +245,25 @@ fn strip_tags_removes_system_reminder() {
         r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Response <private>secret stuff</private> here"}]},"sessionId":"t1"}"#,
     ];
     let t = parse_claude_code_session(Cursor::new(lines.join("\n"))).unwrap();
-    assert!(t.cleaned_text.contains("Hello"), "should keep text before tag");
-    assert!(t.cleaned_text.contains("world"), "should keep text after tag");
-    assert!(!t.cleaned_text.contains("CLAUDE.md"), "should strip system-reminder content");
-    assert!(t.cleaned_text.contains("Response"), "should keep assistant text before tag");
-    assert!(t.cleaned_text.contains("here"), "should keep assistant text after tag");
-    assert!(!t.cleaned_text.contains("secret stuff"), "should strip private content");
+    let cleaned = render_turns(&t.turns);
+    assert!(cleaned.contains("Hello"), "should keep text before tag");
+    assert!(cleaned.contains("world"), "should keep text after tag");
+    assert!(
+        !cleaned.contains("CLAUDE.md"),
+        "should strip system-reminder content"
+    );
+    assert!(
+        cleaned.contains("Response"),
+        "should keep assistant text before tag"
+    );
+    assert!(
+        cleaned.contains("here"),
+        "should keep assistant text after tag"
+    );
+    assert!(
+        !cleaned.contains("secret stuff"),
+        "should strip private content"
+    );
 }
 
 #[test]
@@ -216,8 +295,14 @@ fn secret_redaction_in_tool_summary() {
     // OpenAI-style key in a bash command
     let input = json!({"cmd": "export OPENAI_API_KEY=sk-abc123def456ghi789jkl012mno345"});
     let summary = summarize_tool_input("bash", &input);
-    assert!(summary.contains("[REDACTED]"), "should redact sk- key: {summary}");
-    assert!(!summary.contains("sk-abc123"), "raw key must not remain: {summary}");
+    assert!(
+        summary.contains("[REDACTED]"),
+        "should redact sk- key: {summary}"
+    );
+    assert!(
+        !summary.contains("sk-abc123"),
+        "raw key must not remain: {summary}"
+    );
 }
 
 // ---------------------------------------------------------------------------

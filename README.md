@@ -10,6 +10,8 @@ through a long-lived daemon that keeps agent subprocesses warm.
 ```bash
 # Query your wiki
 memex query "how does the auth migration work"
+memex query "auth rollout date" --collection default
+memex query "auth rollout date" --collection team-a --collection incidents
 
 # Write a page manually
 memex write auth-migration --force --quiet <<'EOF'
@@ -22,6 +24,10 @@ EOF
 
 # Backfill from existing sessions
 memex backfill claude-code
+memex backfill codex --collection team-a --collection incidents
+
+# Ingest one hook transcript into specific collections
+echo '{"transcript_path":"/abs/path/session.jsonl"}' | memex ingest --agent codex --collection team-a
 ```
 
 ## How it works
@@ -35,6 +41,19 @@ memex backfill claude-code
 4. Pages are stored as Markdown files, indexed with BM25, and embedded
    for vector search.
 5. `memex query` retrieves relevant pages and synthesizes an answer.
+
+### Collections
+
+Memex supports document collections for organization:
+
+- `memex ingest --agent <agent> --collection <name> [--collection <name> ...]`
+- `memex backfill <agent> --collection <name> [--collection <name> ...]`
+- `memex query "<question>" --collection <name> [--collection <name> ...]`
+
+No `--collection` behavior:
+
+- `ingest`/`backfill`: assigns `default`
+- `query`: searches `default`
 
 ## Install
 

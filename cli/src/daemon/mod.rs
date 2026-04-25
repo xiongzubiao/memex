@@ -10,6 +10,7 @@ pub mod error;
 pub mod handler;
 pub mod lock;
 pub mod logging;
+pub mod memex_cache;
 pub mod pidfile;
 pub mod protocol;
 pub mod queue;
@@ -18,6 +19,58 @@ pub mod server;
 pub mod worker;
 
 use crate::memex_root;
+
+/// Daemonize the child process.
+///
+/// Standard daemon practice: close inherited file descriptors, then redirect
+/// stdin/stdout/stderr to /dev/null.
+#[cfg(unix)]
+fn daemonize_child() -> Result<()> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if rc != 0 {
+        anyhow::bail!(
+            "getrlimit(RLIMIT_NOFILE) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    let max_fd = limit.rlim_cur.min(i32::MAX as libc::rlim_t) as i32;
+    for fd in 0..max_fd {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    let devnull_fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+    if devnull_fd < 0 {
+        anyhow::bail!(
+            "open(/dev/null) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    for fd in 0..=2 {
+        let rc = unsafe { libc::dup2(devnull_fd, fd) };
+        if rc < 0 {
+            anyhow::bail!(
+                "dup2(/dev/null, {fd}) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    if devnull_fd > 2 {
+        unsafe {
+            libc::close(devnull_fd);
+        }
+    }
+
+    Ok(())
+}
 use anyhow::{Context, Result};
 use server::DaemonPaths;
 use std::path::PathBuf;
@@ -31,19 +84,65 @@ pub fn default_config_path() -> PathBuf {
     memex_root().join("config.toml")
 }
 
-/// `memex daemon start` entrypoint (foreground mode).
-pub fn start_foreground() -> Result<i32> {
+/// `memex daemon start` entrypoint.
+///
+/// Self-daemonizes via `fork() → parent exits → child setsid()` at the very
+/// top. After this, the daemon is in its own session, detached from the
+/// spawning CLI's process group and controlling terminal: it survives
+/// Ctrl+C on the CLI, terminal close (SIGHUP), and is adopted by init
+/// rather than held as a child of the CLI that spawned it.
+///
+/// If `foreground` is true, skip forking and run in terminal (for debugging).
+pub fn start_background(foreground: bool) -> Result<i32> {
+    if !foreground {
+        // SAFETY: must happen before any tokio runtime or thread setup — forking
+        // a multithreaded process with async runtimes/mutexes is undefined.
+        unsafe {
+            let pid = libc::fork();
+            if pid < 0 {
+                anyhow::bail!("fork failed: {}", std::io::Error::last_os_error());
+            }
+            if pid > 0 {
+                // Parent: return to caller.
+                // The detached child continues below.
+                return Ok(0);
+            }
+            // Child: daemonize (close FDs, redirect stdin/stdout/stderr).
+            daemonize_child()?;
+            // Become session leader, detaching from controlling tty
+            // and the CLI's process group.
+            if libc::setsid() < 0 {
+                anyhow::bail!("setsid failed: {}", std::io::Error::last_os_error());
+            }
+        }
+    }
+
     let paths = DaemonPaths::default_under(&memex_root());
     let cfg = config::Config::load(&default_config_path()).context("loading config")?;
     let _guard = logging::init(&cfg.daemon.log_file)?;
-    tracing::info!("memex daemon starting (foreground)");
+    tracing::info!("memex daemon starting (detached)");
 
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
-    let outcome = rt.block_on(server::run_foreground(paths, cfg))?;
+    let outcome = rt.block_on(server::run_daemon(paths, cfg))?;
     match outcome {
         server::StartOutcome::RanAsDaemon => Ok(0),
         server::StartOutcome::AlreadyRunning => Ok(0),
     }
+}
+
+/// Ensure the daemon is running before issuing a batch of concurrent
+/// requests. Idempotent. Single call means only one spawn attempt, which
+/// avoids the N-racing-spawns pattern that produces many brief zombies
+/// under the CLI.
+pub async fn warm_up() -> Result<()> {
+    let paths = DaemonPaths::default_under(&memex_root());
+    let _ = client::connect_or_spawn(
+        &paths.socket,
+        &paths.lock,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await?;
+    Ok(())
 }
 
 /// `memex daemon stop` entrypoint.
@@ -80,7 +179,9 @@ pub fn stop() -> Result<i32> {
         })
     };
     if !socket_alive {
-        println!("daemon: pid {pid} exists but socket is not responsive; refusing to signal (possible PID reuse)");
+        println!(
+            "daemon: pid {pid} exists but socket is not responsive; refusing to signal (possible PID reuse)"
+        );
         pidfile::remove(&paths.pid)?;
         let _ = std::fs::remove_file(&paths.socket);
         return Ok(0);
@@ -148,38 +249,32 @@ pub fn status() -> Result<i32> {
     }
 }
 
-/// `memex ingest` entrypoint. Sends Request::Ingest to the daemon (auto-spawns if needed).
+/// Async core of the ingest client. Callable concurrently from one runtime.
 /// Returns exit code (0 = queued, 1 = error/skipped).
-pub fn ingest(transcript_path: &str, agent: &str, root: &str) -> Result<i32> {
+pub async fn ingest_async(
+    transcript_path: &str,
+    agent: &str,
+    root: &str,
+    collections: Vec<String>,
+) -> Result<i32> {
     let paths = DaemonPaths::default_under(&memex_root());
-    let rt = tokio::runtime::Runtime::new()?;
-    let result: anyhow::Result<Vec<protocol::Event>> = rt.block_on(async {
-        let stream = client::connect_or_spawn(
-            &paths.socket,
-            &paths.lock,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .await?;
-        let events = client::request(
-            stream,
-            &protocol::Request::Ingest {
-                v: 1,
-                transcript_path: transcript_path.to_string(),
-                agent: agent.to_string(),
-                memex_root: root.to_string(),
-            },
-        )
-        .await?;
-        Ok(events)
-    });
-
-    let events = match result {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("memex ingest: {e}");
-            return Ok(1);
-        }
-    };
+    let stream = client::connect_or_spawn(
+        &paths.socket,
+        &paths.lock,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await?;
+    let events = client::request(
+        stream,
+        &protocol::Request::Ingest {
+            v: 1,
+            transcript_path: transcript_path.to_string(),
+            agent: agent.to_string(),
+            collections,
+            memex_root: root.to_string(),
+        },
+    )
+    .await?;
 
     let mut status_code = 1;
     for ev in &events {
@@ -201,12 +296,31 @@ pub fn ingest(transcript_path: &str, agent: &str, root: &str) -> Result<i32> {
     Ok(status_code)
 }
 
+/// `memex ingest` entrypoint. Sync wrapper spinning up a fresh runtime for
+/// single-call hook use. Returns exit code (0 = queued, 1 = error/skipped).
+pub fn ingest(
+    transcript_path: &str,
+    agent: &str,
+    root: &str,
+    collections: Vec<String>,
+) -> Result<i32> {
+    let rt = tokio::runtime::Runtime::new()?;
+    match rt.block_on(ingest_async(transcript_path, agent, root, collections)) {
+        Ok(code) => Ok(code),
+        Err(e) => {
+            eprintln!("memex ingest: {e}");
+            Ok(1)
+        }
+    }
+}
+
 /// `memex query <question> --raw` entrypoint. Connects to the running daemon
-/// (does NOT auto-spawn — Task 9 adds that). Prints the context pages to stdout
+/// (does NOT auto-spawn — Task 9 adds that). Prints the context entries to stdout
 /// in a reader-friendly format. Returns the exit code.
 pub fn query_raw(
     question: &str,
     top_k: usize,
+    collections: Vec<String>,
     memex_root_override: Option<&std::path::Path>,
 ) -> Result<i32> {
     let paths = DaemonPaths::default_under(&memex_root());
@@ -229,6 +343,7 @@ pub fn query_raw(
                 question: question.to_string(),
                 raw: true,
                 top_k,
+                collections,
                 memex_root: root.to_string_lossy().to_string(),
             },
         )
@@ -247,16 +362,18 @@ pub fn query_raw(
     let mut status_code = 1;
     for ev in &events {
         match ev {
-            protocol::Event::Context { pages } => {
-                for p in pages {
-                    let rank = p.get("rank").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let collection = p.get("collection").and_then(|v| v.as_str()).unwrap_or("");
-                    let signal = p.get("signal").and_then(|v| v.as_str()).unwrap_or("");
-                    let stem = p.get("stem").and_then(|v| v.as_str()).unwrap_or("");
-                    let body = p.get("body").and_then(|v| v.as_str()).unwrap_or("");
-                    println!("## [rank {rank}, {collection}, signal {signal}] {stem}");
-                    println!("{body}");
-                    println!();
+            protocol::Event::Context { entries } => {
+                // Emit the same JSON-array shape that the synthesis path
+                // feeds to the LLM (`cli/src/daemon/context.rs`). Unifies
+                // --raw stdout with the synth context block so scripts and
+                // prompts can parse the output as JSON without ad-hoc
+                // splitting on markdown headers.
+                match serde_json::to_string_pretty(entries) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("memex query: failed to serialize context: {e}");
+                        status_code = 1;
+                    }
                 }
             }
             protocol::Event::Error {
@@ -283,6 +400,7 @@ pub fn query_raw(
 pub fn query_synth(
     question: &str,
     top_k: usize,
+    collections: Vec<String>,
     memex_root_override: Option<&std::path::Path>,
 ) -> Result<i32> {
     let paths = server::DaemonPaths::default_under(&memex_root());
@@ -305,6 +423,7 @@ pub fn query_synth(
                 question: question.to_string(),
                 raw: false,
                 top_k,
+                collections,
                 memex_root: root.to_string_lossy().to_string(),
             },
         )

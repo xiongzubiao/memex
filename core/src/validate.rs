@@ -94,6 +94,47 @@ fn fix_yaml_title_colons(yaml: &str) -> String {
         .join("\n")
 }
 
+/// Replace `[[slug]]` references whose target isn't in `known` with the
+/// plain text of the slug (dashes → spaces). Preserves references that do
+/// resolve. Used after LLM merge/extract to clean up links to pages the
+/// LLM proposed but that were absorbed into other pages during merge.
+pub fn scrub_wiki_links(content: &str, known: &std::collections::HashSet<String>) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '[' && chars.peek() == Some(&'[') {
+            chars.next(); // consume second [
+            let mut link = String::new();
+            let mut closed = false;
+            while let Some(c2) = chars.next() {
+                if c2 == ']' && chars.peek() == Some(&']') {
+                    chars.next();
+                    closed = true;
+                    break;
+                }
+                link.push(c2);
+            }
+            if closed && !link.is_empty() {
+                if known.contains(&link) {
+                    out.push_str("[[");
+                    out.push_str(&link);
+                    out.push_str("]]");
+                } else {
+                    // Not a known page — render as plain text for readability.
+                    out.push_str(&link.replace('-', " "));
+                }
+            } else {
+                // Malformed (unterminated `[[...` at EOF); emit verbatim.
+                out.push_str("[[");
+                out.push_str(&link);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Validate wiki links: check that targets exist as .md files in wiki/.
 /// Returns list of dangling links (warnings, not errors).
 pub fn find_dangling_links(content: &str, wiki_dir: &Path) -> Vec<String> {
@@ -189,6 +230,23 @@ mod tests {
         let page = "---\ntitle: Go: Deep Equal Comparison\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
         let (fm, _) = parse_frontmatter(page).unwrap();
         assert_eq!(fm.title, "Go: Deep Equal Comparison");
+    }
+
+    #[test]
+    fn parse_frontmatter_reads_collections_default_empty() {
+        let page = "---\ntitle: Collection Test\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
+        let (fm, _) = parse_frontmatter(page).unwrap();
+        assert!(fm.collections.is_empty());
+    }
+
+    #[test]
+    fn parse_frontmatter_reads_collections_explicit_values() {
+        let page = "---\ntitle: Collection Test\ntags:\n  - entity\ncollections:\n  - default\n  - team-a\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
+        let (fm, _) = parse_frontmatter(page).unwrap();
+        assert_eq!(
+            fm.collections,
+            vec!["default".to_string(), "team-a".to_string()]
+        );
     }
 
     #[test]

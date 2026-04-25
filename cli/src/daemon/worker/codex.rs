@@ -8,13 +8,11 @@
 //! = fresh `thread/start` on the same subprocess (not a full respawn).
 
 use super::jsonrpc::RpcClient;
-use super::{TurnOutcome, classify_error_text};
+use super::{TurnOutcome, WORKER_PROMPT};
 use crate::daemon::config::WorkerConfig;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
-
-const AGENT_PROMPT: &str = include_str!("prompt.txt");
 
 // --- App-server method params / responses ---
 
@@ -106,6 +104,28 @@ struct TurnError {
     message: Option<String>,
 }
 
+/// Parse a codex-style nested provider error payload into (code, message).
+/// Accepts both `{error: {type, message}}` (standard OpenAI shape) and
+/// `{type, message}` at the top level. Returns None if the input isn't
+/// JSON or doesn't expose a recognizable code field.
+fn parse_nested_provider_error(raw: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let code = v
+        .pointer("/error/type")
+        .or_else(|| v.pointer("/error/code"))
+        .or_else(|| v.pointer("/type"))
+        .or_else(|| v.pointer("/code"))
+        .and_then(|c| c.as_str())
+        .map(String::from)?;
+    let message = v
+        .pointer("/error/message")
+        .or_else(|| v.pointer("/message"))
+        .and_then(|m| m.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| raw.to_string());
+    Some((code, message))
+}
+
 /// A persistent `codex app-server` subprocess. Holds the thread id so we
 /// can issue `turn/start` per job.
 pub(super) struct CodexSubprocess {
@@ -137,16 +157,13 @@ impl CodexSubprocess {
                 "LANG",
                 "LC_ALL",
                 "OPENAI_API_KEY",
+                "MEMEX_ROOT",
                 "MOCK_CODEX_MODE",
             ],
         );
 
-        let mut child = cmd.spawn().context("spawning codex app-server")?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("missing stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("missing stdout"))?;
+        let (child, stdin, stdout) =
+            super::spawn_with_pipes(&mut cmd, "spawning codex app-server")?;
 
         let mut sub = Self {
             child,
@@ -182,13 +199,16 @@ impl CodexSubprocess {
 
     async fn start_thread(&mut self, cfg: &WorkerConfig) -> Result<()> {
         let id = self.rpc.alloc_id();
-        let model = cfg.model.as_deref().unwrap_or_else(|| cfg.agent.default_model());
+        let model = cfg
+            .model
+            .as_deref()
+            .unwrap_or_else(|| cfg.backend.default_model());
         self.rpc
             .send_request(
                 id,
                 "thread/start",
                 ThreadStartParams {
-                    base_instructions: AGENT_PROMPT,
+                    base_instructions: WORKER_PROMPT,
                     ephemeral: true,
                     sandbox: "read-only",
                     model,
@@ -211,7 +231,11 @@ impl CodexSubprocess {
 
     /// Send one turn; collect streaming `item/agentMessage/delta` chunks
     /// until `turn/completed`; return a structured outcome.
-    pub(super) async fn one_turn(&mut self, user_text: &str) -> Result<TurnOutcome> {
+    pub(super) async fn one_turn(
+        &mut self,
+        user_text: &str,
+        _task_kind: super::TaskKind,
+    ) -> Result<TurnOutcome> {
         let id = self.rpc.alloc_id();
         let thread_id = self.thread_id.clone();
         self.rpc
@@ -241,7 +265,10 @@ impl CodexSubprocess {
             // Response to our turn/start (ack or error)
             if msg.id == Some(id) {
                 if let Some(e) = msg.error {
-                    return Ok(classify_error_text(&e.message));
+                    return Ok(TurnOutcome::BackendError {
+                        message: e.message,
+                        code: Some(format!("rpc={}", e.code)),
+                    });
                 }
                 continue;
             }
@@ -286,7 +313,7 @@ impl CodexSubprocess {
                             }
                             _ => {
                                 let kind = tc.turn.error.as_ref().and_then(|e| e.kind.clone());
-                                let message = tc
+                                let raw_message = tc
                                     .turn
                                     .error
                                     .as_ref()
@@ -298,16 +325,27 @@ impl CodexSubprocess {
                                             answer.clone()
                                         }
                                     });
-                                return Ok(match kind.as_deref() {
-                                    Some("auth") | Some("unauthorized") | Some("forbidden") => {
-                                        TurnOutcome::Auth(message)
-                                    }
-                                    _ => TurnOutcome::Structured(message),
-                                });
+                                // Codex often returns the upstream provider
+                                // error payload JSON-stringified inside
+                                // `message` (e.g. `{"type":"error","status":400,
+                                // "error":{"type":"invalid_request_error","message":"..."}}`).
+                                // When `kind` is absent, try to extract a
+                                // clean code+message from that nested shape
+                                // so the CLI shows `[invalid_request_error]
+                                // The '...' model is not supported...` rather
+                                // than dumping the JSON blob.
+                                let (message, code) = match kind {
+                                    Some(k) => (raw_message, Some(k)),
+                                    None => match parse_nested_provider_error(&raw_message) {
+                                        Some((c, m)) => (m, Some(c)),
+                                        None => (raw_message, None),
+                                    },
+                                };
+                                return Ok(TurnOutcome::BackendError { message, code });
                             }
                         }
                     } else {
-                        return Ok(TurnOutcome::Structured("turn/completed malformed".into()));
+                        return Ok(TurnOutcome::backend_err_no_code("turn/completed malformed"));
                     }
                 }
                 _ => {}

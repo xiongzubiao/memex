@@ -11,13 +11,12 @@
 //! subprocess (not a full respawn).
 
 use super::jsonrpc::RpcClient;
-use super::{TurnOutcome, classify_error_text};
+use super::{TurnOutcome, WORKER_PROMPT};
 use crate::daemon::config::WorkerConfig;
+use crate::memex_root;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
-
-const AGENT_PROMPT: &str = include_str!("prompt.txt");
 
 // --- ACP method params ---
 
@@ -137,17 +136,57 @@ struct UpdateContent {
 
 /// A persistent `gemini --acp` subprocess. Holds the session id so we can
 /// issue `session/prompt` per job.
-pub(super) struct GeminiSubprocess {
+pub(super) struct GeminiCliSubprocess {
     #[allow(dead_code)]
     child: Child,
     rpc: RpcClient,
     session_id: String,
 }
 
-impl GeminiSubprocess {
+/// Deny all tools and MCP servers.
+const DENY_ALL_POLICY_TOML: &str = r#"[[rule]]
+toolName = "*"
+mcpName = "*"
+decision = "deny"
+priority = 999
+"#;
+
+/// Write the deny-all policy to `memex_root()/.gemini/policies/memex.toml`
+/// (gemini's conventional policies directory, rooted at MEMEX_ROOT
+/// rather than $HOME so it travels with the daemon's state). Overwrite
+/// unconditionally so on-disk content is always pinned to the compiled
+/// constant — no stale file can silently re-permit tools.
+async fn write_deny_all_policy() -> Result<std::path::PathBuf> {
+    let dir = memex_root().join(".gemini").join("policies");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("creating gemini policy dir {}", dir.display()))?;
+    let path = dir.join("memex.toml");
+    tokio::fs::write(&path, DENY_ALL_POLICY_TOML)
+        .await
+        .with_context(|| format!("writing gemini policy to {}", path.display()))?;
+    Ok(path)
+}
+
+impl GeminiCliSubprocess {
     pub(super) async fn spawn(cfg: &WorkerConfig) -> Result<Self> {
+        let policy_path = write_deny_all_policy().await?;
+
         let mut cmd = Command::new("gemini");
-        cmd.arg("--acp").args(["-e", "none"]);
+        // Gemini's Policy Engine (introduced after 1.0) rejects empty
+        // allowlists — "Invalid policy rule: toolName is required". Pass
+        // an explicit deny-all TOML via `--policy` so every built-in and
+        // MCP tool is excluded from the model's memory entirely (in
+        // non-interactive mode, `deny` skips the tool definition, saving
+        // context and guaranteeing no tool-approval round-trips).
+        //
+        // `-e none` turns off auth prompting; `--extensions ""` disables
+        // the extension loader. We don't pass `--allowed-tools` or
+        // `--approval-mode` — the policy file is the source of truth.
+        cmd.arg("--acp")
+            .args(["-e", "none"])
+            .args(["--extensions", ""])
+            .args(["--policy", policy_path.to_string_lossy().as_ref()]);
 
         super::prepare_agent_cmd(
             &mut cmd,
@@ -159,23 +198,33 @@ impl GeminiSubprocess {
                 "GEMINI_API_KEY",
                 "GOOGLE_APPLICATION_CREDENTIALS",
                 "GOOGLE_GENAI_USE_VERTEXAI",
+                "MEMEX_ROOT",
                 "MOCK_GEMINI_MODE",
             ],
         );
 
-        let mut child = cmd.spawn().context("spawning gemini --acp")?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("missing stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("missing stdout"))?;
+        let (mut child, stdin, stdout) =
+            super::spawn_with_pipes(&mut cmd, "spawning gemini --acp")?;
+        // Take stderr out of the child so we can drain it on crash.
+        let stderr = child.stderr.take();
 
         let mut sub = Self {
             child,
             rpc: RpcClient::new(stdin, stdout),
             session_id: String::new(),
         };
-        sub.initialize().await.context("gemini initialize")?;
+        match sub.initialize().await {
+            Ok(()) => {}
+            Err(e) => {
+                let diag = super::drain_stderr(stderr, 4096).await;
+                let msg = if diag.is_empty() {
+                    format!("gemini initialize: {e}")
+                } else {
+                    format!("gemini initialize: {e}; stderr: {diag}")
+                };
+                bail!("{msg}");
+            }
+        }
         sub.new_session(cfg)
             .await
             .context("gemini session/new + set_mode + set_model")?;
@@ -212,9 +261,7 @@ impl GeminiSubprocess {
     async fn new_session(&mut self, cfg: &WorkerConfig) -> Result<()> {
         // session/new
         let new_id = self.rpc.alloc_id();
-        let cwd = dirs::home_dir()
-            .map(|h| h.join(".memex").to_string_lossy().into_owned())
-            .unwrap_or_else(|| "/tmp".to_string());
+        let cwd = memex_root().to_string_lossy().into_owned();
         self.rpc
             .send_request(
                 new_id,
@@ -255,7 +302,10 @@ impl GeminiSubprocess {
         }
 
         // session/set_model
-        let model = cfg.model.as_deref().unwrap_or_else(|| cfg.agent.default_model());
+        let model = cfg
+            .model
+            .as_deref()
+            .unwrap_or_else(|| cfg.backend.default_model());
         let set_id = self.rpc.alloc_id();
         self.rpc
             .send_request(
@@ -275,11 +325,15 @@ impl GeminiSubprocess {
         Ok(())
     }
 
-    pub(super) async fn one_turn(&mut self, user_text: &str) -> Result<TurnOutcome> {
+    pub(super) async fn one_turn(
+        &mut self,
+        user_text: &str,
+        _task_kind: super::TaskKind,
+    ) -> Result<TurnOutcome> {
         // Gemini has no built-in system prompt — prepend agent prompt to each
         // user turn. Pre-allocate to avoid reallocation on the ~2KB prompt.
-        let mut full = String::with_capacity(AGENT_PROMPT.len() + user_text.len() + 4);
-        full.push_str(AGENT_PROMPT);
+        let mut full = String::with_capacity(WORKER_PROMPT.len() + user_text.len() + 4);
+        full.push_str(WORKER_PROMPT);
         full.push_str("\n\n");
         full.push_str(user_text);
         full.push('\n');
@@ -312,7 +366,10 @@ impl GeminiSubprocess {
 
             if msg.id == Some(id) {
                 if let Some(e) = msg.error {
-                    return Ok(classify_error_text(&e.message));
+                    return Ok(TurnOutcome::BackendError {
+                        message: e.message,
+                        code: Some(format!("rpc={}", e.code)),
+                    });
                 }
                 let sp: SessionPromptResult = match msg
                     .result
@@ -321,7 +378,12 @@ impl GeminiSubprocess {
                         serde_json::from_value(r).context("parsing session/prompt result")
                     }) {
                     Ok(r) => r,
-                    Err(e) => return Ok(TurnOutcome::Structured(e.to_string())),
+                    Err(e) => {
+                        return Ok(TurnOutcome::BackendError {
+                            message: e.to_string(),
+                            code: None,
+                        });
+                    }
                 };
                 let input_tokens = sp
                     .meta
@@ -335,7 +397,7 @@ impl GeminiSubprocess {
                         text: answer,
                         input_tokens,
                     },
-                    other => TurnOutcome::Structured(format!("stopReason={other}")),
+                    other => TurnOutcome::backend_err_no_code(format!("stopReason={other}")),
                 });
             }
 

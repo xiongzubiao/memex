@@ -18,6 +18,8 @@ pub enum Request {
         raw: bool,
         #[serde(default = "default_top_k")]
         top_k: usize,
+        #[serde(default)]
+        collections: Vec<String>,
         memex_root: String,
     },
 
@@ -40,6 +42,8 @@ pub enum Request {
         v: u32,
         transcript_path: String,
         agent: String,
+        #[serde(default)]
+        collections: Vec<String>,
         memex_root: String,
     },
     Delete {
@@ -88,7 +92,7 @@ pub enum Event {
         hyde: String,
     },
     Context {
-        pages: Vec<serde_json::Value>,
+        entries: Vec<serde_json::Value>,
     },
     Error {
         code: String,
@@ -154,13 +158,29 @@ mod tests {
                 question,
                 raw,
                 top_k,
+                collections,
                 memex_root,
             } => {
                 assert_eq!(v, 1);
                 assert_eq!(question, "q");
                 assert!(!raw);
                 assert_eq!(top_k, 5);
+                assert!(collections.is_empty());
                 assert_eq!(memex_root, "/x");
+            }
+            _ => panic!("expected Query"),
+        }
+    }
+
+    #[test]
+    fn query_request_deserializes_with_collections() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"query","question":"q","memex_root":"/x","collections":["default","project-a"]}"#,
+        )
+        .unwrap();
+        match r {
+            Request::Query { collections, .. } => {
+                assert_eq!(collections, vec!["default", "project-a"]);
             }
             _ => panic!("expected Query"),
         }
@@ -203,7 +223,14 @@ mod tests {
         )
         .unwrap();
         match r {
-            Request::Write { title, content, tags, sources, force, .. } => {
+            Request::Write {
+                title,
+                content,
+                tags,
+                sources,
+                force,
+                ..
+            } => {
                 assert_eq!(title, "Test");
                 assert_eq!(content, "body");
                 assert!(tags.is_empty());
@@ -221,9 +248,16 @@ mod tests {
         )
         .unwrap();
         match r {
-            Request::Ingest { transcript_path, agent, memex_root, .. } => {
+            Request::Ingest {
+                transcript_path,
+                agent,
+                collections,
+                memex_root,
+                ..
+            } => {
                 assert_eq!(transcript_path, "/tmp/s.jsonl");
                 assert_eq!(agent, "claude-code");
+                assert!(collections.is_empty());
                 assert_eq!(memex_root, "/x");
             }
             _ => panic!("expected Ingest"),
@@ -231,20 +265,29 @@ mod tests {
     }
 
     #[test]
-    fn delete_request_deserializes() {
+    fn ingest_request_deserializes_with_collections() {
         let r: Request = serde_json::from_str(
-            r#"{"op":"delete","slug":"my-page","memex_root":"/x"}"#,
+            r#"{"op":"ingest","transcript_path":"/tmp/s.jsonl","agent":"claude-code","collections":["default","project-a"],"memex_root":"/x"}"#,
         )
         .unwrap();
+        match r {
+            Request::Ingest { collections, .. } => {
+                assert_eq!(collections, vec!["default", "project-a"]);
+            }
+            _ => panic!("expected Ingest"),
+        }
+    }
+
+    #[test]
+    fn delete_request_deserializes() {
+        let r: Request =
+            serde_json::from_str(r#"{"op":"delete","slug":"my-page","memex_root":"/x"}"#).unwrap();
         assert!(matches!(r, Request::Delete { .. }));
     }
 
     #[test]
     fn lint_fix_request_deserializes() {
-        let r: Request = serde_json::from_str(
-            r#"{"op":"lint_fix","memex_root":"/x"}"#,
-        )
-        .unwrap();
+        let r: Request = serde_json::from_str(r#"{"op":"lint_fix","memex_root":"/x"}"#).unwrap();
         assert!(matches!(r, Request::LintFix { .. }));
     }
 

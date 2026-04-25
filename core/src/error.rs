@@ -69,6 +69,12 @@ pub enum MemexError {
 
     #[error("internal invariant violated: {0}")]
     Internal(String),
+
+    #[error("embedding model unavailable at {}: {reason}", path.display())]
+    EmbeddingUnavailable {
+        path: std::path::PathBuf,
+        reason: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, MemexError>;

@@ -11,9 +11,9 @@ pub fn docid_from_content_hash(hash: &str, len: usize) -> String {
     hash[..len.min(hash.len())].to_string()
 }
 
-/// Compute a docid from collection + path (fallback for identical content).
-pub fn docid_from_path(collection: &str, path: &str, len: usize) -> String {
-    let input = format!("{collection}:{path}");
+/// Compute a docid from doc_type + path (fallback for identical content).
+pub fn docid_from_path(doc_type: &str, path: &str, len: usize) -> String {
+    let input = format!("{doc_type}:{path}");
     let hash = content_hash(input.as_bytes());
     hash[..len.min(hash.len())].to_string()
 }
@@ -22,7 +22,7 @@ pub fn docid_from_path(collection: &str, path: &str, len: usize) -> String {
 /// Falls back to path-hash if content hash can't disambiguate (identical content).
 pub fn allocate_docid(
     content_hash_str: &str,
-    collection: &str,
+    doc_type: &str,
     path: &str,
     existing_docids: &[String],
 ) -> String {
@@ -35,9 +35,9 @@ pub fn allocate_docid(
             break;
         }
     }
-    // Fallback: hash collection + path
+    // Fallback: hash doc_type + path
     for len in DEFAULT_DOCID_LEN..=MAX_DOCID_LEN {
-        let candidate = docid_from_path(collection, path, len);
+        let candidate = docid_from_path(doc_type, path, len);
         if !existing_docids.contains(&candidate) {
             return candidate;
         }
@@ -45,7 +45,7 @@ pub fn allocate_docid(
     format!(
         "{}-{}",
         &content_hash_str[..6],
-        &docid_from_path(collection, path, 6)
+        &docid_from_path(doc_type, path, 6)
     )
 }
 

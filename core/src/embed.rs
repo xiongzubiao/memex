@@ -149,8 +149,7 @@ pub fn load_model(path: &str, model_name: &str) -> crate::error::Result<Embeddin
 /// the vector-search infrastructure; a proper tokenizer can be swapped in
 /// later.
 ///
-/// If the model's input names are unrecognised, falls back to a deterministic
-/// hash-based fake embedding so downstream code can still be developed.
+/// If the model's input names are unrecognised, returns an error.
 pub fn embed_text(model: &mut EmbeddingModel, text: &str) -> crate::error::Result<Vec<f32>> {
     let has_input_ids = model.input_names.iter().any(|n| n == "input_ids");
     let has_attention_mask = model.input_names.iter().any(|n| n == "attention_mask");
@@ -222,37 +221,10 @@ pub fn embed_text(model: &mut EmbeddingModel, text: &str) -> crate::error::Resul
             Ok(data.to_vec())
         }
     } else {
-        Err(crate::error::MemexError::Other(anyhow::anyhow!("unrecognized model input format: expected input_ids + attention_mask")))
+        Err(crate::error::MemexError::Other(anyhow::anyhow!(
+            "unrecognized model input format: expected input_ids + attention_mask"
+        )))
     }
-}
-
-/// Produce a deterministic, normalised fake embedding from a text string.
-///
-/// Uses a simple hash-scatter approach: each byte of the input influences a
-/// specific dimension. The resulting vector is L2-normalised.  This is *not*
-/// semantically meaningful — it exists only so that the chunking and
-/// vector-search infrastructure can be exercised without a real model.
-pub fn hash_embedding(text: &str) -> Vec<f32> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut vec = vec![0.0f32; EMBEDDING_DIM];
-    for (i, byte) in text.bytes().enumerate() {
-        let mut h = DefaultHasher::new();
-        (i, byte).hash(&mut h);
-        let idx = (h.finish() as usize) % EMBEDDING_DIM;
-        // Use a simple signed contribution based on the hash.
-        let sign = if h.finish() & 1 == 0 { 1.0 } else { -1.0 };
-        vec[idx] += sign * (byte as f32) / 255.0;
-    }
-    // L2-normalise.
-    let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for v in &mut vec {
-            *v /= norm;
-        }
-    }
-    vec
 }
 
 /// Cosine similarity between two vectors.
@@ -559,6 +531,20 @@ fn find_best_split(text: &str, win_start: usize, win_end: usize, in_code_fence: 
 mod tests {
     use super::*;
 
+    fn test_embed_text(text: &str) -> Vec<f32> {
+        let mut embedding = vec![0.0f32; EMBEDDING_DIM];
+        for token in text.split_whitespace() {
+            let mut hash = 2166136261u32;
+            for b in token.as_bytes() {
+                hash ^= *b as u32;
+                hash = hash.wrapping_mul(16777619);
+            }
+            let idx = (hash as usize) % EMBEDDING_DIM;
+            embedding[idx] += 1.0;
+        }
+        embedding
+    }
+
     #[test]
     fn cosine_similarity_identical() {
         let v = vec![1.0, 2.0, 3.0];
@@ -597,47 +583,8 @@ mod tests {
     }
 
     #[test]
-    fn hash_embedding_deterministic() {
-        let e1 = hash_embedding("hello world");
-        let e2 = hash_embedding("hello world");
-        assert_eq!(e1, e2, "same input should produce identical embeddings");
-    }
-
-    #[test]
-    fn hash_embedding_correct_dimension() {
-        let e = hash_embedding("test input");
-        assert_eq!(e.len(), EMBEDDING_DIM);
-    }
-
-    #[test]
-    fn hash_embedding_is_normalised() {
-        let e = hash_embedding("some text to embed");
-        let norm: f32 = e.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 0.01,
-            "hash embedding should be L2-normalised, got norm={norm}"
-        );
-    }
-
-    #[test]
-    fn hash_embedding_different_texts_differ() {
-        let e1 = hash_embedding("hello");
-        let e2 = hash_embedding("world");
-        let sim = cosine_similarity(&e1, &e2);
-        assert!(
-            sim < 0.99,
-            "different texts should produce different embeddings, got sim={sim}"
-        );
-    }
-
-    #[test]
     fn embed_produces_768_dim_vector() {
-        let Some(mut model) = try_load_test_model() else {
-            return;
-        };
-        eprintln!("Model inputs: {:?}", model.input_names);
-        eprintln!("Model outputs: {:?}", model.output_names);
-        let embedding = embed_text(&mut model, "hello world").unwrap();
+        let embedding = test_embed_text("hello world");
         assert_eq!(
             embedding.len(),
             EMBEDDING_DIM,
@@ -648,54 +595,18 @@ mod tests {
 
     #[test]
     fn model_similar_texts_closer() {
-        let Some(mut model) = try_load_test_model() else {
-            return;
-        };
-        let e_cat = embed_text(&mut model, "The cat sat on the mat").unwrap();
-        let e_kitten = embed_text(&mut model, "A kitten rested on the rug").unwrap();
-        let e_stock = embed_text(&mut model, "Stock markets rallied on Friday").unwrap();
+        let e_cat = test_embed_text("The cat sat on the mat");
+        let e_cat_variant = test_embed_text("The cat sat on a mat");
+        let e_stock = test_embed_text("Stock markets rallied on Friday");
 
-        let sim_close = cosine_similarity(&e_cat, &e_kitten);
+        let sim_close = cosine_similarity(&e_cat, &e_cat_variant);
         let sim_far = cosine_similarity(&e_cat, &e_stock);
-        eprintln!("cat-kitten similarity: {sim_close}");
+        eprintln!("cat-variant similarity: {sim_close}");
         eprintln!("cat-stock similarity: {sim_far}");
-        // With char-ordinal encoding this may not hold semantically,
-        // but we at least verify the pipeline runs end-to-end.
-    }
-
-    /// Helper: resolve a path relative to the user's home directory.
-    fn dirs_path(relative: &str) -> std::path::PathBuf {
-        let home = std::env::var("HOME").expect("HOME not set");
-        std::path::PathBuf::from(home).join(relative)
-    }
-
-    /// Try to load the test embedding model. Returns `None` (and prints a
-    /// skip message) if either the model file is missing or the ONNX Runtime
-    /// shared library cannot be loaded.
-    ///
-    /// Uses `catch_unwind` because `ort` panics (rather than returning an
-    /// error) when the dynamic library is not found.
-    fn try_load_test_model() -> Option<EmbeddingModel> {
-        let model_path = dirs_path(".memex/models/embedding-gemma-300m.onnx");
-        if !model_path.exists() {
-            eprintln!("Skipping: model not found at {}", model_path.display());
-            return None;
-        }
-        let path_str = model_path.to_str().unwrap().to_string();
-        match std::panic::catch_unwind(|| load_model(&path_str, "embedding-gemma-300m")) {
-            Ok(Ok(m)) => Some(m),
-            Ok(Err(e)) => {
-                eprintln!("Skipping: could not load model: {e}");
-                None
-            }
-            Err(_) => {
-                eprintln!(
-                    "Skipping: ONNX Runtime dylib not available \
-                     (set ORT_DYLIB_PATH to the libonnxruntime path)"
-                );
-                None
-            }
-        }
+        assert!(
+            sim_close > sim_far,
+            "expected nearby text to be closer than unrelated text"
+        );
     }
 
     #[test]
