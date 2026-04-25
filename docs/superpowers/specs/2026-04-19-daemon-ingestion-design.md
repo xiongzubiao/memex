@@ -46,7 +46,7 @@ Hook: memex ingest --agent claude-code
     v
 Daemon (persistent process)
     |
-    |-- Dedup check (content hash in source collection)
+    |-- Dedup check (content hash in source doc_type)
     |-- Parse transcript (agent-specific parser)
     |-- Filter (NonSubstantive / InternalSession -> skip)
     |-- Dispatch IngestJob to worker pool
@@ -173,7 +173,7 @@ When the daemon receives `Request::Ingest`:
 
 **Path validation:** Verify `transcript_path` is an absolute path within known agent session directories (`~/.claude/projects/`, `~/.codex/sessions/`, `~/.gemini/sessions/`, or platform equivalents). Reject paths outside these directories to prevent path traversal attacks via malicious hook payloads. Respond `Error` with a clear message.
 
-**Dedup:** Compute SHA-256 hash of the transcript file content. Check if this hash already exists in the source collection's content table. If yes, respond `Done` and skip. This is content-based dedup, not path-based, so file moves or renames don't cause re-ingestion, and file overwrites with new content are correctly re-processed.
+**Dedup:** Compute SHA-256 hash of the transcript file content. Check if this hash already exists in the source doc_type's content table. If yes, respond `Done` and skip. This is content-based dedup, not path-based, so file moves or renames don't cause re-ingestion, and file overwrites with new content are correctly re-processed.
 
 ### 3.2 Parse and clean
 
@@ -336,10 +336,10 @@ After validation, the daemon stores everything in a defined order with rollback 
 ```
 BEGIN TRANSACTION
   1. insert_content() for source document (SHA-256 hash)
-  2. upsert_document() for source in source collection
+  2. upsert_document() for source in source doc_type
   3. For each wiki page:
      a. insert_content() for page body
-     b. upsert_document() in wiki collection
+     b. upsert_document() in wiki doc_type
      c. Insert chunks into chunks table
      d. Embed chunks with warm ONNX, store embeddings
   4. Update backlinks for all affected pages

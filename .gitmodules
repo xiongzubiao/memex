@@ -1,0 +1,3 @@
+[submodule "eval/memory-benchmarks"]
+	path = eval/memory-benchmarks
+	url = https://github.com/mem0ai/memory-benchmarks.git

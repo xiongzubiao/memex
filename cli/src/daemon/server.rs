@@ -5,12 +5,13 @@ use crate::daemon::handler::{HandlerState, handle};
 use crate::daemon::lock::{TryAcquire, try_acquire};
 use crate::daemon::pidfile;
 use crate::daemon::protocol::{Event, Request};
+use crate::memex_root;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -42,8 +43,8 @@ pub enum StartOutcome {
     AlreadyRunning,
 }
 
-/// Run the daemon in the foreground. Blocks until SIGTERM or idle timeout.
-pub async fn run_foreground(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome> {
+/// Run the daemon main loop. Blocks until SIGTERM or idle timeout.
+pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome> {
     // 1. Lock 2.
     let _guard = match try_acquire(&paths.lock).context("acquiring lock 2")? {
         TryAcquire::Acquired(g) => g,
@@ -67,10 +68,7 @@ pub async fn run_foreground(paths: DaemonPaths, cfg: Config) -> Result<StartOutc
     match std::fs::symlink_metadata(&paths.socket) {
         Ok(md) => {
             if md.file_type().is_symlink() {
-                anyhow::bail!(
-                    "refusing to unlink {:?}: path is a symlink",
-                    paths.socket
-                );
+                anyhow::bail!("refusing to unlink {:?}: path is a symlink", paths.socket);
             }
             std::fs::remove_file(&paths.socket)
                 .with_context(|| format!("removing stale socket {:?}", paths.socket))?;
@@ -86,13 +84,26 @@ pub async fn run_foreground(paths: DaemonPaths, cfg: Config) -> Result<StartOutc
         .with_context(|| format!("binding socket {:?}", paths.socket))?;
     info!(socket = %paths.socket.display(), pid, "daemon listening");
 
-    let retrieval_tx = crate::daemon::retrieval::spawn();
+    let memex_cache = crate::daemon::memex_cache::MemexCache::new();
+    let retrieval_tx = crate::daemon::retrieval::spawn(memex_cache.clone())
+        .context("spawning retrieval actor (check ONNX model + libonnxruntime)")?;
+
+    // Create local settings to disable plugins for benchmarking.
+    let root = memex_root();
+    let settings_path = root.join(".claude").join("settings.json");
+    if !settings_path.exists() {
+        let _ = std::fs::create_dir_all(root.join(".claude"));
+        let _ = std::fs::write(&settings_path, r#"{"enabledPlugins":{}}"#);
+    }
+
     let pool = crate::daemon::worker::WorkerPool::new(cfg.daemon.worker.clone());
     let state = Arc::new(HandlerState {
         pid,
         started_at: Utc::now(),
         retrieval: retrieval_tx,
         jobs: Arc::new(pool),
+        memex_cache,
+        slug_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     // 5. Accept loop with idle timeout + SIGTERM.

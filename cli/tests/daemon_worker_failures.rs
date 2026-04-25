@@ -24,7 +24,7 @@ fn setup() -> (TempDir, PathBuf, TempDir, PathBuf) {
 }
 
 #[test]
-fn auth_fail_surfaces_auth_failed_error() {
+fn auth_fail_surfaces_backend_unavailable_with_code() {
     let (_mock, extra_path, _root_tmp, root) = setup();
     let out = common::memex_cmd(&root, Some(&extra_path))
         .env("MOCK_CLAUDE_CODE_MODE", "auth_fail")
@@ -35,9 +35,13 @@ fn auth_fail_surfaces_auth_failed_error() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     common::stop_daemon(&root, Some(&extra_path));
 
+    // Auth failures flow through the unified backend-error path: the
+    // CLI sees `backend_unavailable` with the Claude-native
+    // `[authentication_failed]` code prefixed onto the message, which
+    // is enough for a human to know to re-auth.
     assert!(
-        stderr.contains("auth_failed") || stderr.contains("auth failed"),
-        "expected auth_failed in stderr; stdout={stdout} stderr={stderr}"
+        stderr.contains("backend_unavailable") && stderr.contains("[authentication_failed]"),
+        "expected backend_unavailable with [authentication_failed] code; stdout={stdout} stderr={stderr}"
     );
 }
 
@@ -54,8 +58,8 @@ fn agent_error_surfaces_raw_text() {
     common::stop_daemon(&root, Some(&extra_path));
 
     assert!(
-        stderr.contains("agent_unavailable") || stderr.contains("Overloaded"),
-        "expected agent_unavailable or raw text in stderr; stdout={stdout} stderr={stderr}"
+        stderr.contains("backend_unavailable") || stderr.contains("Overloaded"),
+        "expected backend_unavailable or raw text in stderr; stdout={stdout} stderr={stderr}"
     );
 }
 
@@ -74,8 +78,8 @@ fn non_json_reply_becomes_agent_error() {
     // The non-JSON reply should surface as an agent error carrying the raw
     // text ("I thought about this..."), not as a successful synthesis.
     assert!(
-        stderr.contains("agent_unavailable") || stderr.contains("I thought about"),
-        "expected agent_unavailable or raw text; stdout={stdout} stderr={stderr}"
+        stderr.contains("backend_unavailable") || stderr.contains("I thought about"),
+        "expected backend_unavailable or raw text; stdout={stdout} stderr={stderr}"
     );
 }
 

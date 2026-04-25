@@ -44,7 +44,6 @@ pub(super) struct RpcMessage {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct RpcError {
-    #[allow(dead_code)]
     pub(super) code: i64,
     pub(super) message: String,
 }

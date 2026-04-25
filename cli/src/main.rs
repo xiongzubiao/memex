@@ -89,17 +89,29 @@ enum Commands {
         /// How many pages to retrieve (default 5)
         #[arg(long, default_value = "5")]
         top_k: usize,
+        /// Restrict search to one or more collections
+        #[arg(long = "collection")]
+        collections: Vec<String>,
     },
     /// Ingest a session transcript via the daemon (thin client, used by hooks)
     Ingest {
         /// Agent type (claude-code, codex, gemini-cli)
         #[arg(long)]
         agent: Agent,
+        /// Restrict ingestion to one or more collections
+        #[arg(long = "collection")]
+        collections: Vec<String>,
     },
     /// Bulk-ingest historical sessions via the daemon
     Backfill {
         /// Agent type (claude-code, codex, gemini-cli)
         agent: Agent,
+        /// Restrict ingestion to one or more collections
+        #[arg(long = "collection")]
+        collections: Vec<String>,
+        /// Override discovery: ingest every *.jsonl under this directory (recursive)
+        #[arg(long)]
+        path: Option<std::path::PathBuf>,
     },
     /// Show daemon and ingestion status
     Status,
@@ -107,8 +119,12 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum DaemonAction {
-    /// Run the daemon in the foreground (logs to file; block until SIGTERM/idle)
-    Start,
+    /// Run the daemon (daemonized by default)
+    Start {
+        /// Run in foreground instead of daemonizing (for debugging)
+        #[arg(long, default_value = "false")]
+        foreground: bool,
+    },
     /// Stop the running daemon (SIGTERM via PID file)
     Stop,
     /// Report daemon status (PID + ping)
@@ -119,9 +135,9 @@ fn run_search(title: &str) -> anyhow::Result<()> {
     let root = memex_cli::memex_root();
     let memex = Memex::open(root)?;
     let search = memex.search();
-    let mut model = memex_core::retrieval::load_default_model();
+    let mut model = memex_core::retrieval::load_default_model()?;
 
-    if let Some(slug) = memex_core::retrieval::search_wiki_by_title(search, title, model.as_mut()) {
+    if let Some(slug) = memex_core::retrieval::search_wiki_by_title(search, title, &mut model)? {
         println!("{slug}");
     }
     Ok(())
@@ -150,7 +166,7 @@ fn run_read(refs: &[String]) -> anyhow::Result<()> {
                 .unwrap_or_default();
 
             // Read content: wiki pages from disk, source documents from content table.
-            let body = if doc.collection == "wiki" {
+            let body = if doc.doc_type == "wiki" {
                 let full_path = root.join(&doc.path);
                 let canonical = full_path.canonicalize().unwrap_or(full_path.clone());
                 if !canonical.starts_with(&canonical_wiki) {
@@ -166,7 +182,7 @@ fn run_read(refs: &[String]) -> anyhow::Result<()> {
                     .unwrap_or_else(|e| format!("(error reading content: {e})"))
             };
 
-            println!("=== {} {} {} ===", doc.docid, doc.collection, stem);
+            println!("=== {} {} {} ===", doc.docid, doc.doc_type, stem);
             print!("{body}");
             if !body.ends_with('\n') {
                 println!();
@@ -240,7 +256,12 @@ fn reconstruct_page(original: &str, new_body: &str) -> String {
 }
 
 /// Write a wiki page via the daemon. Sends Request::Write.
-fn run_write_via_daemon(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow::Result<()> {
+fn run_write_via_daemon(
+    name: &str,
+    force: bool,
+    quiet: bool,
+    sources: &[String],
+) -> anyhow::Result<()> {
     // Read content from stdin (same as direct path)
     let content = if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let mut buf = String::new();
@@ -259,8 +280,12 @@ fn run_write_via_daemon(name: &str, force: bool, quiet: bool, sources: &[String]
 
     // Extract tags from frontmatter if present
     let tags = memex_core::search::parse_page_for_indexing(&content)
-        .map(|(_, tags_str, _, _)| {
-            tags_str.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect::<Vec<_>>()
+        .map(|(_, _, tags_str, _, _)| {
+            tags_str
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
@@ -271,7 +296,8 @@ fn run_write_via_daemon(name: &str, force: bool, quiet: bool, sources: &[String]
             &paths.socket,
             &paths.lock,
             tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-        ).await?;
+        )
+        .await?;
         let events = memex_cli::daemon::client::request(
             stream,
             &memex_cli::daemon::protocol::Request::Write {
@@ -283,7 +309,8 @@ fn run_write_via_daemon(name: &str, force: bool, quiet: bool, sources: &[String]
                 force,
                 memex_root: root_str.to_string(),
             },
-        ).await?;
+        )
+        .await?;
         Ok(events)
     });
 
@@ -306,7 +333,6 @@ fn run_write_via_daemon(name: &str, force: bool, quiet: bool, sources: &[String]
     let has_error = events.iter().any(|e| matches!(e, memex_cli::daemon::protocol::Event::Error { code, .. } if code == "not_implemented"));
     if has_error {
         eprintln!("memex: daemon write not yet implemented, falling back to direct write");
-        let _ = init_ort_runtime();
         // Re-read stdin won't work (already consumed). Just report the fallback.
         // The user should use --direct until daemon write is implemented.
         anyhow::bail!("daemon write routing not yet implemented. Use --direct flag.");
@@ -424,10 +450,8 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
     )?;
 
     // Load model once for wiki page + all sources.
-    let mut model = memex_core::retrieval::load_default_model();
-    if let Some(ref mut m) = model {
-        memex_core::retrieval::embed_document(search, &hash, &linked_body, m);
-    }
+    let mut model = memex_core::retrieval::load_default_model()?;
+    memex_core::retrieval::embed_document(search, &hash, &linked_body, &mut model)?;
 
     if let Some(ref old_h) = old_hash
         && old_h != &hash
@@ -453,7 +477,15 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
                 .to_string_lossy()
                 .to_string();
             let source_summary = memex_core::index::extract_summary(&source_content, 120);
-            let docid = store_source_with_docids(search, &source_abs, &source_content, &source_title, &source_summary, &source_docids, model.as_mut())?;
+            let docid = store_source_with_docids(
+                search,
+                &source_abs,
+                &source_content,
+                &source_title,
+                &source_summary,
+                &source_docids,
+                &mut model,
+            )?;
             source_docids.push(docid);
         }
     }
@@ -570,7 +602,7 @@ fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
     if docs.is_empty() {
         die(format!("not found: {page_ref}"));
     }
-    let wiki_docs: Vec<_> = docs.iter().filter(|d| d.collection == "wiki").collect();
+    let wiki_docs: Vec<_> = docs.iter().filter(|d| d.doc_type == "wiki").collect();
     if wiki_docs.is_empty() {
         die(format!(
             "Error: {page_ref} resolves to a source document, not a wiki page"
@@ -609,7 +641,7 @@ fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
     let memex = memex_core::Memex::open_writer(root.clone())?;
     let search = memex.search();
     let docs2 = search.resolve_ref_documents(page_ref)?;
-    let wiki_docs2: Vec<_> = docs2.iter().filter(|d| d.collection == "wiki").collect();
+    let wiki_docs2: Vec<_> = docs2.iter().filter(|d| d.doc_type == "wiki").collect();
     let doc = match wiki_docs2.first() {
         Some(d) if d.docid == confirmed_docid => *d,
         Some(d) => {
@@ -797,7 +829,7 @@ fn init_ort_runtime() -> Result<(), String> {
 }
 
 /// Print an error message and exit with code 1. Used for `run_delete`'s
-/// hard-fail paths (ref not found, ambiguous, wrong collection, TOCTOU
+/// hard-fail paths (ref not found, ambiguous, wrong doc_type, TOCTOU
 /// detection). These bypass `main()`'s `actionable_hint` pipeline on purpose
 /// — the messages are complete diagnostic output, and there's no `MemexError`
 /// variant that would add a useful hint.
@@ -817,28 +849,46 @@ fn store_source_with_docids(
     title: &str,
     summary: &str,
     existing_docids: &[String],
-    model: Option<&mut memex_core::embed::EmbeddingModel>,
+    model: &mut memex_core::embed::EmbeddingModel,
 ) -> anyhow::Result<String> {
     let hash = search.insert_content(content)?;
     let docid = memex_core::docid::allocate_docid(&hash, "source", path, existing_docids);
     let now = now_rfc3339();
-    search.upsert_document("source", path, title, &hash, &docid, "", summary, &now, &now)?;
-    if let Some(model) = model {
-        memex_core::retrieval::embed_document(search, &hash, content, model);
-    }
+    search.upsert_document(
+        "source", path, title, &hash, &docid, "", summary, &now, &now,
+    )?;
+    memex_core::retrieval::embed_document(search, &hash, content, model)?;
     Ok(docid)
 }
 
-fn discover_session_files(agent: &Agent) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    let pattern = match agent {
-        Agent::ClaudeCode => home.join(".claude/projects/*/*.jsonl"),
-        Agent::Codex => home.join(".codex/sessions/*/*/*/*.jsonl"),
-        Agent::GeminiCli => home.join(".gemini/tmp/*/chats/session-*.json"),
+/// Discover session files for an agent. `root_override`, when provided,
+/// replaces the agent's default root (e.g. `~/.claude` for Claude Code);
+/// the agent-specific subpattern (`projects/*/*.jsonl`, etc.) still applies.
+fn discover_session_files(
+    agent: &Agent,
+    root_override: Option<&std::path::Path>,
+) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let root = if let Some(p) = root_override {
+        if !p.is_dir() {
+            anyhow::bail!("{} is not a directory", p.display());
+        }
+        p.to_path_buf()
+    } else {
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+        match agent {
+            Agent::ClaudeCode => home.join(".claude"),
+            Agent::Codex => home.join(".codex"),
+            Agent::GeminiCli => home.join(".gemini"),
+        }
     };
-    let pattern_str = pattern.to_string_lossy().to_string();
-    let files: Vec<std::path::PathBuf> = glob::glob(&pattern_str)
+    let sub = match agent {
+        Agent::ClaudeCode => "projects/*/*.jsonl",
+        Agent::Codex => "sessions/*/*/*/*.jsonl",
+        Agent::GeminiCli => "tmp/*/chats/session-*.json",
+    };
+    let pattern = root.join(sub);
+    let files: Vec<std::path::PathBuf> = glob::glob(&pattern.to_string_lossy())
         .map_err(|e| anyhow::anyhow!("Glob error: {e}"))?
         .filter_map(|r| r.ok())
         .collect();
@@ -850,7 +900,15 @@ fn discover_session_files(agent: &Agent) -> anyhow::Result<Vec<std::path::PathBu
 // ---------------------------------------------------------------------------
 
 /// Thin hook client: read stdin JSON, extract transcript_path, send to daemon.
-fn run_ingest_client(agent: &Agent) -> anyhow::Result<()> {
+fn default_ingest_collections(collections: &[String]) -> Vec<String> {
+    if collections.is_empty() {
+        vec!["default".to_string()]
+    } else {
+        collections.to_vec()
+    }
+}
+
+fn run_ingest_client(agent: &Agent, collections: &[String]) -> anyhow::Result<()> {
     // MEMEX_INTERNAL guard: skip daemon's own sessions
     if std::env::var("MEMEX_INTERNAL").as_deref() == Ok("1") {
         return Ok(());
@@ -874,45 +932,85 @@ fn run_ingest_client(agent: &Agent) -> anyhow::Result<()> {
         transcript_path,
         agent.as_str(),
         root.to_str().unwrap_or("~/.memex"),
+        default_ingest_collections(collections),
     )?;
     std::process::exit(code);
 }
 
-/// Discover session files for an agent and send each to the daemon for ingestion.
-fn run_backfill(agent: &Agent) -> anyhow::Result<()> {
-    let session_files = discover_session_files(agent)?;
+/// Discover session files for an agent (or a user-supplied directory) and
+/// dispatch ingestion to the daemon. All sessions are fired concurrently;
+/// the daemon's worker pool (`daemon.worker.max_count`) caps actual
+/// parallelism, with excess jobs queued internally.
+fn run_backfill(
+    agent: &Agent,
+    collections: &[String],
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let session_files = discover_session_files(agent, path)?;
     if session_files.is_empty() {
-        println!("No session files found for {agent:?}");
+        println!("No session files found");
         return Ok(());
     }
-    println!("Discovered {} sessions", session_files.len());
-
-    let root = memex_cli::memex_root();
-    let root_str = root.to_string_lossy();
-
-    let mut queued = 0u32;
-    let mut skipped = 0u32;
-    let mut errors = 0u32;
-
-    for path in &session_files {
-        let path_str = path.to_string_lossy();
-        match memex_cli::daemon::ingest(&path_str, agent.as_str(), &root_str) {
-            Ok(0) => {
-                queued += 1;
-                eprintln!("queued: {path_str}");
-            }
-            Ok(_) => skipped += 1,
-            Err(e) => {
-                eprintln!("error: {path_str}: {e}");
-                errors += 1;
-            }
-        }
-    }
-
     println!(
-        "Queued {queued} (skipped {skipped}, errors {errors}) of {} sessions",
+        "Discovered {} sessions; dispatching to daemon",
         session_files.len()
     );
+
+    let root = memex_cli::memex_root();
+    let root_str = root.to_string_lossy().to_string();
+    let agent_str = agent.as_str().to_string();
+    let collections = default_ingest_collections(collections);
+    let total = session_files.len();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let (queued, skipped, errors) = rt.block_on(async move {
+        // Pre-warm the daemon with a single spawn-or-connect before firing
+        // N concurrent ingest tasks. Without this, the tasks race into
+        // connect_or_spawn, each sees a cold socket, and several try to
+        // spawn the daemon simultaneously — producing brief zombie children
+        // under this CLI process.
+        if let Err(e) = memex_cli::daemon::warm_up().await {
+            eprintln!("warning: daemon pre-warm failed: {e}");
+        }
+
+        let mut handles = Vec::with_capacity(total);
+        for p in session_files {
+            let agent_str = agent_str.clone();
+            let root_str = root_str.clone();
+            let collections = collections.clone();
+            let path_str = p.to_string_lossy().to_string();
+            handles.push(tokio::spawn(async move {
+                let result =
+                    memex_cli::daemon::ingest_async(&path_str, &agent_str, &root_str, collections)
+                        .await;
+                (path_str, result)
+            }));
+        }
+
+        let mut queued = 0u32;
+        let mut skipped = 0u32;
+        let mut errors = 0u32;
+        for h in handles {
+            match h.await {
+                Ok((path_str, Ok(0))) => {
+                    queued += 1;
+                    eprintln!("queued: {path_str}");
+                }
+                Ok((_, Ok(_))) => skipped += 1,
+                Ok((path_str, Err(e))) => {
+                    eprintln!("error: {path_str}: {e}");
+                    errors += 1;
+                }
+                Err(e) => {
+                    eprintln!("task join error: {e}");
+                    errors += 1;
+                }
+            }
+        }
+        (queued, skipped, errors)
+    });
+
+    println!("Queued {queued} (skipped {skipped}, errors {errors}) of {total} sessions");
     Ok(())
 }
 
@@ -959,7 +1057,7 @@ fn main() {
 fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Commands::Search { title } => {
-            let _ = init_ort_runtime();
+            init_ort_runtime().map_err(|e| anyhow::anyhow!(e))?;
             run_search(&title)
         }
         Commands::Read { refs } => run_read(&refs),
@@ -971,7 +1069,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             direct,
         } => {
             if direct {
-                let _ = init_ort_runtime();
+                init_ort_runtime().map_err(|e| anyhow::anyhow!(e))?;
                 run_write(&name, force, quiet, &sources)
             } else {
                 run_write_via_daemon(&name, force, quiet, &sources)
@@ -980,14 +1078,14 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Commands::Delete { page_ref, force } => run_delete(&page_ref, force),
         Commands::Lint { fix } => {
             if fix {
-                let _ = init_ort_runtime();
+                init_ort_runtime().map_err(|e| anyhow::anyhow!(e))?;
             }
             run_lint(fix)
         }
         Commands::Daemon { action } => match action {
-            DaemonAction::Start => {
+            DaemonAction::Start { foreground } => {
                 init_ort_runtime().map_err(|e| anyhow::anyhow!(e))?;
-                std::process::exit(memex_cli::daemon::start_foreground()?)
+                std::process::exit(memex_cli::daemon::start_background(foreground)?)
             }
             DaemonAction::Stop => std::process::exit(memex_cli::daemon::stop()?),
             DaemonAction::Status => std::process::exit(memex_cli::daemon::status()?),
@@ -996,16 +1094,21 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             question,
             raw,
             top_k,
+            collections,
         } => {
             let code = if raw {
-                memex_cli::daemon::query_raw(&question, top_k, None)?
+                memex_cli::daemon::query_raw(&question, top_k, collections, None)?
             } else {
-                memex_cli::daemon::query_synth(&question, top_k, None)?
+                memex_cli::daemon::query_synth(&question, top_k, collections, None)?
             };
             std::process::exit(code);
         }
-        Commands::Ingest { agent } => run_ingest_client(&agent),
-        Commands::Backfill { agent } => run_backfill(&agent),
+        Commands::Ingest { agent, collections } => run_ingest_client(&agent, &collections),
+        Commands::Backfill {
+            agent,
+            collections,
+            path,
+        } => run_backfill(&agent, &collections, path.as_deref()),
         Commands::Status => run_status(),
     }
 }
@@ -1081,6 +1184,13 @@ fn actionable_hint(err: &anyhow::Error) -> Option<String> {
         MemexError::InvalidEnvVar { var, .. } => {
             format!("Set {var} to a number between 1 and 3600 (seconds), e.g. `export {var}=60`.")
         }
+        MemexError::EmbeddingUnavailable { path, .. } => format!(
+            "Install the embedding model + ONNX Runtime:\n\
+             \n  cd plugin && npm install      # downloads {} and libonnxruntime\n  \
+             # or, manually place the 768-dim ONNX model at {} and libonnxruntime in ~/.memex/lib/",
+            path.display(),
+            path.display(),
+        ),
         _ => return None,
     })
 }

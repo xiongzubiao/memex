@@ -1,5 +1,30 @@
 use crate::error::Result;
 use rusqlite::Connection;
+use std::sync::Once;
+
+/// Register the sqlite-vec extension as a SQLite auto-extension. Idempotent
+/// via `Once`: the FFI function must be registered exactly once per process,
+/// and **before any connection is opened** — `sqlite3_auto_extension` only
+/// affects connections opened *after* the call. Every opener in this crate
+/// calls this before `Connection::open`.
+pub fn register_sqlite_vec_once() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: `sqlite3_vec_init` is the extension's C entry point.
+        // `sqlite3_auto_extension` takes a function pointer and stores it
+        // in a global list consulted by every subsequent SQLite connection.
+        unsafe {
+            type EntryFn = unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut i8,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> i32;
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), EntryFn>(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
 
 fn register_strip_frontmatter(conn: &Connection) -> Result<()> {
     conn.create_scalar_function(
@@ -32,7 +57,7 @@ CREATE TABLE IF NOT EXISTS content (
 
 CREATE TABLE IF NOT EXISTS documents (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    collection  TEXT NOT NULL,
+    doc_type    TEXT NOT NULL,
     path        TEXT NOT NULL,
     title       TEXT NOT NULL,
     hash        TEXT NOT NULL REFERENCES content(hash),
@@ -41,10 +66,21 @@ CREATE TABLE IF NOT EXISTS documents (
     summary     TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
-    UNIQUE(collection, path)
+    UNIQUE(doc_type, path)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_docid ON documents(docid) WHERE docid != '';
+
+CREATE TABLE IF NOT EXISTS collections (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    name    TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS document_collections (
+    document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    collection_id   INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    PRIMARY KEY(document_id, collection_id)
+);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
     path, title, tags, body,
@@ -87,8 +123,15 @@ CREATE TABLE IF NOT EXISTS chunks (
     len         INTEGER NOT NULL,
     model       TEXT NOT NULL,
     embedded_at TEXT NOT NULL,
-    embedding   BLOB,
     PRIMARY KEY(hash, seq)
+);
+
+-- sqlite-vec virtual table for similarity search. Keyed by
+-- "{hash}_{seq}" so each chunk has a stable row ID that joins back to
+-- `chunks` for snippet text and back to `documents` via `chunks.hash`.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+    hash_seq TEXT PRIMARY KEY,
+    embedding float[768] distance=cosine
 );
 
 CREATE TABLE IF NOT EXISTS ingest_jobs (
@@ -105,6 +148,7 @@ CREATE TABLE IF NOT EXISTS ingest_jobs (
 "#;
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     register_strip_frontmatter(conn)?;
     conn.execute_batch(SCHEMA_SQL)?;
     Ok(())
@@ -117,6 +161,7 @@ mod tests {
 
     #[test]
     fn strip_frontmatter_removes_yaml() {
+        register_sqlite_vec_once();
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let result: String = conn
@@ -131,6 +176,7 @@ mod tests {
 
     #[test]
     fn strip_frontmatter_no_frontmatter_passthrough() {
+        register_sqlite_vec_once();
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
         let result: String = conn

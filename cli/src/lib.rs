@@ -23,4 +23,3 @@ pub fn slugify(name: &str) -> String {
         .collect::<Vec<_>>()
         .join("-")
 }
-

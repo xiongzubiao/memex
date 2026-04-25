@@ -195,7 +195,7 @@ A query is a small state machine: retrieve → optionally expand → synthesize.
 2. **Retrieval phase** (retrieval actor):
    - Actor opens SQLite for the requested `memex_root` (reuses a recent open if same root).
    - Probe search (BM25 + vector with RRF fusion). Tags the result with `signal: strong` or `signal: weak` based on the BM25 top-1 vs top-2 gap.
-   - Auto-read the top-K results across collections (wiki + source). If no results at all, respond with `retrieval_empty` error.
+   - Auto-read the top-K results across doc_types (wiki + source). If no results at all, respond with `retrieval_empty` error.
 3. **Expansion phase** (only when `signal: weak`):
    - Daemon enqueues an `ExpandJob{question, reply_tx}` onto the central agent job queue.
    - A worker picks it up and sends a user message tagged `[TASK: EXPAND]` (the agent-prompt system prompt instructs the agent to recognize this tag and produce typed rewrite terms). One LLM turn generates: one short lexical variant, one semantic reformulation, one single-sentence hypothetical answer (HyDE).
@@ -214,7 +214,7 @@ A query is a small state machine: retrieve → optionally expand → synthesize.
    - A worker pulls the job, sends a user message tagged `[TASK: SYNTHESIZE]` containing the context block + question, and invokes its agent subprocess via the provider's persistent protocol (stream-json stdin for claude; `turn/start` on the codex app-server's open thread; `session/prompt` on the gemini ACP session). The agent replies with `{"answer": "...", "citations": [...]}`, worker is released back.
    - On worker subprocess crash / auth error / timeout: the worker respawns its agent subprocess and retries THIS job once. If the retry also fails, surface a typed error (`subprocess_crashed` / `auth_failed` / `subprocess_timeout`).
    - Connection handler awaits on `reply_tx`, surfaces result to CLI, releases.
-6. If `--raw` mode: skip both expansion and synthesis; return the formatted context block from step 4 directly (no queue involved).
+6. If `--raw` mode: skip synthesis; return the formatted context block from step 4 directly. Expansion (step 3) still runs on weak-signal probes so the returned context reflects the full retrieval pipeline.
 
 **Expansion and synthesis use the same worker pool.** There's no separate "expansion pool" — both job types (`ExpandJob`, `SynthJob`) flow through the same MPMC queue. Each job is a single LLM turn, one worker checkout. A worker's restart counter increments per job, regardless of type. This keeps the pool model simple: one worker type, one queue, two job shapes.
 
@@ -228,9 +228,9 @@ The actor opens the wiki via `memex_core::Memex::open(root)` — the **reader** 
 
 **Synthesis worker pool + central queue:**
 
-The daemon runs a single in-memory FIFO queue fed by connection handlers and drained by a pool of agent-subprocess workers (claude, codex, or gemini depending on `daemon.worker.agent`). Because multiple workers share the same queue, this is an **MPMC** (multi-producer, multi-consumer) channel — `tokio::mpsc` won't work here (single-consumer only); use `async-channel` (`async_channel::bounded`) or `flume::bounded` which expose cloneable receivers.
+The daemon runs a single in-memory FIFO queue fed by connection handlers and drained by a pool of agent-subprocess workers (claude, codex, or gemini depending on `daemon.worker.backend`). Because multiple workers share the same queue, this is an **MPMC** (multi-producer, multi-consumer) channel — `tokio::mpsc` won't work here (single-consumer only); use `async-channel` (`async_channel::bounded`) or `flume::bounded` which expose cloneable receivers.
 
-- **Queue**: `async_channel::bounded::<AgentJob>(cap)` with capacity `max(workers × 4, 32)`, where `AgentJob` is a union enum holding either `ExpandJob` or `SynthJob`. Both the sender and receiver handles are cloneable; producers clone the sender, each worker holds a clone of the receiver. When full, `send().await` applies backpressure (blocks the handler, which blocks the CLI, making load visible rather than silently OOM-ing).
+- **Queue**: `async_channel::bounded::<BackendJob>(cap)` with capacity `max(workers × 4, 32)`, where `AgentJob` is a union enum holding either `ExpandJob` or `SynthJob`. Both the sender and receiver handles are cloneable; producers clone the sender, each worker holds a clone of the receiver. When full, `send().await` applies backpressure (blocks the handler, which blocks the CLI, making load visible rather than silently OOM-ing).
 - **Workers**: each runs a loop `while let Ok(job) = rx.recv().await { serve(job) }`. All workers race on the same receiver; the channel ensures each job is delivered to exactly one worker. FIFO ordering is preserved at the queue; fairness across workers is an async-channel property.
 - **Pool size**: configurable via `~/.memex/config.toml` (`daemon.worker.max_count`) or `MEMEX__DAEMON__WORKER__MAX_COUNT`; default is `num_cpus::get()`. Tune downward for memory-constrained hosts or when API rate limits would throttle.
 - **Lazy spawning + autoscale**: one "min" worker spawns eagerly; extra workers spawn on demand, up to `daemon.worker.max_count`. The scale-up signal at `submit()` time is `tx.len() > 0 || busy >= live` — i.e., either queued jobs have no picker, or every live worker is mid-job. `busy` is an atomic counter incremented when a worker receives a job and decremented when it finishes, so the signal catches "all workers occupied" even when the channel is empty. When the signal fires and `live < max_count`, the pool CAS-increments `live` and spawns a non-min worker. Non-min workers exit after `daemon.worker.idle_reap_sec` (default 600) with no job. The min worker tokio task stays alive until the daemon exits, but its subprocess is recycled by the same count/context/crash triggers as any non-min worker.
@@ -301,7 +301,7 @@ Stripped to these ~363 tokens of Claude Code framework boilerplate plus our ~500
 - Default Claude model is **Sonnet** (mid-tier). Rationale: synthesis must read multiple ranked sources, weight them by rank, reconcile contradictions, and produce a cited answer. This is reasoning-heavy; Haiku was empirically less reliable on early benchmarks despite being cheaper/faster. Escalation path: `opus` (flagship) via `daemon.worker.model` if Sonnet proves insufficient. Mid-tier is the parity choice across all three providers (see cross-provider table below).
 - Restart cadence: every 15 queries per worker (empirically ~150k token context growth per worker — leaves margin before 200k limit). Restart is always between-jobs (never mid-job).
 - Restart triggers: query-count threshold, subprocess EOF, subprocess non-zero exit, auth error, subprocess timeout.
-- System prompt is a **compiled-in string constant** in the daemon binary (`const AGENT_PROMPT: &str = include_str!("agent_prompt.txt")`). Ensures the prompt matches the code's assumptions about context format. Changes require a rebuild. No runtime override in this iteration; a `MEMEX_AGENT_PROMPT_FILE` override can be added later if demand appears.
+- Worker instructions are a **compiled-in string constant** in the daemon binary (`const WORKER_PROMPT: &str = include_str!("prompt.txt")`). Ensures the prompt matches the code's assumptions about context format. Changes require a rebuild. No runtime override in this iteration; a `MEMEX_AGENT_PROMPT_FILE` override can be added later if demand appears.
 - The prompt (~500-700 tokens) instructs the agent on **both** roles it plays per job:
   - **Expansion job** (user message tagged `[TASK: EXPAND]`, see request handling): produce typed rewrite terms — one lexical variant, one semantic reformulation, one HyDE-style hypothetical answer — as a JSON object.
   - **Synthesis job** (user message tagged `[TASK: SYNTHESIZE]`): read the ranked context, weight higher ranks more, treat weak-signal top results with skepticism, prefer higher-ranked sources when facts conflict, cite with `[[page-stem]]` links, and say "the wiki doesn't have this information" if no page answers the question.
@@ -371,7 +371,7 @@ Turn 2's uncached delta (~314 tokens) reflects just the new user input plus turn
 **Projected 15-query thread with realistic ~2k-per-turn context**: ~18.7k (turn 1 cold) + 14 × ~2.3k (turns 2–15, where the ~2k context block is fresh plus ~0.3k gap) ≈ **~51k uncached total**. This is substantially higher than Claude's warm path (~1k per turn) but meaningfully lower than fresh-per-job `codex exec` (~315k for 15 calls) — app-server is the only codex path worth supporting.
 
 **Caveats:**
-- Marked `[experimental]` in the codex CLI (v0.118.0). Protocol may change across codex versions. Pin behavior tests against the JSON-RPC methods we use; surface a clear error if `initialize` or `thread/start` fails. If the user's codex version doesn't support `app-server`, daemon reports `agent_unavailable` and user must switch `daemon.worker.agent` (no fresh-exec fallback).
+- Marked `[experimental]` in the codex CLI (v0.118.0). Protocol may change across codex versions. Pin behavior tests against the JSON-RPC methods we use; surface a clear error if `initialize` or `thread/start` fails. If the user's codex version doesn't support `app-server`, daemon reports `agent_unavailable` and user must switch `daemon.worker.backend` (no fresh-exec fallback).
 - OpenAI's prompt cache has a TTL (~5–10 min, per OpenAI docs). Sparse traffic causes re-paying the ~18.7k cold cost when the cache expires. The amortization assumes steady queries.
 - Thread context grows with each turn's assistant output. Primary mitigation: context-based restart (~70% of `lookup_model(model).max_input_tokens`) tracks cumulative uncached input tokens from `thread/tokenUsage/updated` deltas and triggers `fresh_thread`. Secondary: `restart_after_jobs` (default 100) as a count-based fallback for non-context reasons (memory leaks, stale state).
 - Same cross-query contamination risk as Claude's persistent pattern (documented under Risks).
@@ -498,7 +498,7 @@ Three honest observations from the measurements:
 - `codex`: OAuth or API key via `~/.codex/auth.json` (populated by `codex login`). Falls back to `OPENAI_API_KEY` if set.
 - `gemini`: `GEMINI_API_KEY` env var. Or Vertex AI via `GOOGLE_APPLICATION_CREDENTIALS` + `GOOGLE_GENAI_USE_VERTEXAI=true`.
 
-Each provider's required env vars are added to the subprocess environment allowlist when `daemon.worker.agent` is set accordingly.
+Each provider's required env vars are added to the subprocess environment allowlist when `daemon.worker.backend` is set accordingly.
 
 ### 3. IPC protocol
 
@@ -526,7 +526,7 @@ Synthesized mode:
 
 Raw mode:
 ```json
-{"type": "context", "pages": [{"docid": "...", "stem": "...", "collection": "wiki", "rank": 1, "signal": "strong", "body": "..."}]}
+{"type": "context", "pages": [{"docid": "...", "stem": "...", "doc_type": "wiki", "rank": 1, "signal": "strong", "body": "..."}]}
 {"type": "done", "status": 0}
 ```
 
@@ -567,7 +567,7 @@ Exit code `1` covers many distinct failure categories. Scripts that want to bran
 - `subprocess_timeout` — agent subprocess hung past `daemon.worker.timeout_sec`
 - `subprocess_crashed` — agent subprocess crashed twice (initial + retry)
 - `auth_failed` — agent subprocess reported auth error after one retry
-- `agent_unavailable` — the configured `daemon.worker.agent`'s persistent pattern is not available on this system (e.g., `codex app-server` method not recognized on older codex; `gemini --acp` flag rejected on older gemini). User must switch `daemon.worker.agent` or upgrade the CLI.
+- `agent_unavailable` — the configured `daemon.worker.backend`'s persistent pattern is not available on this system (e.g., `codex app-server` method not recognized on older codex; `gemini --acp` flag rejected on older gemini). User must switch `daemon.worker.backend` or upgrade the CLI.
 
 Mapping: `subprocess_timeout` / `subprocess_crashed` → exit 4. `auth_failed` → exit 5. `agent_unavailable` → exit 1 (terminal; requires user action). Everything else → exit 1. The core CLI continues to map `LockTimeout` → 2, `FileOpExhausted` → 3, everything else → 1 per parallel-access.
 
@@ -680,12 +680,12 @@ struct DaemonConfig {
     #[serde(default)]                               worker: WorkerConfig,
 }
 #[derive(Deserialize)]
-enum Agent { #[serde(rename="claude")] Claude, #[serde(rename="codex")] Codex, #[serde(rename="gemini")] Gemini }
+enum Backend { #[serde(rename="claude")] Claude, #[serde(rename="codex")] Codex, #[serde(rename="gemini")] Gemini }
 
 #[derive(Deserialize)]
 struct WorkerConfig {
-    #[serde(default = "default_agent")]             agent: Agent,
-    #[serde(default)]                               model: Option<String>,    // None → per-agent default (sonnet / gpt-5.4-mini / gemini-3-flash-preview)
+    #[serde(default = "default_backend")]            backend: Backend,
+    #[serde(default)]                               model: Option<String>,    // None → per-backend default (sonnet / gpt-5.4-mini / gemini-3-flash-preview)
     #[serde(default = "default_max_count")]         max_count: usize,         // default: num_cpus::get()
     #[serde(default = "default_idle_reap_sec")]     idle_reap_sec: u64,       // default: 600
     #[serde(default = "default_restart_after_jobs")] restart_after_jobs: u32, // default: 100 (secondary; context-based restart is primary)
@@ -797,7 +797,7 @@ Coverage is planned before implementation so tests ship alongside each unit, not
 ### Retrieval actor
 
 **Unit:**
-- Context formatter: top-K pages with mixed wiki+source → each section tagged `[rank N, collection, signal strong|weak]` correctly.
+- Context formatter: top-K pages with mixed wiki+source → each section tagged `[rank N, doc_type, signal strong|weak]` correctly.
 - Rank assignment: RRF ordering preserved end-to-end.
 
 **Integration:**

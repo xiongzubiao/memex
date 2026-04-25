@@ -21,6 +21,7 @@ walkdir = "2"
 thiserror = "2"
 regex = "1.10"
 rusqlite = { version = "0.37", features = ["bundled", "functions"] }
+sqlite-vec = "0.1.9"
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "api-23"] }
 libloading = "0.9"
 toml = "0.8"

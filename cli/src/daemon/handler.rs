@@ -5,9 +5,16 @@
 //! `done` event.
 
 use crate::daemon::error::DaemonError;
+use crate::daemon::memex_cache::MemexCache;
 use crate::daemon::protocol::{Event, Request, SUPPORTED_VERSIONS};
 use chrono::Utc;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
+
+/// Map key identifying a wiki page: (memex_root, slug).
+type SlugKey = (String, String);
 
 /// Daemon-shared state accessible to handlers.
 pub struct HandlerState {
@@ -15,6 +22,375 @@ pub struct HandlerState {
     pub started_at: chrono::DateTime<Utc>,
     pub retrieval: crate::daemon::retrieval::RetrievalSender,
     pub jobs: Arc<crate::daemon::worker::WorkerPool>,
+    /// Shared per-root Memex handle cache. Both the query path (via the
+    /// retrieval actor) and the ingest path read from it so only one
+    /// SQLite connection per root is open at a time.
+    pub memex_cache: Arc<MemexCache>,
+    /// Per-(memex_root, slug) write locks. Acquired before `dedup_against_existing`
+    /// reads the existing wiki file and released after `write_wiki_files`,
+    /// so parallel ingests that produce the same slug don't race on the
+    /// read-modify-write sequence. The outer StdMutex only guards the
+    /// map itself (brief lock); the inner TokioMutex is held across the
+    /// long-running MERGE LLM call via `.await`.
+    pub slug_locks: Arc<StdMutex<HashMap<SlugKey, Arc<TokioMutex<()>>>>>,
+}
+
+/// Acquire per-slug locks for a batch, in sorted order to avoid deadlock
+/// between concurrent ingests that touch overlapping slug sets.
+///
+/// The map grows by one `Arc<Mutex<()>>` per distinct (root, slug) ever
+/// seen — negligible for typical wikis (hundreds to low-thousands of
+/// entries). If a future long-running daemon accumulates millions, GC
+/// idle entries with:
+///   `state.slug_locks.lock().unwrap()
+///        .retain(|_, m| Arc::strong_count(m) > 1);`
+/// (strong_count == 1 means only the map holds it; no live waiter or
+/// holder. Safe to drop.) Trigger periodically or on idle reap.
+async fn acquire_slug_locks(
+    state: &HandlerState,
+    memex_root: &str,
+    mut slugs: Vec<String>,
+) -> Vec<OwnedMutexGuard<()>> {
+    slugs.sort();
+    slugs.dedup();
+    let locks: Vec<Arc<TokioMutex<()>>> = {
+        let mut map = state
+            .slug_locks
+            .lock()
+            .expect("slug_locks map poisoned");
+        slugs
+            .into_iter()
+            .map(|s| {
+                map.entry((memex_root.to_string(), s))
+                    .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                    .clone()
+            })
+            .collect()
+    };
+    let mut guards = Vec::with_capacity(locks.len());
+    for lock in locks {
+        guards.push(lock.lock_owned().await);
+    }
+    guards
+}
+
+/// Look up the shared Memex handle for `root`, opening on first use.
+/// Thin wrapper that maps cache-level errors into `DaemonError::Internal`.
+fn get_or_open_memex(
+    cache: &MemexCache,
+    root: &Path,
+) -> Result<Arc<memex_core::Memex>, DaemonError> {
+    cache
+        .get_or_open(root)
+        .map_err(|e| DaemonError::Internal(format!("cannot open memex: {e}")))
+}
+
+/// `atomic_write` on the blocking thread pool, so the fsync + rename don't
+/// stall the tokio runtime.
+async fn async_atomic_write(
+    path: std::path::PathBuf,
+    bytes: Vec<u8>,
+) -> Result<(), DaemonError> {
+    tokio::task::spawn_blocking(move || memex_core::storage::atomic_write(&path, &bytes))
+        .await
+        .map_err(|e| DaemonError::Internal(format!("write task panicked: {e}")))?
+        .map_err(|e| DaemonError::Internal(format!("atomic_write failed: {e}")))
+}
+
+/// Read a file after gating on size via `metadata()` — avoids allocating
+/// multi-GB before the cap check would have rejected the input.
+async fn read_file_capped(path: &Path, max_bytes: u64) -> Result<String, DaemonError> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.len() > max_bytes => Err(DaemonError::BadRequest(format!(
+            "transcript too large: {} bytes (max {})",
+            meta.len(),
+            max_bytes
+        ))),
+        Ok(_) => tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| DaemonError::BadRequest(format!("cannot read transcript: {e}"))),
+        Err(e) => Err(DaemonError::BadRequest(format!(
+            "cannot stat transcript: {e}"
+        ))),
+    }
+}
+
+/// Submit a worker job and await its reply, mapping every error path into a
+/// `DaemonError`. Collapses the five-arm match (submit failure, crash,
+/// timeout, auth, backend) repeated across the handler.
+async fn run_worker_job<R, F>(
+    state: &HandlerState,
+    build_job: F,
+) -> Result<R, DaemonError>
+where
+    R: Send + 'static,
+    F: FnOnce(tokio::sync::oneshot::Sender<Result<R, crate::daemon::queue::WorkerError>>)
+        -> crate::daemon::queue::BackendJob,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let job = build_job(tx);
+    state
+        .jobs
+        .submit(job)
+        .await
+        .map_err(|_| DaemonError::Internal("worker queue closed".into()))?;
+    match rx.await {
+        Ok(Ok(reply)) => Ok(reply),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(DaemonError::Internal("worker dropped reply".into())),
+    }
+}
+
+/// Turn a batch of merged/new extracted pages into insert-ready records:
+/// scrub dead wiki links, read each page's prior frontmatter (in parallel),
+/// preserve `created_at`, accumulate `sources`, and compose the full
+/// markdown with frontmatter.
+async fn build_wiki_records(
+    all_pages: &[&crate::daemon::queue::ExtractedPage],
+    wiki_dir: &Path,
+    transcript_path: &str,
+    effective_collections: &[String],
+    now_dt: chrono::DateTime<chrono::Utc>,
+) -> Vec<memex_core::search::IngestWikiPage> {
+    // Known slugs = surviving pages in this batch + everything already on
+    // disk. Used to scrub `[[other-slug]]` references the LLM may have
+    // emitted for pages that got absorbed during MERGE or hallucinated.
+    let mut known_slugs: std::collections::HashSet<String> =
+        all_pages.iter().map(|p| p.slug.clone()).collect();
+    if let Ok(mut entries) = tokio::fs::read_dir(wiki_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                known_slugs.insert(stem.to_string());
+            }
+        }
+    }
+
+    // Preserve created_at and accumulate sources across merges. Without
+    // this, each merge would overwrite the previous session list and
+    // created_at, leaving merged pages looking single-source.
+    let prior_read_handles: Vec<_> = all_pages
+        .iter()
+        .map(|page| {
+            let existing_path = wiki_dir.join(format!("{}.md", page.slug));
+            tokio::spawn(async move { tokio::fs::read_to_string(&existing_path).await.ok() })
+        })
+        .collect();
+
+    let mut records = Vec::with_capacity(all_pages.len());
+    for (page, prior) in all_pages.iter().zip(prior_read_handles) {
+        let scrubbed_body = memex_core::validate::scrub_wiki_links(&page.body, &known_slugs);
+        let safe_title = page.title.replace(['\n', '\r'], " ");
+
+        let existing_content = prior.await.ok().flatten();
+        let (created_at, sources) = existing_content
+            .as_deref()
+            .and_then(|c| memex_core::validate::parse_frontmatter(c).ok())
+            .map(|(fm, _body)| {
+                let mut srcs = fm.sources;
+                if !srcs.iter().any(|s| s == transcript_path) {
+                    srcs.push(transcript_path.to_string());
+                }
+                (fm.created_at, srcs)
+            })
+            .unwrap_or_else(|| (now_dt, vec![transcript_path.to_string()]));
+
+        let yaml = serde_yaml::to_string(&memex_core::types::PageFrontmatterRef {
+            title: &safe_title,
+            summary: None,
+            tags: &page.tags,
+            collections: effective_collections,
+            created_at,
+            updated_at: now_dt,
+            sources: &sources,
+        })
+        .expect("frontmatter always serializes");
+        records.push(memex_core::search::IngestWikiPage {
+            slug: page.slug.clone(),
+            title: page.title.clone(),
+            content: format!("---\n{yaml}---\n\n{scrubbed_body}"),
+            tags: page.tags.join(","),
+        });
+    }
+    records
+}
+
+/// Drop EXTRACT pages with empty/invalid slug-title-body, re-slugify the
+/// rest, truncate bodies, and cap at 10. Warns on bad slug shapes (dates,
+/// episode words) but does not reject them — see `is_bad_slug`.
+fn validate_extracted_pages(
+    raw: Vec<crate::daemon::queue::ExtractedPage>,
+) -> Vec<crate::daemon::queue::ExtractedPage> {
+    raw.into_iter()
+        .take(10)
+        .filter_map(|page| {
+            if page.slug.is_empty() || page.title.is_empty() || page.body.is_empty() {
+                return None;
+            }
+            let slug = crate::slugify(&page.slug);
+            if slug.is_empty() {
+                return None;
+            }
+            if is_bad_slug(&slug) {
+                tracing::warn!(
+                    slug = %slug,
+                    title = %page.title,
+                    "non-subject slug emitted by EXTRACT (episode/date/multi-subject)"
+                );
+            }
+            Some(crate::daemon::queue::ExtractedPage {
+                slug,
+                title: page.title,
+                tags: page.tags,
+                body: memex_core::transcript::truncate(&page.body, 20_000),
+            })
+        })
+        .collect()
+}
+
+/// For each proposed page, title-BM25 search existing wiki; if a hit is
+/// found and readable, route to `merge_pairs`. Otherwise it becomes a new
+/// page. Errors from the search layer propagate up.
+async fn dedup_against_existing(
+    search: &memex_core::search::Bm25Search,
+    wiki_dir: &Path,
+    valid_pages: &[crate::daemon::queue::ExtractedPage],
+    model: &mut memex_core::embed::EmbeddingModel,
+) -> Result<
+    (
+        Vec<crate::daemon::queue::ExtractedPage>,
+        Vec<crate::daemon::queue::MergePair>,
+    ),
+    DaemonError,
+> {
+    let mut new_pages = Vec::new();
+    let mut merge_pairs = Vec::new();
+    for page in valid_pages {
+        let existing_slug = memex_core::retrieval::search_wiki_by_title(search, &page.title, model)
+            .map_err(|e| DaemonError::Internal(format!("dedup search: {e}")))?;
+        tracing::info!(title = %page.title, result = ?existing_slug, "dedup search");
+        match existing_slug {
+            Some(slug) => {
+                let existing_path = wiki_dir.join(format!("{slug}.md"));
+                tracing::info!(slug = %slug, path = %existing_path.display(), "reading existing page for merge");
+                if let Ok(existing_content) = tokio::fs::read_to_string(&existing_path).await {
+                    // Strip frontmatter before sending to MERGE. If we send
+                    // the full file, the LLM sometimes echoes the frontmatter
+                    // block into its output body — when the handler then
+                    // prepends a fresh frontmatter, the file ends with two
+                    // consecutive `---` blocks.
+                    let existing_body = memex_core::validate::parse_frontmatter(&existing_content)
+                        .map(|(_fm, body)| body)
+                        .unwrap_or(existing_content);
+                    merge_pairs.push(crate::daemon::queue::MergePair {
+                        slug,
+                        proposed: page.body.clone(),
+                        existing: existing_body,
+                    });
+                } else {
+                    new_pages.push(page.clone());
+                }
+            }
+            None => new_pages.push(page.clone()),
+        }
+    }
+    Ok((new_pages, merge_pairs))
+}
+
+/// Embed the source transcript and every wiki page from the ingest batch.
+/// Reuses hashes from `store_ingest_batch` so no bytes are rehashed.
+fn embed_ingested(
+    search: &memex_core::search::Bm25Search,
+    batch_result: &memex_core::search::IngestBatchResult,
+    canonical_transcript: &str,
+    wiki_pages: &[memex_core::search::IngestWikiPage],
+    model: &mut memex_core::embed::EmbeddingModel,
+) -> Result<(), DaemonError> {
+    memex_core::retrieval::embed_document(
+        search,
+        &batch_result.source_hash,
+        canonical_transcript,
+        model,
+    )
+    .map_err(|e| DaemonError::Internal(format!("embed transcript: {e}")))?;
+    for (page, (slug, page_hash)) in wiki_pages.iter().zip(&batch_result.wiki_hashes) {
+        debug_assert_eq!(&page.slug, slug);
+        memex_core::retrieval::embed_document(search, page_hash, &page.content, model)
+            .map_err(|e| DaemonError::Internal(format!("embed wiki page {slug}: {e}")))?;
+        tracing::debug!(slug = %slug, "embedded wiki page");
+    }
+    Ok(())
+}
+
+/// Canonicalize a user-supplied source path, store its content in the DB,
+/// and embed it. A missing file logs a warning and returns `Ok(())` — we
+/// treat sources as best-effort enrichment, not a hard requirement.
+async fn store_additional_source(
+    search: &memex_core::search::Bm25Search,
+    model: &mut memex_core::embed::EmbeddingModel,
+    source_path_str: &str,
+    now: &str,
+) -> Result<(), DaemonError> {
+    let source_path = std::path::PathBuf::from(source_path_str);
+    let Ok(source_path) = tokio::fs::canonicalize(&source_path).await else {
+        tracing::warn!(path = source_path_str, "source not found; skipping");
+        return Ok(());
+    };
+    let Ok(source_content) = tokio::fs::read_to_string(&source_path).await else {
+        tracing::warn!(path = %source_path.display(), "source read failed; skipping");
+        return Ok(());
+    };
+    let source_abs = source_path.to_string_lossy().to_string();
+    let source_title = source_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let source_summary = memex_core::index::extract_summary(&source_content, 120);
+    let source_hash = search
+        .insert_content(&source_content)
+        .map_err(|e| DaemonError::Internal(format!("insert_content failed: {e}")))?;
+    let source_docid =
+        memex_core::docid::allocate_docid(&source_hash, "source", &source_abs, &[]);
+    search
+        .upsert_document(
+            "source",
+            &source_abs,
+            &source_title,
+            &source_hash,
+            &source_docid,
+            "",
+            &source_summary,
+            now,
+            now,
+        )
+        .map_err(|e| DaemonError::Internal(format!("upsert_document failed: {e}")))?;
+    memex_core::retrieval::embed_document(search, &source_hash, &source_content, model)
+        .map_err(|e| DaemonError::Internal(format!("embed source {source_abs}: {e}")))?;
+    Ok(())
+}
+
+/// Atomically write every wiki record to disk, in parallel. Failures are
+/// logged (the DB row already exists; `memex lint` detects the gap).
+async fn write_wiki_files(wiki_dir: &Path, records: &[memex_core::search::IngestWikiPage]) {
+    let _ = tokio::fs::create_dir_all(wiki_dir).await;
+    let handles: Vec<_> = records
+        .iter()
+        .map(|page| {
+            let page_path = wiki_dir.join(format!("{}.md", page.slug));
+            let slug = page.slug.clone();
+            let fut = async_atomic_write(page_path, page.content.as_bytes().to_vec());
+            tokio::spawn(async move { (slug, fut.await) })
+        })
+        .collect();
+    for h in handles {
+        match h.await {
+            Ok((_, Ok(()))) => {}
+            Ok((slug, Err(e))) => {
+                tracing::warn!(slug = %slug, %e, "failed to write wiki page file");
+            }
+            Err(e) => tracing::warn!(?e, "wiki write task panicked"),
+        }
+    }
 }
 
 /// Given a parsed request, return the stream of events to emit, in order.
@@ -40,6 +416,7 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
             question,
             raw,
             top_k,
+            collections,
             memex_root,
         } => {
             if !SUPPORTED_VERSIONS.contains(&v) {
@@ -50,12 +427,14 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
             // Retrieval: dispatch to the retrieval actor. Shared by raw + synth.
             use crate::daemon::retrieval::{RetrievalError, RetrievalReq};
             let (tx, rx) = tokio::sync::oneshot::channel();
+            let collections = collections;
             let send_result = state
                 .retrieval
                 .send(RetrievalReq {
                     memex_root: memex_root.clone().into(),
                     question: question.clone(),
                     top_k,
+                    collections: collections.clone(),
                     expansion: None,
                     reply: tx,
                 })
@@ -84,42 +463,32 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
                 }
             };
 
-            if raw {
-                return vec![
-                    Event::Context {
-                        pages: retrieval_resp
-                            .pages
-                            .into_iter()
-                            .map(|p| serde_json::to_value(p).unwrap_or(serde_json::Value::Null))
-                            .collect(),
-                    },
-                    Event::Done { status: 0 },
-                ];
-            }
-
-            // Synthesis path. If the probe is weak, try expansion first.
+            // Expansion runs on weak-signal probes before either raw or
+            // synth returns, so both paths work from the same retrieval
+            // pipeline. Synth then composes an answer; raw returns the
+            // expanded context directly.
             use crate::daemon::context as ctx_fmt;
-            use crate::daemon::queue::{AgentJob, ExpandJob, SynthJob, WorkerError};
+            use crate::daemon::queue::{BackendJob, ExpandJob, SynthJob};
             use crate::daemon::retrieval::ExpansionTerms;
 
-            // Cache the initial pages/signal so fallback branches can reuse them.
+            // Cache the initial entries/signal so fallback branches can reuse them.
             let initial_signal = retrieval_resp.signal;
-            let initial_pages = retrieval_resp.pages;
+            let initial_entries = retrieval_resp.entries;
 
             let mut events_pre: Vec<Event> = Vec::new();
-            let pages_for_ctx = if matches!(initial_signal, memex_core::retrieval::Signal::Weak) {
-                // Enqueue ExpandJob. Fall back to initial pages on any error.
+            let entries_for_ctx = if matches!(initial_signal, memex_core::retrieval::Signal::Weak) {
+                // Enqueue ExpandJob. Fall back to initial entries on any error.
                 let (etx, erx) = tokio::sync::oneshot::channel();
                 let expand_sent = state
                     .jobs
-                    .submit(AgentJob::Expand(ExpandJob {
+                    .submit(BackendJob::Expand(ExpandJob {
                         question: question.clone(),
                         reply: etx,
                     }))
                     .await;
                 if expand_sent.is_err() {
                     tracing::warn!("expand queue closed; falling back to un-expanded retrieval");
-                    initial_pages
+                    initial_entries
                 } else {
                     match erx.await {
                         Ok(Ok(exp)) => {
@@ -137,6 +506,7 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
                                     memex_root: memex_root.into(),
                                     question: question.clone(),
                                     top_k,
+                                    collections: collections.clone(),
                                     expansion: Some(ExpansionTerms {
                                         lex: exp.lex,
                                         vec: exp.vec,
@@ -147,22 +517,22 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
                                 .await;
                             if send2.is_err() {
                                 tracing::warn!("retrieval actor closed during expansion retry");
-                                initial_pages
+                                initial_entries
                             } else {
                                 match rx2.await {
-                                    Ok(Ok(r)) => r.pages,
+                                    Ok(Ok(r)) => r.entries,
                                     Ok(Err(e)) => {
                                         tracing::warn!(
                                             ?e,
                                             "expanded retrieval failed; falling back"
                                         );
-                                        initial_pages
+                                        initial_entries
                                     }
                                     Err(_) => {
                                         tracing::warn!(
                                             "expanded retrieval actor dropped reply; falling back"
                                         );
-                                        initial_pages
+                                        initial_entries
                                     }
                                 }
                             }
@@ -172,21 +542,33 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
                                 ?e,
                                 "expand job failed; falling back to un-expanded retrieval"
                             );
-                            initial_pages
+                            initial_entries
                         }
                         Err(_) => {
                             tracing::warn!("expand worker dropped reply; falling back");
-                            initial_pages
+                            initial_entries
                         }
                     }
                 }
             } else {
-                initial_pages
+                initial_entries
             };
 
-            let context = ctx_fmt::format(&pages_for_ctx);
+            if raw {
+                let mut out = events_pre;
+                out.push(Event::Context {
+                    entries: entries_for_ctx
+                        .into_iter()
+                        .map(|e| serde_json::to_value(e).unwrap_or(serde_json::Value::Null))
+                        .collect(),
+                });
+                out.push(Event::Done { status: 0 });
+                return out;
+            }
+
+            let context = ctx_fmt::format(&entries_for_ctx);
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let job = AgentJob::Synth(SynthJob {
+            let job = BackendJob::Synth(SynthJob {
                 context,
                 question: question.clone(),
                 reply: reply_tx,
@@ -196,20 +578,7 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
             }
             let synth_reply = match reply_rx.await {
                 Ok(Ok(r)) => r,
-                Ok(Err(WorkerError::Crash(msg))) => {
-                    tracing::warn!(%msg, "worker subprocess crashed");
-                    return error_events(DaemonError::SubprocessCrashed);
-                }
-                Ok(Err(WorkerError::Timeout)) => {
-                    return error_events(DaemonError::SubprocessTimeout);
-                }
-                Ok(Err(WorkerError::AuthFailed(msg))) => {
-                    tracing::warn!(%msg, "agent auth failed");
-                    return error_events(DaemonError::AuthFailed);
-                }
-                Ok(Err(WorkerError::AgentError(msg))) => {
-                    return error_events(DaemonError::AgentUnavailable(msg));
-                }
+                Ok(Err(e)) => return error_events(e.into()),
                 Err(_) => {
                     return error_events(DaemonError::Internal("worker dropped reply".into()));
                 }
@@ -228,6 +597,7 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
             v,
             transcript_path,
             agent,
+            collections,
             memex_root,
         } => {
             if !SUPPORTED_VERSIONS.contains(&v) {
@@ -235,7 +605,7 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
                     supported: SUPPORTED_VERSIONS.to_vec(),
                 });
             }
-            handle_ingest(transcript_path, agent, memex_root, state).await
+            handle_ingest(transcript_path, agent, collections, memex_root, state).await
         }
 
         Request::Write {
@@ -252,7 +622,7 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
                     supported: SUPPORTED_VERSIONS.to_vec(),
                 });
             }
-            handle_write(title, content, tags, sources, force, memex_root).await
+            handle_write(title, content, tags, sources, force, memex_root, state).await
         }
 
         // Delete and LintFix — stubs
@@ -283,6 +653,7 @@ async fn handle_write(
     sources: Vec<String>,
     force: bool,
     memex_root: String,
+    state: &HandlerState,
 ) -> Vec<Event> {
     use std::path::PathBuf;
 
@@ -294,11 +665,9 @@ async fn handle_write(
     }
 
     let root_path = PathBuf::from(&memex_root);
-    let memex = match memex_core::Memex::open(root_path) {
+    let memex = match get_or_open_memex(&state.memex_cache, &root_path) {
         Ok(m) => m,
-        Err(e) => {
-            return error_events(DaemonError::Internal(format!("cannot open memex: {e}")));
-        }
+        Err(e) => return error_events(e),
     };
 
     let search = memex.search();
@@ -332,57 +701,51 @@ async fn handle_write(
     if let Err(e) = search.upsert_document(
         "wiki", &slug, &title, &hash, &docid, &tags_str, "", &now, &now,
     ) {
-        return error_events(DaemonError::Internal(format!("upsert_document failed: {e}")));
+        return error_events(DaemonError::Internal(format!(
+            "upsert_document failed: {e}"
+        )));
     }
 
     // Write markdown file
     let wiki_dir = memex.wiki_dir();
-    let _ = std::fs::create_dir_all(&wiki_dir);
+    let _ = tokio::fs::create_dir_all(&wiki_dir).await;
     let page_path = wiki_dir.join(format!("{slug}.md"));
-    if let Err(e) = std::fs::write(&page_path, &content) {
-        return error_events(DaemonError::Internal(format!("write file failed: {e}")));
+    if let Err(e) = async_atomic_write(page_path, content.as_bytes().to_vec()).await {
+        return error_events(e);
     }
 
     // Embed wiki page + sources. Load model once for all.
-    if let Some(ref mut model) = memex_core::retrieval::load_default_model() {
-        memex_core::retrieval::embed_document(search, &hash, &content, model);
+    let mut model = match memex_core::retrieval::load_default_model() {
+        Ok(m) => m,
+        Err(e) => {
+            return error_events(DaemonError::Internal(format!("{e}")));
+        }
+    };
+    if let Err(e) = memex_core::retrieval::embed_document(search, &hash, &content, &mut model) {
+        return error_events(DaemonError::Internal(format!("embed wiki page: {e}")));
+    }
 
-        for source_path_str in &sources {
-            let source_path = std::path::PathBuf::from(source_path_str);
-            if !source_path.exists() {
-                eprintln!("warning: source not found: {source_path_str} (skipping)");
-                continue;
-            }
-            if let Ok(source_path) = std::fs::canonicalize(&source_path)
-                && let Ok(source_content) = std::fs::read_to_string(&source_path)
-            {
-                let source_abs = source_path.to_string_lossy().to_string();
-                let source_title = source_path.file_stem().unwrap_or_default().to_string_lossy().to_string();
-                let source_summary = memex_core::index::extract_summary(&source_content, 120);
-                let source_hash = search.insert_content(&source_content).unwrap_or_default();
-                let source_docid = memex_core::docid::allocate_docid(&source_hash, "source", &source_abs, &[]);
-                let _ = search.upsert_document("source", &source_abs, &source_title, &source_hash, &source_docid, "", &source_summary, &now, &now);
-                memex_core::retrieval::embed_document(search, &source_hash, &source_content, model);
-            }
+    for source_path_str in &sources {
+        if let Err(e) =
+            store_additional_source(search, &mut model, source_path_str, &now).await
+        {
+            return error_events(e);
         }
     }
 
-    vec![
-        Event::Written { slug, docid },
-        Event::Done { status: 0 },
-    ]
+    vec![Event::Written { slug, docid }, Event::Done { status: 0 }]
 }
 
-/// Handle an ingest request: validate, dedup, parse, filter, dispatch to worker,
-/// dedup search, optional merge, validate output, store atomically.
-/// Implements spec sections 3.1-3.9.
+/// Handle an ingest request: validate, dedup, parse, filter, dispatch to
+/// worker, dedup search, optional merge, validate output, store atomically.
 async fn handle_ingest(
     transcript_path: String,
     agent: String,
+    collections: Vec<String>,
     memex_root: String,
     state: &HandlerState,
 ) -> Vec<Event> {
-    use crate::daemon::queue::{AgentJob, IngestJob, MergeJob, MergePair, WorkerError};
+    use crate::daemon::queue::{BackendJob, IngestJob, MergeJob};
     use memex_core::transcript::SessionFilter;
     use std::hash::{Hash, Hasher};
     use std::path::PathBuf;
@@ -390,8 +753,8 @@ async fn handle_ingest(
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     transcript_path.hash(&mut hasher);
     let job_id = format!("ingest-{:x}", hasher.finish());
+    let t0 = std::time::Instant::now();
 
-    // 3.1 Path validation: must be absolute
     let path = PathBuf::from(&transcript_path);
     if !path.is_absolute() {
         return error_events(DaemonError::BadRequest(
@@ -399,55 +762,32 @@ async fn handle_ingest(
         ));
     }
 
-    // 3.1 Read file for dedup + parsing (cap at 50MB to prevent OOM)
-    const MAX_TRANSCRIPT_BYTES: usize = 50 * 1024 * 1024;
-    let raw_content = match std::fs::read_to_string(&path) {
+    const MAX_TRANSCRIPT_BYTES: u64 = 50 * 1024 * 1024;
+    let raw_content = match read_file_capped(&path, MAX_TRANSCRIPT_BYTES).await {
         Ok(c) => c,
-        Err(e) => {
-            return error_events(DaemonError::BadRequest(format!(
-                "cannot read transcript: {e}"
-            )));
-        }
+        Err(e) => return error_events(e),
     };
-    if raw_content.len() > MAX_TRANSCRIPT_BYTES {
-        return error_events(DaemonError::BadRequest(format!(
-            "transcript too large: {} bytes (max {})",
-            raw_content.len(),
-            MAX_TRANSCRIPT_BYTES
-        )));
-    }
 
-    // Open memex once, used for dedup + job queue + storage
-    let content_hash = memex_core::storage::content_hash(raw_content.as_bytes());
+    // Open memex via the per-root handle cache. Re-opening per-request races
+    // on schema-init DDL under concurrent ingest.
     let root_path = PathBuf::from(&memex_root);
-    let memex = match memex_core::Memex::open(root_path) {
+    let memex = match get_or_open_memex(&state.memex_cache, &root_path) {
         Ok(m) => m,
-        Err(e) => {
-            return error_events(DaemonError::Internal(format!("cannot open memex: {e}")));
-        }
+        Err(e) => return error_events(e),
     };
     let search = memex.search();
+    let effective_collections = memex_core::search::normalize_collections(&collections);
 
-    // 3.1 Content-hash dedup
-    if search.content_exists(&content_hash).unwrap_or(false) {
-        return vec![Event::Done { status: 0 }]; // already ingested
-    }
-
-    // 3.2 Parse and clean
     let transcript = match agent.as_str() {
-        "claude-code" => {
-            memex_core::transcript::parse_claude_code_session(std::io::BufReader::new(
-                raw_content.as_bytes(),
-            ))
-        }
+        "claude-code" => memex_core::transcript::parse_claude_code_session(
+            std::io::BufReader::new(raw_content.as_bytes()),
+        ),
         "codex" => memex_core::transcript::parse_codex_session(std::io::BufReader::new(
             raw_content.as_bytes(),
         )),
         "gemini-cli" => memex_core::transcript::parse_gemini_cli_session(&raw_content),
         _ => {
-            return error_events(DaemonError::BadRequest(format!(
-                "unknown agent: {agent}"
-            )));
+            return error_events(DaemonError::BadRequest(format!("unknown agent: {agent}")));
         }
     };
 
@@ -458,7 +798,6 @@ async fn handle_ingest(
         }
     };
 
-    // 3.3 Filter
     match transcript.filter {
         SessionFilter::Pass => {} // continue
         SessionFilter::NonSubstantive | SessionFilter::InternalSession => {
@@ -466,10 +805,33 @@ async fn handle_ingest(
         }
     }
 
-    // 3.4 Durable job queue: persist before LLM dispatch.
+    // Structured turns are the sole transcript source of truth.
+    if transcript.turns.is_empty() {
+        return vec![Event::Done { status: 0 }];
+    }
+    let canonical_transcript = memex_core::transcript::render_turns(&transcript.turns);
+
+    // Hash the cleaned text — that's what `store_ingest_batch` writes to the
+    // content table. Hashing `raw_content` instead would never match any
+    // stored row, so dedup always missed and every re-ingest paid full LLM
+    // cost.
+    let content_hash = memex_core::storage::content_hash(canonical_transcript.as_bytes());
+    if search.content_exists(&content_hash).unwrap_or(false) {
+        return vec![Event::Done { status: 0 }]; // already ingested
+    }
+
+    // Persist the job before LLM dispatch so a crash doesn't lose it;
     // INSERT OR IGNORE dedupes concurrent ingests of the same transcript.
-    if let Err(e) = search.insert_ingest_job(&job_id, &transcript_path, &content_hash, &agent, &memex_root) {
-        return error_events(DaemonError::Internal(format!("insert_ingest_job failed: {e}")));
+    if let Err(e) = search.insert_ingest_job(
+        &job_id,
+        &transcript_path,
+        &content_hash,
+        &agent,
+        &memex_root,
+    ) {
+        return error_events(DaemonError::Internal(format!(
+            "insert_ingest_job failed: {e}"
+        )));
     }
 
     // Emit progress
@@ -478,44 +840,23 @@ async fn handle_ingest(
         transcript_path: transcript_path.clone(),
     }];
 
-    // 3.5 Dispatch Extract job to worker pool
     events.push(Event::Distilling {
         job_id: job_id.clone(),
         transcript_path: transcript_path.clone(),
     });
 
-    let (extract_tx, extract_rx) = tokio::sync::oneshot::channel();
-    let extract_job = AgentJob::Ingest(IngestJob {
-        transcript: transcript.cleaned_text.clone(),
-        reply: extract_tx,
-    });
-
-    if state.jobs.submit(extract_job).await.is_err() {
-        let _ = search.update_ingest_job_status(&job_id, "failed", Some("worker queue closed"));
-        return error_events(DaemonError::Internal("worker queue closed".into()));
-    }
-
-    let extracted = match extract_rx.await {
-        Ok(Ok(reply)) => reply,
-        Ok(Err(WorkerError::Crash(_))) => {
-            let _ = search.update_ingest_job_status(&job_id, "failed", Some("subprocess crashed"));
-            return error_events(DaemonError::SubprocessCrashed);
-        }
-        Ok(Err(WorkerError::Timeout)) => {
-            let _ = search.update_ingest_job_status(&job_id, "failed", Some("subprocess timeout"));
-            return error_events(DaemonError::SubprocessTimeout);
-        }
-        Ok(Err(WorkerError::AuthFailed(_))) => {
-            let _ = search.update_ingest_job_status(&job_id, "failed", Some("auth failed"));
-            return error_events(DaemonError::AuthFailed);
-        }
-        Ok(Err(WorkerError::AgentError(msg))) => {
-            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&msg));
-            return error_events(DaemonError::AgentUnavailable(msg));
-        }
-        Err(_) => {
-            let _ = search.update_ingest_job_status(&job_id, "failed", Some("worker dropped reply"));
-            return error_events(DaemonError::Internal("worker dropped reply".into()));
+    let extracted = match run_worker_job(state, |reply| {
+        BackendJob::Ingest(IngestJob {
+            turns: transcript.turns.clone(),
+            reply,
+        })
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
+            return error_events(e);
         }
     };
 
@@ -525,140 +866,102 @@ async fn handle_ingest(
         return events;
     }
 
-    // 3.8 Validate LLM output
-    let mut valid_pages = Vec::new();
-    for page in extracted.pages.into_iter().take(10) {
-        if page.slug.is_empty() || page.title.is_empty() || page.body.is_empty() {
-            continue;
-        }
-        let slug = crate::slugify(&page.slug);
-        if slug.is_empty() {
-            continue;
-        }
-        valid_pages.push(crate::daemon::queue::ExtractedPage {
-            slug,
-            title: page.title,
-            tags: page.tags,
-            body: memex_core::transcript::truncate(&page.body, 20_000),
-        });
-    }
+    let valid_pages = validate_extracted_pages(extracted.pages);
 
     let _ = search.update_ingest_job_status(&job_id, "processing", None);
 
-    // 3.6 Dedup search: for each proposed page, check if a wiki page with
-    // overlapping topic already exists. Title-only BM25 + vector reranking.
-    let mut model = memex_core::retrieval::load_default_model();
-    let mut new_pages = Vec::new();
-    let mut merge_pairs = Vec::new();
+    // Serialize dedup-read → MERGE → write for this batch's slugs.
+    // Locks the EXTRACT-proposed slugs; if dedup later routes to a
+    // different existing slug (title-similarity match with a different
+    // slug), that edge case still races. Covers the common same-person
+    // slug stability case that caused >half of john.md's sources to be
+    // silently dropped on LoCoMo conv6.
+    let lock_slugs: Vec<String> = valid_pages.iter().map(|p| p.slug.clone()).collect();
+    let _slug_guards = acquire_slug_locks(state, &memex_root, lock_slugs).await;
 
-    for page in &valid_pages {
-        let existing_slug = memex_core::retrieval::search_wiki_by_title(search, &page.title, model.as_mut());
-        tracing::info!(title = %page.title, result = ?existing_slug, "dedup search");
-        match existing_slug {
-            Some(slug) => {
-                let wiki_dir = memex.wiki_dir();
-                let existing_path = wiki_dir.join(format!("{slug}.md"));
-                tracing::info!(slug = %slug, path = %existing_path.display(), "reading existing page for merge");
-                if let Ok(existing_content) = std::fs::read_to_string(&existing_path) {
-                    merge_pairs.push(MergePair {
-                        slug,
-                        proposed: page.body.clone(),
-                        existing: existing_content,
-                    });
-                } else {
-                    new_pages.push(page.clone());
-                }
-            }
-            None => {
-                new_pages.push(page.clone());
-            }
+    // Dedup: title-BM25 + vector rerank to decide new-page vs merge-with-existing.
+    let mut model = match memex_core::retrieval::load_default_model() {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
+            return error_events(DaemonError::Internal(format!("{e}")));
         }
-    }
+    };
+    let wiki_dir = memex.wiki_dir();
+    let (mut new_pages, merge_pairs) =
+        match dedup_against_existing(search, &wiki_dir, &valid_pages, &mut model).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
+                return error_events(e);
+            }
+        };
 
-    // 3.7 Merge: dispatch MergeJob if there are pages to merge
-    tracing::info!(new = new_pages.len(), merge = merge_pairs.len(), "dedup search complete");
+    tracing::info!(
+        new = new_pages.len(),
+        merge = merge_pairs.len(),
+        "dedup search complete"
+    );
     let mut merged_pages = Vec::new();
     if !merge_pairs.is_empty() {
-        let (merge_tx, merge_rx) = tokio::sync::oneshot::channel();
-        let merge_job = AgentJob::Merge(MergeJob {
-            pages: merge_pairs.clone(),
-            reply: merge_tx,
-        });
-        if state.jobs.submit(merge_job).await.is_ok() {
-            match merge_rx.await {
-                Ok(Ok(reply)) => {
-                    // Force merged pages to use the existing slugs, not whatever
-                    // the LLM returned. The merge should update the existing page.
-                    for (i, pair) in merge_pairs.iter().enumerate() {
-                        if let Some(page) = reply.merged_pages.get(i) {
-                            merged_pages.push(crate::daemon::queue::ExtractedPage {
-                                slug: pair.slug.clone(),
-                                title: page.title.clone(),
-                                tags: page.tags.clone(),
-                                body: page.body.clone(),
-                            });
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(?e, "merge job failed; storing proposed pages as new");
-                    // Fallback: store proposed content as new pages
-                    for pair in &merge_pairs {
-                        new_pages.push(crate::daemon::queue::ExtractedPage {
+        let merge_result = run_worker_job(state, |reply| {
+            BackendJob::Merge(MergeJob {
+                pages: merge_pairs.clone(),
+                reply,
+            })
+        })
+        .await;
+        match merge_result {
+            Ok(reply) => {
+                // Force merged pages to use the existing slugs, not whatever
+                // the LLM returned. The merge should update the existing page.
+                for (i, pair) in merge_pairs.iter().enumerate() {
+                    if let Some(page) = reply.merged_pages.get(i) {
+                        merged_pages.push(crate::daemon::queue::ExtractedPage {
                             slug: pair.slug.clone(),
-                            title: pair.slug.replace('-', " "),
-                            tags: vec![],
-                            body: pair.proposed.clone(),
+                            title: page.title.clone(),
+                            tags: page.tags.clone(),
+                            body: page.body.clone(),
                         });
                     }
                 }
-                Err(_) => {
-                    tracing::warn!("merge worker dropped reply; storing proposed pages as new");
-                    for pair in &merge_pairs {
-                        new_pages.push(crate::daemon::queue::ExtractedPage {
-                            slug: pair.slug.clone(),
-                            title: pair.slug.replace('-', " "),
-                            tags: vec![],
-                            body: pair.proposed.clone(),
-                        });
-                    }
+            }
+            Err(e) => {
+                tracing::warn!(%e, "merge job failed; storing proposed pages as new");
+                for pair in &merge_pairs {
+                    new_pages.push(crate::daemon::queue::ExtractedPage {
+                        slug: pair.slug.clone(),
+                        title: pair.slug.replace('-', " "),
+                        tags: vec![],
+                        body: pair.proposed.clone(),
+                    });
                 }
             }
         }
     }
 
-    // 3.9 Store source + wiki pages in a single DB transaction, then write
-    // files to disk. File writes are after COMMIT because they can't be
-    // rolled back. If a file write fails, DB row exists but file is missing,
-    // which `memex lint` detects.
-    let now = memex_core::search::now_rfc3339();
+    let now_dt = chrono::Utc::now();
+    let now = now_dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let title = memex_core::transcript::truncate(&transcript.first_user_message, 80);
-    let summary = memex_core::index::extract_summary(&transcript.cleaned_text, 120);
+    let summary = memex_core::index::extract_summary(&canonical_transcript, 120);
 
     let all_pages: Vec<_> = new_pages.iter().chain(merged_pages.iter()).collect();
-    let wiki_pages: Vec<(String, String, String, String)> = all_pages
-        .iter()
-        .map(|page| {
-            let safe_title = page.title.replace('\n', " ").replace('\r', "");
-            let content = format!(
-                "---\ntitle: \"{}\"\nsummary: \"\"\ntags: [{}]\ncreated_at: {}\nupdated_at: {}\nsources: [{}]\n---\n\n{}",
-                safe_title.replace('"', "\\\""),
-                page.tags.iter().map(|t| {
-                    let safe_tag = t.replace('\\', "\\\\").replace('"', "\\\"");
-                    format!("\"{safe_tag}\"")
-                }).collect::<Vec<_>>().join(", "),
-                &now, &now, &transcript_path, page.body
-            );
-            (page.slug.clone(), page.title.clone(), content, page.tags.join(","))
-        })
-        .collect();
+    let wiki_pages = build_wiki_records(
+        &all_pages,
+        &wiki_dir,
+        &transcript_path,
+        &effective_collections,
+        now_dt,
+    )
+    .await;
 
-    let (cleaned_hash, source_docid, wiki_page_slugs) = match search.store_ingest_batch(
-        &transcript.cleaned_text,
+    let batch_result = match search.store_ingest_batch(
+        &canonical_transcript,
         &transcript_path,
         &title,
         &summary,
         &wiki_pages,
+        &effective_collections,
         &now,
     ) {
         Ok(r) => r,
@@ -668,39 +971,73 @@ async fn handle_ingest(
         }
     };
 
-    // Write wiki files to disk (after DB commit).
-    let wiki_dir = memex.wiki_dir();
-    let _ = std::fs::create_dir_all(&wiki_dir);
-    for (slug, _title, content, _tags) in &wiki_pages {
-        let page_path = wiki_dir.join(format!("{slug}.md"));
-        if let Err(e) = std::fs::write(&page_path, content) {
-            tracing::warn!(slug = %slug, ?e, "failed to write wiki page file");
-        }
-    }
+    // File writes run after DB commit because they can't be rolled back;
+    // lint detects any DB row without its file.
+    write_wiki_files(&wiki_dir, &wiki_pages).await;
 
-    // Embed source + wiki pages. Reuse the model loaded for dedup.
-    if let Some(ref mut m) = model {
-        memex_core::retrieval::embed_document(search, &cleaned_hash, &transcript.cleaned_text, m);
-        for (slug, _title, content, _tags) in &wiki_pages {
-            let page_hash = memex_core::storage::content_hash(content.as_bytes());
-            memex_core::retrieval::embed_document(search, &page_hash, content, m);
-            tracing::debug!(slug = %slug, "embedded wiki page");
-        }
+    if let Err(e) = embed_ingested(
+        search,
+        &batch_result,
+        &canonical_transcript,
+        &wiki_pages,
+        &mut model,
+    ) {
+        let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
+        return error_events(e);
     }
 
     let _ = search.update_ingest_job_status(&job_id, "completed", None);
 
+    tracing::info!(
+        job_id = %job_id,
+        transcript = %transcript_path,
+        new = new_pages.len(),
+        merged = merged_pages.len(),
+        elapsed_ms = t0.elapsed().as_millis() as u64,
+        "ingest job completed"
+    );
+
     events.push(Event::Stored {
         job_id,
-        source_docid: source_docid.clone(),
-        wiki_pages: wiki_page_slugs,
+        source_docid: batch_result.source_docid,
+        wiki_pages: batch_result.wiki_hashes.into_iter().map(|(s, _)| s).collect(),
     });
     events.push(Event::Done { status: 0 });
     events
 }
 
+/// Heuristic: does this slug violate the one-subject rule?
+/// Catches date-bearing and episode-word slugs — generic structural patterns,
+/// not content-specific. Multi-subject detection is left to the EXTRACT prompt.
+fn is_bad_slug(slug: &str) -> bool {
+    // Year segment: *-2023, *-2023-08
+    let has_year = slug
+        .split('-')
+        .any(|seg| seg.len() == 4 && seg.chars().all(|c| c.is_ascii_digit()));
+    if has_year {
+        return true;
+    }
+    // Month names as segments.
+    const MONTHS: &[&str] = &[
+        "january", "february", "march", "april", "may", "june",
+        "july", "august", "september", "october", "november", "december",
+    ];
+    if slug.split('-').any(|seg| MONTHS.contains(&seg)) {
+        return true;
+    }
+    // Episode markers — unambiguously indicate an episode slug rather
+    // than a subject slug. Keep narrow; content-specific terms
+    // ("roadtrip", "wedding", etc.) belong in the prompt, not here.
+    const EPISODE: &[&str] = &["conversation", "session", "episode"];
+    if slug.split('-').any(|seg| EPISODE.contains(&seg)) {
+        return true;
+    }
+    false
+}
+
 fn error_events(err: DaemonError) -> Vec<Event> {
     let status = err.exit_code();
+    tracing::error!(code = err.code_str(), status, message = %err.message(), "handler error");
     vec![
         Event::Error {
             code: err.code_str().to_string(),
@@ -722,6 +1059,8 @@ mod tests {
             started_at: Utc::now(),
             retrieval: r_tx,
             jobs: Arc::new(crate::daemon::worker::WorkerPool::new_inert_for_test()),
+            memex_cache: MemexCache::new(),
+            slug_locks: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -752,6 +1091,8 @@ mod tests {
             started_at: Utc::now(),
             retrieval: tx,
             jobs: Arc::new(crate::daemon::worker::WorkerPool::new_inert_for_test()),
+            memex_cache: MemexCache::new(),
+            slug_locks: Arc::new(StdMutex::new(HashMap::new())),
         };
         let events = handle(
             Request::Query {
@@ -759,6 +1100,7 @@ mod tests {
                 question: "q".into(),
                 raw: true,
                 top_k: 5,
+                collections: vec![],
                 memex_root: "/x".into(),
             },
             &state,

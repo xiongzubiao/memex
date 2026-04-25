@@ -1,6 +1,6 @@
 //! PID file helpers. Used for observability (`memex daemon status`) and
 //! `memex daemon stop` to find the daemon process. Not authoritative for
-//! liveness — the flock at `~/.memex/daemon.lock` is.
+//! liveness — the flock at `${MEMEX_ROOT}/daemon.lock` is.
 
 use anyhow::{Context, Result};
 use std::fs;

@@ -16,9 +16,22 @@ fn content_exists_and_source_count() {
     assert!(search.content_exists(&stored_hash).unwrap());
 
     let existing: Vec<String> = search.existing_docids().unwrap().into_iter().collect();
-    let docid = memex_core::docid::allocate_docid(&stored_hash, "source", "/tmp/test.jsonl", &existing);
+    let docid =
+        memex_core::docid::allocate_docid(&stored_hash, "source", "/tmp/test.jsonl", &existing);
     let now = chrono::Utc::now().to_rfc3339();
-    search.upsert_document("source", "/tmp/test.jsonl", "test", &stored_hash, &docid, "", "", &now, &now).unwrap();
+    search
+        .upsert_document(
+            "source",
+            "/tmp/test.jsonl",
+            "test",
+            &stored_hash,
+            &docid,
+            "",
+            "",
+            &now,
+            &now,
+        )
+        .unwrap();
 
     assert_eq!(search.source_count().unwrap(), 1);
 }

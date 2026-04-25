@@ -22,6 +22,10 @@ citations.
 For raw retrieval without synthesis (no LLM call):
 - `memex query --raw "<question>"` — returns ranked pages with metadata
 
+Collection-scoped retrieval:
+- `memex query "<question>" --collection team-a --collection incidents`
+- With no `--collection`, query defaults to the `default` collection.
+
 ## Common Mistakes
 
 - Running `memex search` instead of `memex query` — `search` is for title lookup, `query` does full retrieval + synthesis

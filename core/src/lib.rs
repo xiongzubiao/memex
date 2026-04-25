@@ -11,8 +11,8 @@ pub mod retrieval;
 pub mod schema;
 pub mod search;
 pub mod storage;
-pub mod types;
 pub mod transcript;
+pub mod types;
 pub mod validate;
 pub mod vector;
 

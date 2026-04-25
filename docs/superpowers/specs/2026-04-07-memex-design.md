@@ -57,7 +57,7 @@ graph TD
 | Concept | Implementation |
 |---|---|
 | Wiki | `~/.memex/wiki/*.md` with YAML frontmatter (Section 1) |
-| Source | Original content in `source` collection, SQLite only (Section 1) |
+| Source | Original content in `source` doc_type, SQLite only (Section 1) |
 | Skills | query, ingest, brainstorm, distill, backfill — cross-platform SKILL.md (Section 3) |
 | Storage | Content-addressable SQLite following QMD (Section 5) |
 | Search | BM25 + vector, typed queries (lex/vec/hyde), RRF fusion (Section 6) |
@@ -72,8 +72,8 @@ Wiki pages and original sources serve different purposes:
 
 | Layer | Purpose | Collection |
 |---|---|---|
-| Wiki page | Structured knowledge, cross-links, synthesis | `wiki` collection (also on disk as `~/.memex/wiki/*.md`) |
-| Original source | Full detail, exact terms, verification | `source` collection (SQLite only) |
+| Wiki page | Structured knowledge, cross-links, synthesis | `wiki` doc_type (also on disk as `~/.memex/wiki/*.md`) |
+| Original source | Full detail, exact terms, verification | `source` doc_type (SQLite only) |
 
 Wiki pages are markdown files with YAML frontmatter in `~/.memex/wiki/`.
 
@@ -160,9 +160,9 @@ If no conflict (or `--force`):
 5. **Store content + embed + update documents** — follows the mutation ordering invariant:
    1. Hash complete .md file (frontmatter + body), `INSERT OR IGNORE` into `content` table.
    2. Chunk and embed new content hash into `chunks` + `chunks_vec`.
-   3. Insert/update `documents` row (collection=`wiki`, with tags, summary, `created_at` and `updated_at` from the new page's frontmatter). The agent is responsible for setting appropriate timestamps when drafting page content.
+   3. Insert/update `documents` row (doc_type=`wiki`, with tags, summary, `created_at` and `updated_at` from the new page's frontmatter). The agent is responsible for setting appropriate timestamps when drafting page content.
    4. Orphan-clean old hash if overwriting.
-6. **Store sources** — if `--source` provided, same mutation ordering: hash source content → `INSERT OR IGNORE` into `content` → embed → upsert `documents` (collection=`source`) → orphan-clean old hash. Source `created_at` set on first insert, `updated_at` set to current time.
+6. **Store sources** — if `--source` provided, same mutation ordering: hash source content → `INSERT OR IGNORE` into `content` → embed → upsert `documents` (doc_type=`source`) → orphan-clean old hash. Source `created_at` set on first insert, `updated_at` set to current time.
 
 Output (success):
 ```
@@ -234,7 +234,7 @@ updated_at: 2026-04-10T14:30:00Z
 Summary of API design notes covering [[rest-patterns]] and error-handling.
 ```
 
-Header line: `=== docid collection stem ===` (space-separated). Followed by the full .md content (frontmatter + body). The `updated_at` timestamp is in the frontmatter, not duplicated in the header.
+Header line: `=== docid doc_type stem ===` (space-separated). Followed by the full .md content (frontmatter + body). The `updated_at` timestamp is in the frontmatter, not duplicated in the header.
 
 Source documents are also readable by docid. The agent can read any document (wiki or source) returned by search.
 
@@ -243,7 +243,7 @@ Source documents are also readable by docid. The agent can read any document (wi
 2. **Filename stem**: match input against `documents.path`. For wiki docs: input `rest-patterns` matches path `wiki/rest-patterns.md` (strip directory prefix and `.md` extension). For source docs: match against the basename without extension (e.g., input `article` matches path `/path/to/article.md`). If no stem match, try exact path match.
 3. **Title**: case-insensitive match against `documents.title`
 
-First match wins across tiers. If multiple documents match within a tier (e.g., duplicate titles), return all matches for `read`, error for `delete` (must resolve to exactly one wiki document). `delete` only accepts wiki collection documents; attempting to delete a source document is an error.
+First match wins across tiers. If multiple documents match within a tier (e.g., duplicate titles), return all matches for `read`, error for `delete` (must resolve to exactly one wiki document). `delete` only accepts wiki doc_type documents; attempting to delete a source document is an error.
 
 ### `memex search <query> [--lex <term> ...] [--vec <term> ...] [--hyde <term> ...]`
 
@@ -294,7 +294,7 @@ e4f1a2b3  source  0.333  /path/to/article  Original REST API specification from.
 ```
 
 - Probe includes `signal: strong` / `signal: weak` first line; expansion does not
-- Each result line: docid + collection + post-fusion score + filename stem (wiki) or path (source) + best chunk snippet (tab-separated)
+- Each result line: docid + doc_type + post-fusion score + filename stem (wiki) or path (source) + best chunk snippet (tab-separated)
 - Scores are `1/rank` (rank 1 = 1.0, rank 2 = 0.5, rank 3 = 0.33) — ordinal position, not calibrated similarity
 
 **Two-call pattern**:
@@ -388,7 +388,7 @@ graph TD
 - `<agent>` specifies which agent's session location to scan (e.g., `claude-code`, `codex`, `gemini`)
 - `--path` processes a single file directly (used by the SessionEnd hook)
 - `--quiet` suppresses progress messages (default: human-readable with progress). Per-file `imported: <docid>\t<path>` lines always print for hook consumption.
-- **Deduplication**: skips already-ingested sessions by tracking original file path (`UNIQUE(collection, path)`)
+- **Deduplication**: skips already-ingested sessions by tracking original file path (`UNIQUE(doc_type, path)`)
 - **Distillation session filtering**: skips sessions whose first user message starts with `/memex-distill`
 - **Format version detection**: checks format markers (Claude Code `version` field, Codex `cli_version`), warns on unknown versions
 - **Secret redaction**: scans tool input summaries for common secret patterns (API keys, tokens, passwords), replaces with `[REDACTED]`
@@ -476,7 +476,7 @@ graph TD
     Lint --> Report["7. Agent reports: pages created, lint findings"]
 ```
 
-Pre-write check (step 5): agent uses signal, collection, and stem from search output to judge similarity. Source hits are ignored for duplicate detection. Numeric scores are ordinal (`1/rank`), not calibrated similarity — don't threshold on them.
+Pre-write check (step 5): agent uses signal, doc_type, and stem from search output to judge similarity. Source hits are ignored for duplicate detection. Numeric scores are ordinal (`1/rank`), not calibrated similarity — don't threshold on them.
 
 ### `memex-brainstorm` — Multi-LLM brainstorming via cross-CLI calls
 
@@ -595,7 +595,7 @@ erDiagram
 
     documents {
         int id PK
-        text collection
+        text doc_type
         text path
         text title
         text hash FK
@@ -639,12 +639,12 @@ CREATE TABLE IF NOT EXISTS content (
 
 ### Documents table
 
-Maps filesystem paths and collections to content hashes. A document is a wiki page or a source.
+Maps filesystem paths and doc_types to content hashes. A document is a wiki page or a source.
 
 ```sql
 CREATE TABLE IF NOT EXISTS documents (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    collection  TEXT NOT NULL,             -- 'wiki' or 'source'
+    doc_type    TEXT NOT NULL,             -- 'wiki' or 'source'
     path        TEXT NOT NULL,             -- filesystem path (wiki: relative, source: absolute local path)
     title       TEXT NOT NULL,             -- extracted from frontmatter (wiki) or filename (source)
     hash        TEXT NOT NULL REFERENCES content(hash),
@@ -654,19 +654,19 @@ CREATE TABLE IF NOT EXISTS documents (
     created_at  TEXT NOT NULL,              -- ISO 8601 timestamp
     updated_at  TEXT NOT NULL,             -- ISO 8601 timestamp
     distilled_at TEXT,                     -- NULL = not yet distilled, ISO 8601 = when distilled
-    UNIQUE(collection, path)
+    UNIQUE(doc_type, path)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_docid ON documents(docid) WHERE docid != '';
 ```
 
-**`path` for sources:** The `UNIQUE(collection, path)` constraint means the absolute local path serves as the dedup key. `memex import` stores the original transcript path (e.g., `~/.claude/projects/myproject/sessions/abc123.jsonl`), so re-running skips already-ingested files.
+**`path` for sources:** The `UNIQUE(doc_type, path)` constraint means the absolute local path serves as the dedup key. `memex import` stores the original transcript path (e.g., `~/.claude/projects/myproject/sessions/abc123.jsonl`), so re-running skips already-ingested files.
 
-**`distilled_at`:** NULL on ingest, set to ISO 8601 timestamp when `/memex-distill` completes. `memex source list --undistilled` queries `WHERE collection = 'source' AND distilled_at IS NULL`.
+**`distilled_at`:** NULL on ingest, set to ISO 8601 timestamp when `/memex-distill` completes. `memex source list --undistilled` queries `WHERE doc_type = 'source' AND distilled_at IS NULL`.
 
 ### FTS5 virtual table
 
-Single FTS5 table indexing all documents. Searched with collection-filtered queries.
+Single FTS5 table indexing all documents. Searched with doc_type-filtered queries.
 
 ```sql
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
@@ -765,7 +765,7 @@ This ordering ensures: FTS triggers have access to content during step 3 (old + 
 Short identifier for each document. Every document (wiki and source) gets a docid.
 
 - **Primary**: first 6 characters of the content hash. Extend to 7, 8, ... if another document already has that prefix.
-- **Fallback**: if two documents have identical content (same full hash, different paths), the content-hash prefix can never disambiguate. In this case, hash `collection + path` and use a 6+ char prefix of that instead. This is rare (duplicate content across different paths).
+- **Fallback**: if two documents have identical content (same full hash, different paths), the content-hash prefix can never disambiguate. In this case, hash `doc_type + path` and use a 6+ char prefix of that instead. This is rare (duplicate content across different paths).
 - Most documents get 6-char content-hash docids (16.7M possibilities, collisions unlikely below ~5,000 documents)
 - **Stability**: content-hash docids change when content is edited. Path-hash fallback docids are stable only while the duplicate-content condition persists; if a document is later edited so its content hash becomes unique, the docid reverts to content-hash-based on next recompute. In all cases, docids should be treated as short-lived lookup handles, not permanent identifiers. Agents should use filename stems in citations and cross-references. Wiki links (`[[page-stem]]`) are filename-based for this reason.
 - Stored in `documents` table with unique index for O(1) lookup
@@ -798,7 +798,7 @@ graph TD
         Signal{"Signal detection<br/>(wiki BM25 probe only,<br/>skipped if expansions present)"}
     end
 
-    Out["Output: signal · docid · collection · score · stem · chunk snippet"]
+    Out["Output: signal · docid · doc_type · score · stem · chunk snippet"]
 
     Q --> BM25
     Q --> Vec
@@ -838,10 +838,10 @@ where $r_i(d)$ is the **1-based rank** of document $d$ in list $i$ (rank 1 = top
 | Parameter | Value | Notes |
 |---|---|---|
 | $k$ | 60 | Smoothing constant |
-| $w_i$ | 2.0 for wiki BM25 lists, 1.0 for all others | By collection, not by position (see below) |
+| $w_i$ | 2.0 for wiki BM25 lists, 1.0 for all others | By doc_type, not by position (see below) |
 | $\text{bonus}$ | +0.05 if $r = 1$, +0.02 if $r \in \{2, 3\}$ | Top-rank bonus |
 
-**List weighting**: wiki BM25 lists (from primary query and each `--lex` term) get weight 2.0. Source BM25 lists and all vector lists get weight 1.0. This is **collection-based**, not positional — unlike QMD which weights the first 2 lists by position. Memex uses collection-based weighting because `--lex` expansion creates variable numbers of BM25 lists; positional weighting would incorrectly over-weight whichever list happens to be second.
+**List weighting**: wiki BM25 lists (from primary query and each `--lex` term) get weight 2.0. Source BM25 lists and all vector lists get weight 1.0. This is **doc_type-based**, not positional — unlike QMD which weights the first 2 lists by position. Memex uses doc_type-based weighting because `--lex` expansion creates variable numbers of BM25 lists; positional weighting would incorrectly over-weight whichever list happens to be second.
 
 Post-fusion scores reassigned as $s(d) = 1 / r$ where $r$ is the final rank (rank 1 = 1.0, rank 2 = 0.5, rank 3 = 0.33). No minScore filtering (QMD's `hybridQuery` default is 0).
 
@@ -877,7 +877,7 @@ Runs on the **initial BM25 probe only** (normalized BM25 scores before RRF fusio
 
 $$\text{strong} \iff s_1 \geq 0.85 \;\wedge\; (s_1 - s_2) \geq 0.15$$
 
-where $s_1$ and $s_2$ are the top two **normalized BM25 scores** from the wiki collection FTS probe. If fewer than 2 results, $s_2 = 0$. If no results, signal is always weak. When strong, the agent skips query expansion. Source and vector evidence do not participate in signal detection (intentional: the BM25 probe is a fast pre-check, not a full search).
+where $s_1$ and $s_2$ are the top two **normalized BM25 scores** from the wiki doc_type FTS probe. If fewer than 2 results, $s_2 = 0$. If no results, signal is always weak. When strong, the agent skips query expansion. Source and vector evidence do not participate in signal detection (intentional: the BM25 probe is a fast pre-check, not a full search).
 
 ### Best chunk selection
 
@@ -989,7 +989,7 @@ Agent spawning is in the hook script (shell), not in the Rust binary. This keeps
 
 ### Data model
 
-Sessions are stored as **source documents** (collection `source`). Cleaned transcripts get the same treatment as any other source: indexed in FTS5, chunked and embedded for vector search, searchable alongside wiki pages (with wiki results boosted 2x in RRF fusion). Wiki pages produced from sessions link back via the `sources` frontmatter field for provenance.
+Sessions are stored as **source documents** (doc_type `source`). Cleaned transcripts get the same treatment as any other source: indexed in FTS5, chunked and embedded for vector search, searchable alongside wiki pages (with wiki results boosted 2x in RRF fusion). Wiki pages produced from sessions link back via the `sources` frontmatter field for provenance.
 
 **Distillation output per session:**
 - One wiki page per distinct topic (not one page per session)

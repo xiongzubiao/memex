@@ -1545,7 +1545,7 @@ fn concurrent_readers_ok_while_writer_holds() {
         let r = root.clone();
         handles.push(std::thread::spawn(move || {
             let memex = Memex::open(r).unwrap();
-            memex.search().search_collection("test", "wiki", 5).unwrap()
+            memex.search().search_by_doc_type("test", "wiki", 5).unwrap()
         }));
     }
     for h in handles {

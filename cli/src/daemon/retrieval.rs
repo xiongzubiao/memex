@@ -1,24 +1,33 @@
-//! Retrieval actor: eager-loaded ONNX + SQLite reader, probe + read top-K.
+//! Retrieval actor: eager-loaded ONNX embedder running over a shared
+//! `MemexCache` handle.
 //!
 //! Orchestration (embed → BM25 + vector → RRF → MIN_SCORE) lives in
-//! `memex_core::retrieval` and is shared with `memex search`. This module owns:
-//! daemon IPC types (`Page`, `RetrievalReq/Resp/Error`), the actor + handle
-//! cache, and reading the page body from disk.
+//! `memex_core::retrieval` and is shared with `memex search`. This module
+//! owns: daemon IPC types (`Entry`, `RetrievalReq/Resp/Error`) and the
+//! actor that serializes one retrieval request at a time against the
+//! model. Memex handles come from the daemon-wide `MemexCache` so query
+//! and ingest paths share one SQLite connection per root. Each `Entry`
+//! is either a wiki page or a source document — hence the generic name.
 
+use crate::daemon::memex_cache::MemexCache;
 use memex_core::retrieval::{
     self as core_retrieval, HybridResult, Signal, embed_query, load_default_model,
 };
-use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Page {
-    pub docid: String,
-    pub stem: String,
-    pub collection: String,
+pub struct Entry {
+    /// Canonical citable identifier. Always the docid (content-hash-derived,
+    /// guaranteed unique across the memex root). Use this in `[[id]]`
+    /// citations from the synthesis LLM.
+    pub id: String,
+    /// Human-readable label. Wiki: the slug (e.g. "caroline"). Source:
+    /// the first-user-message truncated to 80 chars. Provided as a hint
+    /// to the LLM for quick topic orientation; not guaranteed unique.
+    pub title: String,
+    pub doc_type: String,
     pub rank: u32,
     pub signal: Signal,
     pub body: String,
@@ -38,7 +47,8 @@ pub struct RetrievalReq {
     pub memex_root: std::path::PathBuf,
     pub question: String,
     pub top_k: usize,
-    /// Agent-provided expansion terms (lex as strings; vec/hyde get
+    pub collections: Vec<String>,
+    /// Backend-provided expansion terms (lex as strings; vec/hyde get
     /// embedded inside the actor). None = no expansion (initial probe).
     pub expansion: Option<ExpansionTerms>,
     pub reply: oneshot::Sender<Result<RetrievalResp, RetrievalError>>,
@@ -46,7 +56,7 @@ pub struct RetrievalReq {
 
 #[derive(Debug)]
 pub struct RetrievalResp {
-    pub pages: Vec<Page>,
+    pub entries: Vec<Entry>,
     pub signal: Signal,
 }
 
@@ -63,35 +73,24 @@ pub enum RetrievalError {
 /// Sender half for enqueuing retrieval requests. Cloneable.
 pub type RetrievalSender = mpsc::Sender<RetrievalReq>;
 
-/// Cap on per-root SQLite handles kept in memory. Typical use is one root
-/// per user; integration tests rotate tempdirs and would leak handles
-/// without this bound.
-const MAX_HANDLES: usize = 8;
-
 pub struct RetrievalActor {
     rx: mpsc::Receiver<RetrievalReq>,
-    handles: HashMap<PathBuf, memex_core::Memex>,
-    /// LRU order of keys in `handles`, oldest at index 0.
-    lru_order: Vec<PathBuf>,
-    model: Option<memex_core::embed::EmbeddingModel>,
+    memex_cache: Arc<MemexCache>,
+    model: memex_core::embed::EmbeddingModel,
 }
 
-/// Spawn the retrieval actor. ONNX is loaded eagerly; missing/broken model
-/// logs a warning and falls back to the hash embedding.
-pub fn spawn() -> RetrievalSender {
+/// Spawn the retrieval actor. Errors if the ONNX model or runtime library
+/// cannot be loaded — the daemon refuses to start without a working embedder.
+pub fn spawn(memex_cache: Arc<MemexCache>) -> memex_core::error::Result<RetrievalSender> {
     let (tx, rx) = mpsc::channel(64);
-    let model = load_default_model();
-    if model.is_none() {
-        tracing::warn!("ONNX model not available; using hash embedding fallback");
-    }
+    let model = load_default_model()?;
     let actor = RetrievalActor {
         rx,
-        handles: HashMap::new(),
-        lru_order: Vec::new(),
+        memex_cache,
         model,
     };
     tokio::spawn(async move { actor.run().await });
-    tx
+    Ok(tx)
 }
 
 impl RetrievalActor {
@@ -102,6 +101,7 @@ impl RetrievalActor {
                 &req.question,
                 req.top_k,
                 req.expansion,
+                &req.collections,
             );
             let _ = req.reply.send(resp);
         }
@@ -109,112 +109,133 @@ impl RetrievalActor {
 
     fn handle(
         &mut self,
-        root: PathBuf,
+        root: std::path::PathBuf,
         question: &str,
         top_k: usize,
         expansion: Option<ExpansionTerms>,
+        collections: &[String],
     ) -> Result<RetrievalResp, RetrievalError> {
-        // Embed first — releases the &mut self borrow on `model` before we
-        // borrow `handles` via `get_or_open`.
-        let q_emb = embed_query(self.model.as_mut(), question);
+        let q_emb = embed_query(&mut self.model, question)
+            .map_err(|e| RetrievalError::Other(anyhow::anyhow!(e)))?;
 
         // Embed expansion vec/hyde terms if present.
-        let expansion_embedded = expansion.as_ref().map(|e| core_retrieval::Expansion {
-            lex: if e.lex.is_empty() {
-                vec![]
-            } else {
-                vec![e.lex.clone()]
-            },
-            vec_embs: if e.vec.is_empty() {
-                vec![]
-            } else {
-                vec![embed_query(self.model.as_mut(), &e.vec)]
-            },
-            hyde_embs: if e.hyde.is_empty() {
-                vec![]
-            } else {
-                vec![embed_query(self.model.as_mut(), &e.hyde)]
-            },
-        });
+        let expansion_embedded = match expansion.as_ref() {
+            None => None,
+            Some(e) => {
+                let vec_embs = if e.vec.is_empty() {
+                    vec![]
+                } else {
+                    vec![
+                        embed_query(&mut self.model, &e.vec)
+                            .map_err(|err| RetrievalError::Other(anyhow::anyhow!(err)))?,
+                    ]
+                };
+                let hyde_embs = if e.hyde.is_empty() {
+                    vec![]
+                } else {
+                    vec![
+                        embed_query(&mut self.model, &e.hyde)
+                            .map_err(|err| RetrievalError::Other(anyhow::anyhow!(err)))?,
+                    ]
+                };
+                Some(core_retrieval::Expansion {
+                    lex: if e.lex.is_empty() {
+                        vec![]
+                    } else {
+                        vec![e.lex.clone()]
+                    },
+                    vec_embs,
+                    hyde_embs,
+                })
+            }
+        };
 
-        let memex = self.get_or_open(&root)?;
+        let memex = self
+            .memex_cache
+            .get_or_open(&root)
+            .map_err(|e| RetrievalError::InvalidRoot(e.to_string()))?;
         let default_exp = core_retrieval::Expansion::default();
         let exp = expansion_embedded.as_ref().unwrap_or(&default_exp);
-        let HybridResult { results, signal } =
-            core_retrieval::hybrid_retrieve_expanded(memex.search(), question, &q_emb, exp, false)
-                .map_err(|e| RetrievalError::Other(anyhow::anyhow!(e)))?;
+        let HybridResult { results, signal } = core_retrieval::hybrid_retrieve_expanded(
+            memex.search(),
+            question,
+            &q_emb,
+            exp,
+            false,
+            collections,
+        )
+        .map_err(|e| RetrievalError::Other(anyhow::anyhow!(e)))?;
 
-        let mut pages = Vec::with_capacity(top_k);
-        for r in results.into_iter().take(top_k) {
-            let stem = core_retrieval::result_stem(&r);
-            let body = read_page_body(&root, &r).unwrap_or_default();
-            let rank = (pages.len() as u32) + 1;
-            pages.push(Page {
-                docid: r.docid.clone(),
-                stem,
-                collection: r.collection.clone(),
+        let top: Vec<_> = results.into_iter().take(top_k).collect();
+
+        // Single batch read: one SQLite round-trip + one mutex cycle fetches
+        // every entry's body, replacing N per-entry reads.
+        let hashes: Vec<&str> = top.iter().map(|r| r.hash.as_str()).collect();
+        let bodies = memex
+            .search()
+            .with_connection(|conn| memex_core::content::get_content_batch(conn, &hashes))
+            .map_err(|e| RetrievalError::Other(anyhow::anyhow!(e)))?;
+
+        let mut entries = Vec::with_capacity(top.len());
+        for (idx, r) in top.into_iter().enumerate() {
+            let title = if r.doc_type == "wiki" {
+                // For wiki, prefer the slug (filename stem) as title — it's
+                // the canonical subject name (e.g. "caroline"), more useful
+                // for orientation than the frontmatter title.
+                r.path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| r.title.clone())
+            } else {
+                r.title.clone()
+            };
+            let body = bodies
+                .get(&r.hash)
+                .map(|raw| {
+                    memex_core::validate::parse_frontmatter(raw)
+                        .map(|(_fm, b)| b)
+                        .unwrap_or_else(|_| raw.clone())
+                })
+                .unwrap_or_default();
+            let rank = (idx as u32) + 1;
+            entries.push(Entry {
+                id: r.docid.clone(),
+                title,
+                doc_type: r.doc_type.clone(),
                 rank,
                 signal,
                 body,
             });
         }
 
-        if pages.is_empty() {
+        if entries.is_empty() {
             return Err(RetrievalError::Empty);
         }
-        Ok(RetrievalResp { pages, signal })
+        Ok(RetrievalResp { entries, signal })
     }
 
-    fn get_or_open(&mut self, root: &Path) -> Result<&memex_core::Memex, RetrievalError> {
-        if self.handles.contains_key(root) {
-            // Promote to most-recently-used.
-            if let Some(pos) = self.lru_order.iter().position(|p| p == root) {
-                let key = self.lru_order.remove(pos);
-                self.lru_order.push(key);
-            }
-        } else {
-            if self.handles.len() >= MAX_HANDLES {
-                let oldest = self.lru_order.remove(0);
-                self.handles.remove(&oldest);
-            }
-            let m = memex_core::Memex::open(root.to_path_buf())
-                .with_context(|| format!("opening memex at {root:?}"))
-                .map_err(|e| RetrievalError::InvalidRoot(e.to_string()))?;
-            self.handles.insert(root.to_path_buf(), m);
-            self.lru_order.push(root.to_path_buf());
-        }
-        Ok(self.handles.get(root).unwrap())
-    }
 }
 
-/// Read a page's full body from disk. Wiki paths are relative to MEMEX_ROOT;
-/// source paths are absolute.
-fn read_page_body(root: &Path, r: &memex_core::search::SearchResult) -> anyhow::Result<String> {
-    let full = if r.path.is_absolute() {
-        r.path.clone()
-    } else {
-        root.join(&r.path)
-    };
-    Ok(std::fs::read_to_string(&full).unwrap_or_default())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn page_serializes_with_expected_shape() {
-        let p = Page {
-            docid: "abc".into(),
-            stem: "auth-migration".into(),
-            collection: "wiki".into(),
+    fn entry_serializes_with_expected_shape() {
+        let e = Entry {
+            id: "abc".into(),
+            title: "auth-migration".into(),
+            doc_type: "wiki".into(),
             rank: 1,
             signal: Signal::Strong,
             body: "hello".into(),
         };
-        let s = serde_json::to_string(&p).unwrap();
-        assert!(s.contains(r#""docid":"abc""#));
-        assert!(s.contains(r#""collection":"wiki""#));
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""id":"abc""#));
+        assert!(s.contains(r#""title":"auth-migration""#));
+        assert!(s.contains(r#""doc_type":"wiki""#));
         assert!(s.contains(r#""rank":1"#));
         assert!(s.contains(r#""signal":"strong""#));
     }
