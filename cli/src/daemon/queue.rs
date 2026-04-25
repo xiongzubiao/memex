@@ -87,12 +87,54 @@ pub struct ExtractedPage {
 
 pub type IngestResult = Result<IngestReply, WorkerError>;
 
-/// Ingest extraction job: cleaned transcript → wiki pages.
+/// One unit of LLM-visible content fed into the Extract task. Optional
+/// fields convey the asymmetry between transcripts (per-turn role +
+/// timestamp) and documents (single segment, no role).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractSegment {
+    /// 1-based ordinal hint. Optional — array position is canonical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    /// Speaker identity for transcripts (e.g. "user", "assistant").
+    /// Absent for documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// ISO 8601 timestamp when known. Absent for documents and for
+    /// transcripts whose underlying turn lacked a timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    /// The body of this segment.
+    pub text: String,
+}
+
+/// Position of a chunk within a multi-chunk document. The two fields are
+/// always set together — a chunk that knows its index also knows the
+/// total. Wrapping them in one struct prevents the inconsistent state
+/// "index without total."
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ChunkPosition {
+    /// 0-based chunk index.
+    pub index: usize,
+    /// Total chunks in this document.
+    pub total: usize,
+}
+
+/// Ingest extraction job: cleaned segments → wiki pages.
+/// Carries both transcript (multi-segment) and document (single-segment-
+/// per-call) Extract calls.
 #[derive(Debug)]
 pub struct IngestJob {
-    /// Structured turns from the parser with role/timestamp/text.
-    pub turns: Vec<memex_core::transcript::TranscriptTurn>,
-    /// Worker sends the extracted pages here.
+    /// Segments to extract from. For transcripts, one per turn. For
+    /// document chunks, exactly one segment carrying the chunk body.
+    pub segments: Vec<ExtractSegment>,
+    /// Provenance identifier (URL, file path, transcript path). Always
+    /// populated by callers. Used in document framing for "this is chunk
+    /// N of M from {source}" preamble and for slug/title hints.
+    pub source: String,
+    /// Position within a multi-chunk document. None for transcripts and
+    /// single-chunk docs.
+    pub chunk: Option<ChunkPosition>,
+    /// Worker sends extracted pages here.
     pub reply: oneshot::Sender<IngestResult>,
 }
 

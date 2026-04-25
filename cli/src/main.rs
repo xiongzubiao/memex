@@ -1,6 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use memex_core::Memex;
-use memex_core::search::now_rfc3339;
 use std::io::Read as _;
 use std::path::Path;
 
@@ -53,9 +52,9 @@ enum Commands {
         /// Reduced output (only written: and wiki_pages:)
         #[arg(long)]
         quiet: bool,
-        /// Source file paths to attach (repeatable)
-        #[arg(long = "source")]
-        sources: Vec<String>,
+        /// docid of an already-stored source (from `memex source add`); attach to this page
+        #[arg(long)]
+        source: Option<String>,
         /// Bypass daemon and write directly to SQLite (escape hatch)
         #[arg(long)]
         direct: bool,
@@ -93,12 +92,22 @@ enum Commands {
         #[arg(long = "collection")]
         collections: Vec<String>,
     },
-    /// Ingest a session transcript via the daemon (thin client, used by hooks)
+    /// Ingest a session transcript (`--agent` or auto-detected) or a pre-converted
+    /// document file (`<path>`), or stdin content (`--source <id>`).
     Ingest {
-        /// Agent type (claude-code, codex, gemini-cli)
+        /// Agent override for transcript ingestion. If omitted with a positional
+        /// path, memex infers the agent from file content.
+        #[arg(long, requires = "path", conflicts_with = "source")]
+        agent: Option<Agent>,
+        /// Filesystem path: transcript file (with --agent or auto-detected) OR
+        /// text/Markdown document file that memex reads directly.
+        #[arg(conflicts_with = "source")]
+        path: Option<std::path::PathBuf>,
+        /// Source identifier for stdin-piped content (URL, logical name, or any
+        /// string that doesn't resolve to a readable file). Reads stdin as content.
         #[arg(long)]
-        agent: Agent,
-        /// Restrict ingestion to one or more collections
+        source: Option<String>,
+        /// Collections to associate with the ingested content
         #[arg(long = "collection")]
         collections: Vec<String>,
     },
@@ -115,6 +124,11 @@ enum Commands {
     },
     /// Show daemon and ingestion status
     Status,
+    /// Manage source documents (the raw material wiki pages reference)
+    Source {
+        #[command(subcommand)]
+        action: SourceAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -129,6 +143,44 @@ enum DaemonAction {
     Stop,
     /// Report daemon status (PID + ping)
     Status,
+}
+
+#[derive(Subcommand)]
+enum SourceAction {
+    /// Store source content (stdin = bytes), print docid to stdout
+    Add {
+        /// Source identifier — URL, file path, or arbitrary label
+        path: String,
+        /// Restrict source to one or more collections
+        #[arg(long = "collection")]
+        collections: Vec<String>,
+        /// Print human-readable info to stderr (size, summary). Stdout
+        /// stays just the docid for shell composition.
+        #[arg(long, short = 'v')]
+        verbose: bool,
+    },
+    /// List source documents
+    List {
+        /// Filter to one or more collections
+        #[arg(long = "collection")]
+        collections: Vec<String>,
+        /// Emit one JSON object per row (for scripting)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print source content to stdout
+    Show {
+        /// docid (e.g. src-abc123) or 'path:<source-path>'
+        reference: String,
+    },
+    /// Delete a source document
+    Delete {
+        /// docid or 'path:<source-path>'
+        reference: String,
+        /// Skip confirmation; required when wiki pages reference this source
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn run_search(title: &str) -> anyhow::Result<()> {
@@ -255,12 +307,219 @@ fn reconstruct_page(original: &str, new_body: &str) -> String {
     format!("{prefix}\n\n{new_body}")
 }
 
+/// `memex source delete <ref>`. Mutation — routed through the daemon
+/// (`Request::SourceDelete`). Reports any wiki pages that now have
+/// dangling source references.
+fn run_source_delete(reference: &str, force: bool) -> anyhow::Result<()> {
+    let root = memex_cli::memex_root();
+    let root_str = root.to_string_lossy().to_string();
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
+        let stream = memex_cli::daemon::client::connect_or_spawn(
+            &paths.socket,
+            &paths.lock,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await?;
+        let events = memex_cli::daemon::client::request(
+            stream,
+            &memex_cli::daemon::protocol::Request::SourceDelete {
+                ref_: reference.to_string(),
+                force,
+                memex_root: root_str,
+            },
+        )
+        .await?;
+        let mut exit_code = 0;
+        for ev in &events {
+            match ev {
+                memex_cli::daemon::protocol::Event::SourceDeleted {
+                    docid,
+                    source_path,
+                    dangling_wiki_pages,
+                } => {
+                    println!("deleted: {docid} ({source_path})");
+                    if !dangling_wiki_pages.is_empty() {
+                        println!(
+                            "warning: {} wiki page(s) still reference this source path in their `sources:` frontmatter: {}",
+                            dangling_wiki_pages.len(),
+                            dangling_wiki_pages.join(", ")
+                        );
+                        println!(
+                            "  edit each page to drop the entry, or attach a replacement source via `memex write --source <docid>`."
+                        );
+                    }
+                }
+                memex_cli::daemon::protocol::Event::Error {
+                    code,
+                    message,
+                    status,
+                } => {
+                    eprintln!("delete error ({code}): {message}");
+                    exit_code = *status;
+                }
+                _ => {}
+            }
+        }
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+/// `memex source show <ref>`. Read-only; resolves a docid or
+/// `path:<source-path>` and prints the source body to stdout.
+fn run_source_show(reference: &str) -> anyhow::Result<()> {
+    let root = memex_cli::memex_root();
+    let memex = memex_core::Memex::open(root)?;
+    let search = memex.search();
+
+    let doc = if let Some(rest) = reference.strip_prefix("path:") {
+        search.lookup_source_by_path(rest)?
+    } else {
+        let docs = search.resolve_ref_documents(reference)?;
+        docs.into_iter().find(|d| d.doc_type == "source")
+    };
+    let doc = match doc {
+        Some(d) => d,
+        None => {
+            anyhow::bail!(
+                "source not found: '{reference}'. Use 'src-...' for docid \
+                 or 'path:<source-path>'."
+            );
+        }
+    };
+    let body = search.get_content(&doc.hash)?;
+    print!("{body}");
+    if !body.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+/// `memex source list`. Read-only; bypasses the daemon and queries the
+/// search DB directly.
+fn run_source_list(collections: &[String], json: bool) -> anyhow::Result<()> {
+    let root = memex_cli::memex_root();
+    let memex = memex_core::Memex::open(root)?;
+    let search = memex.search();
+    let rows = search.list_sources(collections)?;
+
+    if json {
+        for r in &rows {
+            println!("{}", serde_json::to_string(r)?);
+        }
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("No source documents.");
+        return Ok(());
+    }
+
+    println!("{:<20} {:<10} {:<24} PATH", "DOCID", "SIZE", "CREATED");
+    for r in &rows {
+        println!(
+            "{:<20} {:<10} {:<24} {}",
+            truncate_for_table(&r.docid, 20),
+            human_size(r.size_bytes),
+            &r.created_at,
+            truncate_for_table(&r.path, 80)
+        );
+    }
+    Ok(())
+}
+
+fn truncate_for_table(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max - 1).collect();
+        format!("{cut}…")
+    }
+}
+
+fn human_size(bytes: usize) -> String {
+    const K: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < K {
+        format!("{bytes}B")
+    } else if b < K * K {
+        format!("{:.1}K", b / K)
+    } else {
+        format!("{:.1}M", b / (K * K))
+    }
+}
+
+/// `memex source add <path>`. Reads stdin into a UTF-8 string, sends
+/// `Request::SourceAdd` to the daemon, prints the allocated docid on stdout.
+fn run_source_add(
+    source_path: &str,
+    collections: &[String],
+    verbose: bool,
+) -> anyhow::Result<()> {
+    let mut buf = Vec::new();
+    std::io::stdin().read_to_end(&mut buf)?;
+    let content = String::from_utf8(buf)
+        .map_err(|e| anyhow::anyhow!("source content is not valid UTF-8: {e}"))?;
+    if content.trim().is_empty() {
+        anyhow::bail!("empty source content on stdin");
+    }
+    let content_size = content.len();
+    let root = memex_cli::memex_root();
+    let root_str = root.to_string_lossy().to_string();
+    // Pass collections through verbatim. The daemon's `normalize_collections`
+    // adds "default" for new sources; for re-adds we want the empty list
+    // to signal "leave existing collections alone" (handle_source_add gates
+    // its set_document_collections_by_path call on `!collections.is_empty()`).
+    let collections = collections.to_vec();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let docid = rt.block_on(async move {
+        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
+        let stream = memex_cli::daemon::client::connect_or_spawn(
+            &paths.socket,
+            &paths.lock,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await?;
+        let events = memex_cli::daemon::client::request(
+            stream,
+            &memex_cli::daemon::protocol::Request::SourceAdd {
+                source_path: source_path.to_string(),
+                content,
+                collections,
+                memex_root: root_str,
+            },
+        )
+        .await?;
+        for ev in &events {
+            if let memex_cli::daemon::protocol::Event::SourceAdded { docid } = ev {
+                return Ok::<String, anyhow::Error>(docid.clone());
+            }
+            if let memex_cli::daemon::protocol::Event::Error { code, message, .. } = ev {
+                anyhow::bail!("source add error ({code}): {message}");
+            }
+        }
+        anyhow::bail!("daemon did not return SourceAdded event")
+    })?;
+    if verbose {
+        eprintln!("Stored: {source_path} ({content_size} bytes) → {docid}");
+        eprintln!("Use: memex write <slug> --source {docid}");
+    }
+    println!("{docid}");
+    Ok(())
+}
+
 /// Write a wiki page via the daemon. Sends Request::Write.
 fn run_write_via_daemon(
     name: &str,
     force: bool,
     quiet: bool,
-    sources: &[String],
+    source: Option<&str>,
 ) -> anyhow::Result<()> {
     // Read content from stdin (same as direct path)
     let content = if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -301,11 +560,10 @@ fn run_write_via_daemon(
         let events = memex_cli::daemon::client::request(
             stream,
             &memex_cli::daemon::protocol::Request::Write {
-                v: 1,
                 title: name.to_string(),
                 content,
                 tags,
-                sources: sources.to_vec(),
+                source: source.map(str::to_string),
                 force,
                 memex_root: root_str.to_string(),
             },
@@ -342,7 +600,17 @@ fn run_write_via_daemon(
 }
 
 /// Write a wiki page directly to SQLite (--direct flag).
-fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow::Result<()> {
+fn run_write(
+    name: &str,
+    force: bool,
+    quiet: bool,
+    source: Option<&str>,
+) -> anyhow::Result<()> {
+    if source.is_some() {
+        anyhow::bail!(
+            "--source attachment not supported with --direct; use the daemon path instead"
+        );
+    }
     // Phase 1 — input (no lock).
     let content = if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let mut buf = String::new();
@@ -449,7 +717,6 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
         &now,
     )?;
 
-    // Load model once for wiki page + all sources.
     let mut model = memex_core::retrieval::load_default_model()?;
     memex_core::retrieval::embed_document(search, &hash, &linked_body, &mut model)?;
 
@@ -457,37 +724,6 @@ fn run_write(name: &str, force: bool, quiet: bool, sources: &[String]) -> anyhow
         && old_h != &hash
     {
         let _ = search.cleanup_orphaned_content(old_h);
-    }
-
-    // Source ingestion
-    if !sources.is_empty() {
-        let mut source_docids: Vec<String> = search.existing_docids()?.into_iter().collect();
-        for source_path_str in sources {
-            let source_path = std::path::PathBuf::from(source_path_str);
-            if !source_path.exists() {
-                eprintln!("warning: source not found: {source_path_str} (skipping)");
-                continue;
-            }
-            let source_path = std::fs::canonicalize(&source_path)?;
-            let source_content = std::fs::read_to_string(&source_path)?;
-            let source_abs = source_path.to_string_lossy().to_string();
-            let source_title = source_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let source_summary = memex_core::index::extract_summary(&source_content, 120);
-            let docid = store_source_with_docids(
-                search,
-                &source_abs,
-                &source_content,
-                &source_title,
-                &source_summary,
-                &source_docids,
-                &mut model,
-            )?;
-            source_docids.push(docid);
-        }
     }
 
     let wiki_page_count = search.wiki_page_count()?;
@@ -842,25 +1078,6 @@ fn die(msg: impl std::fmt::Display) -> ! {
 // Session ingestion
 // ---------------------------------------------------------------------------
 
-fn store_source_with_docids(
-    search: &memex_core::search::Bm25Search,
-    path: &str,
-    content: &str,
-    title: &str,
-    summary: &str,
-    existing_docids: &[String],
-    model: &mut memex_core::embed::EmbeddingModel,
-) -> anyhow::Result<String> {
-    let hash = search.insert_content(content)?;
-    let docid = memex_core::docid::allocate_docid(&hash, "source", path, existing_docids);
-    let now = now_rfc3339();
-    search.upsert_document(
-        "source", path, title, &hash, &docid, "", summary, &now, &now,
-    )?;
-    memex_core::retrieval::embed_document(search, &hash, content, model)?;
-    Ok(docid)
-}
-
 /// Discover session files for an agent. `root_override`, when provided,
 /// replaces the agent's default root (e.g. `~/.claude` for Claude Code);
 /// the agent-specific subpattern (`projects/*/*.jsonl`, etc.) still applies.
@@ -908,33 +1125,165 @@ fn default_ingest_collections(collections: &[String]) -> Vec<String> {
     }
 }
 
-fn run_ingest_client(agent: &Agent, collections: &[String]) -> anyhow::Result<()> {
-    // MEMEX_INTERNAL guard: skip daemon's own sessions
+/// Map a CLI `Agent` to the protocol `TranscriptAgent` used in
+/// `Request::Ingest`.
+fn agent_to_protocol(agent: &Agent) -> memex_cli::daemon::protocol::TranscriptAgent {
+    match agent {
+        Agent::ClaudeCode => memex_cli::daemon::protocol::TranscriptAgent::ClaudeCode,
+        Agent::Codex => memex_cli::daemon::protocol::TranscriptAgent::Codex,
+        Agent::GeminiCli => memex_cli::daemon::protocol::TranscriptAgent::GeminiCli,
+    }
+}
+
+/// Map a `core::transcript::TranscriptAgent` (returned by inference) to the
+/// protocol's `TranscriptAgent` (sent over the daemon socket).
+fn core_agent_to_protocol(
+    agent: memex_core::transcript::TranscriptAgent,
+) -> memex_cli::daemon::protocol::TranscriptAgent {
+    match agent {
+        memex_core::transcript::TranscriptAgent::ClaudeCode => {
+            memex_cli::daemon::protocol::TranscriptAgent::ClaudeCode
+        }
+        memex_core::transcript::TranscriptAgent::Codex => {
+            memex_cli::daemon::protocol::TranscriptAgent::Codex
+        }
+        memex_core::transcript::TranscriptAgent::GeminiCli => {
+            memex_cli::daemon::protocol::TranscriptAgent::GeminiCli
+        }
+    }
+}
+
+fn run_ingest_client(
+    agent: Option<&Agent>,
+    path: Option<&std::path::Path>,
+    source: Option<&str>,
+    collections: &[String],
+) -> anyhow::Result<()> {
     if std::env::var("MEMEX_INTERNAL").as_deref() == Ok("1") {
         return Ok(());
     }
-
-    // Read stdin JSON (hook passes {"transcript_path": "...", ...})
-    // Cap at 64KB — hook payloads are small JSON.
-    let mut input = Vec::new();
-    std::io::stdin().take(65_536).read_to_end(&mut input)?;
-    let input = String::from_utf8(input)
-        .map_err(|e| anyhow::anyhow!("Hook stdin is not valid UTF-8: {e}"))?;
-    let json: serde_json::Value = serde_json::from_str(input.trim())
-        .map_err(|e| anyhow::anyhow!("Failed to parse hook stdin JSON: {e}"))?;
-    let transcript_path = json
-        .get("transcript_path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Hook stdin JSON missing 'transcript_path' field"))?;
-
     let root = memex_cli::memex_root();
-    let code = memex_cli::daemon::ingest(
-        transcript_path,
-        agent.as_str(),
-        root.to_str().unwrap_or("~/.memex"),
-        default_ingest_collections(collections),
-    )?;
-    std::process::exit(code);
+    let root_str = root.to_string_lossy().to_string();
+    let collections = if collections.is_empty() {
+        vec!["default".to_string()]
+    } else {
+        collections.to_vec()
+    };
+
+    let request = match (agent, path, source) {
+        // Transcript mode: explicit --agent + positional path
+        (Some(agent), Some(p), None) => {
+            let p_abs = std::fs::canonicalize(p)
+                .map_err(|e| anyhow::anyhow!("transcript path: {e}"))?;
+            memex_cli::daemon::protocol::Request::Ingest {
+                source: memex_cli::daemon::protocol::IngestSource::Transcript {
+                    path: p_abs.to_string_lossy().to_string(),
+                    agent: agent_to_protocol(agent),
+                },
+                collections,
+                memex_root: root_str,
+            }
+        }
+        // Positional path alone (no --agent): try inference, fall back to document mode
+        (None, Some(p), None) => {
+            let p_abs = std::fs::canonicalize(p)
+                .map_err(|e| anyhow::anyhow!("path: {e}"))?;
+            if let Some(detected_agent) = memex_core::transcript::detect_transcript_agent(&p_abs) {
+                memex_cli::daemon::protocol::Request::Ingest {
+                    source: memex_cli::daemon::protocol::IngestSource::Transcript {
+                        path: p_abs.to_string_lossy().to_string(),
+                        agent: core_agent_to_protocol(detected_agent),
+                    },
+                    collections,
+                    memex_root: root_str,
+                }
+            } else {
+                let content = std::fs::read_to_string(&p_abs)
+                    .map_err(|e| anyhow::anyhow!("read {}: {e}", p_abs.display()))?;
+                if content.trim().is_empty() {
+                    anyhow::bail!("empty document file: {}", p_abs.display());
+                }
+                memex_cli::daemon::protocol::Request::Ingest {
+                    source: memex_cli::daemon::protocol::IngestSource::Document {
+                        source_path: p_abs.to_string_lossy().to_string(),
+                        content,
+                    },
+                    collections,
+                    memex_root: root_str,
+                }
+            }
+        }
+        // Stdin mode: --source + content piped on stdin. Bail early on
+        // oversize so we don't waste the IPC round-trip; the daemon
+        // catches empty/binary content with a more informative message.
+        (None, None, Some(src)) => {
+            let max = memex_cli::daemon::config::INGEST_MAX_BYTES;
+            let mut buf = Vec::with_capacity(64 * 1024);
+            std::io::stdin()
+                .take((max as u64) + 1)
+                .read_to_end(&mut buf)?;
+            if buf.len() > max {
+                anyhow::bail!(
+                    "source content > {}MB; raise [ingest].fetch_max_bytes if intentional",
+                    max / (1024 * 1024)
+                );
+            }
+            let content = String::from_utf8(buf)
+                .map_err(|e| anyhow::anyhow!("source content is not valid UTF-8: {e}"))?;
+            memex_cli::daemon::protocol::Request::Ingest {
+                source: memex_cli::daemon::protocol::IngestSource::Document {
+                    source_path: src.to_string(),
+                    content,
+                },
+                collections,
+                memex_root: root_str,
+            }
+        }
+        _ => anyhow::bail!(
+            "ingest requires one of:\n  \
+             --agent <agent> <transcript-path>      (transcript mode)\n  \
+             <file-path>                            (document file mode)\n  \
+             --source <id>                          (stdin mode; pipe content via stdin)"
+        ),
+    };
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let paths =
+            memex_cli::daemon::server::DaemonPaths::default_under(&memex_cli::memex_root());
+        let stream = memex_cli::daemon::client::connect_or_spawn(
+            &paths.socket,
+            &paths.lock,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await?;
+        let events = memex_cli::daemon::client::request(stream, &request).await?;
+        let mut exit_code = 0;
+        for ev in &events {
+            match ev {
+                memex_cli::daemon::protocol::Event::Error {
+                    code,
+                    message,
+                    status,
+                } => {
+                    eprintln!("ingest error ({code}): {message}");
+                    exit_code = *status;
+                }
+                memex_cli::daemon::protocol::Event::Stored { wiki_pages, .. } => {
+                    println!("stored: {} pages", wiki_pages.len());
+                }
+                memex_cli::daemon::protocol::Event::Done { status } if *status != 0 => {
+                    exit_code = *status;
+                }
+                _ => {}
+            }
+        }
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
 }
 
 /// Discover session files for an agent (or a user-supplied directory) and
@@ -1065,14 +1414,14 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             name,
             force,
             quiet,
-            sources,
+            source,
             direct,
         } => {
             if direct {
                 init_ort_runtime().map_err(|e| anyhow::anyhow!(e))?;
-                run_write(&name, force, quiet, &sources)
+                run_write(&name, force, quiet, source.as_deref())
             } else {
-                run_write_via_daemon(&name, force, quiet, &sources)
+                run_write_via_daemon(&name, force, quiet, source.as_deref())
             }
         }
         Commands::Delete { page_ref, force } => run_delete(&page_ref, force),
@@ -1103,13 +1452,33 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             };
             std::process::exit(code);
         }
-        Commands::Ingest { agent, collections } => run_ingest_client(&agent, &collections),
+        Commands::Ingest {
+            agent,
+            path,
+            source,
+            collections,
+        } => run_ingest_client(
+            agent.as_ref(),
+            path.as_deref(),
+            source.as_deref(),
+            &collections,
+        ),
         Commands::Backfill {
             agent,
             collections,
             path,
         } => run_backfill(&agent, &collections, path.as_deref()),
         Commands::Status => run_status(),
+        Commands::Source { action } => match action {
+            SourceAction::Add {
+                path,
+                collections,
+                verbose,
+            } => run_source_add(&path, &collections, verbose),
+            SourceAction::List { collections, json } => run_source_list(&collections, json),
+            SourceAction::Show { reference } => run_source_show(&reference),
+            SourceAction::Delete { reference, force } => run_source_delete(&reference, force),
+        },
     }
 }
 

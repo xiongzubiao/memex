@@ -4,6 +4,22 @@ use crate::error::Result;
 use crate::types::{LintIssue, LintIssueKind, LintReport};
 use crate::validate;
 
+/// Extract the slug from any wiki document's `documents.path` field.
+///
+/// Wiki documents land in the DB under one of two path conventions
+/// depending on the writer: `handle_write` (daemon path) stores `"slug"`
+/// directly, while `rebuild()` (memex reindex) and `run_write --direct`
+/// (filesystem path) store `"wiki/slug.md"`. Both forms reduce to the
+/// same slug via `file_stem()`. Lint normalizes through this helper so
+/// each disk-vs-DB check works regardless of how the row was written.
+fn slug_of_db_path(db_path: &str) -> String {
+    std::path::Path::new(db_path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
 impl Memex {
     /// Run deterministic lint checks on the wiki.
     ///
@@ -17,69 +33,67 @@ impl Memex {
         let wiki_dir = self.wiki_dir();
         let mut issues = Vec::new();
 
-        // Collect DB state: all wiki documents.
+        // Collect DB state: all wiki documents, keyed by slug.
         let db_docs = self.search.all_wiki_documents()?;
-        let db_paths: std::collections::HashSet<String> =
-            db_docs.iter().map(|d| d.path.clone()).collect();
+        let db_slugs: std::collections::HashSet<String> = db_docs
+            .iter()
+            .map(|d| slug_of_db_path(&d.path))
+            .collect();
 
-        // Collect disk state: all .md files in wiki/.
-        let mut disk_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Collect disk state: slug of every .md file in wiki/.
+        let mut disk_slugs: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         if wiki_dir.exists() {
             for entry in std::fs::read_dir(&wiki_dir)? {
                 let entry = entry?;
                 let path = entry.path();
                 if path.extension().is_some_and(|e| e == "md") {
-                    let rel = format!(
-                        "wiki/{}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    );
-                    disk_files.insert(rel);
+                    let stem = path
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    disk_slugs.insert(stem);
                 }
             }
         }
 
         // Check: Stale index — file hash differs from documents.hash.
         for doc in &db_docs {
-            let full_path = self.root.join(&doc.path);
+            let slug = slug_of_db_path(&doc.path);
+            let full_path = wiki_dir.join(format!("{slug}.md"));
             if full_path.exists()
                 && let Ok(disk_hash) = crate::storage::file_hash(&full_path)
                 && disk_hash != doc.hash
             {
-                let stem = std::path::Path::new(&doc.path)
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
                 issues.push(LintIssue {
                     kind: LintIssueKind::StaleIndex,
-                    page: stem,
+                    page: slug,
                     target: doc.path.clone(),
                 });
             }
         }
 
-        // Check: Untracked file — on disk but no DB row.
-        for rel in &disk_files {
-            if !db_paths.contains(rel) {
+        // Check: Untracked file — on disk but no DB row. `target` is the
+        // human-readable relative form so users can find it.
+        for slug in &disk_slugs {
+            if !db_slugs.contains(slug) {
                 issues.push(LintIssue {
                     kind: LintIssueKind::UntrackedFile,
                     page: String::new(),
-                    target: rel.clone(),
+                    target: format!("wiki/{slug}.md"),
                 });
             }
         }
 
-        // Check: Missing file — DB row but no file on disk.
+        // Check: Missing file — DB row but no file on disk. `target`
+        // preserves the DB-stored path so the fix-flow can look it up.
         for doc in &db_docs {
-            if !disk_files.contains(&doc.path) {
-                let stem = std::path::Path::new(&doc.path)
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
+            let slug = slug_of_db_path(&doc.path);
+            if !disk_slugs.contains(&slug) {
                 issues.push(LintIssue {
                     kind: LintIssueKind::MissingFile,
-                    page: stem,
+                    page: slug,
                     target: doc.path.clone(),
                 });
             }
@@ -447,6 +461,56 @@ mod tests {
             .collect();
         assert_eq!(untracked.len(), 1, "should detect one untracked file");
         assert!(untracked[0].target.contains("untracked.md"));
+    }
+
+    /// Regression: when the DB stores a wiki document under the slug-only
+    /// path convention used by `handle_write` (e.g. `path = "test"`, not
+    /// `path = "wiki/test.md"`), and the matching file exists on disk,
+    /// lint must NOT report both `untracked` and `missing-file`. Both checks
+    /// now normalize through `slug_of_db_path`.
+    #[test]
+    fn lint_clean_when_db_path_stored_as_slug_only() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+
+        // Write file + reindex. Reindex stores path = "wiki/test.md".
+        write_and_index(
+            &root,
+            "test.md",
+            "---\ntitle: Test\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nbody\n",
+        );
+        let memex = open_and_reindex(&root);
+
+        // Rewrite the path column to the slug-only form (the daemon's
+        // `handle_write` writes documents this way).
+        memex
+            .search()
+            .with_connection(|conn| {
+                let n = conn
+                    .execute(
+                        "UPDATE documents SET path = 'test' WHERE doc_type = 'wiki' AND path = 'wiki/test.md'",
+                        [],
+                    )
+                    .unwrap();
+                assert_eq!(n, 1, "expected to rewrite one wiki row");
+                Ok(())
+            })
+            .unwrap();
+
+        let report = memex.lint().unwrap();
+        let untracked = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == crate::types::LintIssueKind::UntrackedFile)
+            .count();
+        let missing = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == crate::types::LintIssueKind::MissingFile)
+            .count();
+        assert_eq!(untracked, 0, "DB row exists for the file; nothing should be untracked");
+        assert_eq!(missing, 0, "file exists for the DB row; nothing should be missing");
     }
 
     #[test]

@@ -14,6 +14,11 @@ pub(crate) mod parse;
 /// runaway streaming. The largest model output is ~512KB (128K tokens).
 pub(crate) const MAX_RESPONSE_BYTES: usize = 1_048_576;
 
+/// Type alias for test-mode prompt-handler closures. Takes a rendered prompt,
+/// returns the canned LLM response string.
+#[cfg(any(test, feature = "test-harness"))]
+pub type MockPromptFn = std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 use crate::daemon::config::{Backend, WorkerConfig};
 use crate::daemon::queue::{
     BackendJob, ExpandResult, IngestResult, JobReceiver, JobSender, MergeResult, SynthResult,
@@ -283,9 +288,80 @@ impl WorkerPool {
 
     /// Build a pool without spawning any worker tasks. Handler unit tests
     /// only exercise code paths that don't reach the queue.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn new_inert_for_test() -> Self {
         Self::empty(WorkerConfig::default())
+    }
+
+    /// Drain the job queue via test closures instead of LLM subprocesses.
+    /// Extract closures are required; merge closures are optional (jobs that
+    /// would call merge return an error if no closure is supplied). Expand
+    /// and Synth jobs are unsupported — return Backend errors.
+    #[cfg(any(test, feature = "test-harness"))]
+    pub fn new_with_mock(
+        extract: MockPromptFn,
+        merge: Option<MockPromptFn>,
+    ) -> Self {
+        let pool = Self::empty(WorkerConfig::default());
+        // Pretend max-count workers are already alive so `submit()`'s
+        // autoscale path never spawns a real subprocess worker. Without
+        // this, `submit()` sees `live=0 < max_count` and launches a
+        // backend subprocess, which fails in tests with no LLM backend
+        // configured.
+        pool.live
+            .store(pool.cfg.max_count, std::sync::atomic::Ordering::Release);
+        let rx = pool.rx.clone();
+        tokio::spawn(async move {
+            while let Ok(job) = rx.recv().await {
+                match job {
+                    BackendJob::Ingest(j) => {
+                        let prompt = build_extract_prompt(&j);
+                        let response = extract(&prompt);
+                        let reply = match parse::parse_ingest(&response) {
+                            Ok(r) => Ok(r),
+                            Err(e) => Err(WorkerError::Backend {
+                                message: e.reason,
+                                code: None,
+                            }),
+                        };
+                        let _ = j.reply.send(reply);
+                    }
+                    BackendJob::Merge(j) => match &merge {
+                        Some(m) => {
+                            let prompt = build_merge_prompt(&j.pages);
+                            let response = m(&prompt);
+                            let reply = match parse::parse_merge(&response) {
+                                Ok(r) => Ok(r),
+                                Err(e) => Err(WorkerError::Backend {
+                                    message: e.reason,
+                                    code: None,
+                                }),
+                            };
+                            let _ = j.reply.send(reply);
+                        }
+                        None => {
+                            let _ = j.reply.send(Err(WorkerError::Backend {
+                                message: "mock pool: merge closure not provided".into(),
+                                code: None,
+                            }));
+                        }
+                    },
+                    BackendJob::Expand(j) => {
+                        let _ = j.reply.send(Err(WorkerError::Backend {
+                            message: "mock pool does not handle Expand jobs".into(),
+                            code: None,
+                        }));
+                    }
+                    BackendJob::Synth(j) => {
+                        let _ = j.reply.send(Err(WorkerError::Backend {
+                            message: "mock pool does not handle Synth jobs".into(),
+                            code: None,
+                        }));
+                    }
+                }
+            }
+        });
+        pool
     }
 }
 
@@ -435,7 +511,7 @@ async fn run_job_with_retry(
             ),
             TaskKind::Synthesize,
         ),
-        BackendJob::Ingest(j) => (build_extract_prompt(&j.turns), TaskKind::Extract),
+        BackendJob::Ingest(j) => (build_extract_prompt(j), TaskKind::Extract),
         BackendJob::Merge(j) => (build_merge_prompt(&j.pages), TaskKind::Merge),
     };
 
@@ -527,23 +603,37 @@ async fn run_job_with_retry(
     (as_err(last_err), 0)
 }
 
-fn build_extract_prompt(turns: &[memex_core::transcript::TranscriptTurn]) -> String {
-    let payload = json!({
-        "turns": turns
-            .iter()
-            .enumerate()
-            .map(|(i, t)| json!({
-                "turn_index": i + 1,
-                "role": t.role,
-                "timestamp": t.timestamp,
-                "text": t.text,
-            }))
-            .collect::<Vec<_>>(),
+pub(crate) fn build_extract_prompt(job: &crate::daemon::queue::IngestJob) -> String {
+    let segments: Vec<serde_json::Value> = job
+        .segments
+        .iter()
+        .map(|s| {
+            let mut m = serde_json::Map::new();
+            if let Some(idx) = s.index {
+                m.insert("index".into(), idx.into());
+            }
+            if let Some(role) = &s.role {
+                m.insert("role".into(), role.clone().into());
+            }
+            if let Some(ts) = &s.timestamp {
+                m.insert("timestamp".into(), ts.clone().into());
+            }
+            m.insert("text".into(), s.text.clone().into());
+            serde_json::Value::Object(m)
+        })
+        .collect();
+    let mut payload = json!({
+        "segments": segments,
+        "source": job.source,
     });
+    if let Some(chunk) = &job.chunk {
+        payload["chunk_index"] = chunk.index.into();
+        payload["total_chunks"] = chunk.total.into();
+    }
     format!("[TASK: EXTRACT]\n\n{}\n", payload)
 }
 
-fn build_merge_prompt(pages: &[crate::daemon::queue::MergePair]) -> String {
+pub(crate) fn build_merge_prompt(pages: &[crate::daemon::queue::MergePair]) -> String {
     let payload = json!({
         "pages": pages
             .iter()
@@ -560,7 +650,24 @@ fn build_merge_prompt(pages: &[crate::daemon::queue::MergePair]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::queue::{ChunkPosition, ExtractSegment, IngestJob};
 
+    /// Build a throwaway IngestJob for prompt-shape tests. The reply channel's
+    /// receiver is dropped immediately — these tests assert on the prompt
+    /// string, not on worker round-trip.
+    fn job_for_test(
+        segments: Vec<ExtractSegment>,
+        source: &str,
+        chunk: Option<ChunkPosition>,
+    ) -> IngestJob {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        IngestJob {
+            segments,
+            source: source.into(),
+            chunk,
+            reply: tx,
+        }
+    }
 
     #[test]
     fn context_threshold_resolves_for_each_agent() {
@@ -580,27 +687,175 @@ mod tests {
     }
 
     #[test]
-    fn build_extract_prompt_uses_structured_turns_with_timestamp() {
-        let turns = vec![
-            memex_core::transcript::TranscriptTurn {
-                role: "user".to_string(),
-                timestamp: Some("2026-04-23T12:00:00Z".to_string()),
-                text: "hello".to_string(),
-            },
-            memex_core::transcript::TranscriptTurn {
-                role: "assistant".to_string(),
-                timestamp: Some("2026-04-23T12:00:01Z".to_string()),
-                text: "world".to_string(),
-            },
-        ];
-        let p = build_extract_prompt(&turns);
+    fn build_extract_prompt_emits_role_and_timestamp_for_transcript_segments() {
+        let job = job_for_test(
+            vec![
+                ExtractSegment {
+                    index: Some(1),
+                    role: Some("user".into()),
+                    timestamp: Some("2026-04-23T12:00:00Z".into()),
+                    text: "hello".into(),
+                },
+                ExtractSegment {
+                    index: Some(2),
+                    role: Some("assistant".into()),
+                    timestamp: Some("2026-04-23T12:00:01Z".into()),
+                    text: "world".into(),
+                },
+            ],
+            "/tmp/transcript.jsonl",
+            None,
+        );
+        let p = build_extract_prompt(&job);
+        assert!(p.starts_with("[TASK: EXTRACT]"));
+        assert!(p.contains("\"role\":\"user\""));
+        assert!(p.contains("\"role\":\"assistant\""));
         assert!(p.contains("\"timestamp\":\"2026-04-23T12:00:00Z\""));
-        assert!(p.contains("\"timestamp\":\"2026-04-23T12:00:01Z\""));
+        assert!(p.contains("\"source\":\"/tmp/transcript.jsonl\""));
+        assert!(!p.contains("\"chunk_index\""), "transcript prompt must not include chunk metadata");
     }
 
     #[test]
-    fn build_extract_prompt_handles_empty_turns() {
-        let p = build_extract_prompt(&[]);
-        assert!(p.contains("\"turns\":[]"));
+    fn build_extract_prompt_handles_empty_segments() {
+        let job = job_for_test(vec![], "/tmp/empty.jsonl", None);
+        let p = build_extract_prompt(&job);
+        assert!(p.contains("\"segments\":[]"));
+    }
+
+    #[test]
+    fn build_extract_prompt_omits_role_for_document_segments() {
+        let job = job_for_test(
+            vec![ExtractSegment {
+                index: None,
+                role: None,
+                timestamp: None,
+                text: "# Heading\n\nbody".into(),
+            }],
+            "https://example.com/doc",
+            None,
+        );
+        let p = build_extract_prompt(&job);
+        assert!(p.starts_with("[TASK: EXTRACT]"));
+        assert!(!p.contains("\"role\""), "document segment must not emit role: {p}");
+        assert!(p.contains("\"text\":\"# Heading"));
+        assert!(p.contains("\"source\":\"https://example.com/doc\""));
+    }
+
+    #[test]
+    fn build_extract_prompt_includes_chunk_metadata_when_set() {
+        let job = job_for_test(
+            vec![ExtractSegment {
+                index: None,
+                role: None,
+                timestamp: None,
+                text: "chunk body".into(),
+            }],
+            "https://x.test/p",
+            Some(ChunkPosition { index: 1, total: 3 }),
+        );
+        let p = build_extract_prompt(&job);
+        assert!(p.starts_with("[TASK: EXTRACT]"));
+        assert!(p.contains("\"chunk_index\":1"), "expected chunk_index=1: {p}");
+        assert!(p.contains("\"total_chunks\":3"));
+    }
+
+    #[test]
+    fn build_extract_prompt_omits_chunk_metadata_when_unset() {
+        let job = job_for_test(
+            vec![ExtractSegment {
+                index: None,
+                role: None,
+                timestamp: None,
+                text: "single-chunk doc".into(),
+            }],
+            "https://x.test/p",
+            None,
+        );
+        let p = build_extract_prompt(&job);
+        assert!(p.starts_with("[TASK: EXTRACT]"));
+        assert!(!p.contains("\"chunk_index\""));
+        assert!(!p.contains("\"total_chunks\""));
+    }
+
+    #[test]
+    fn build_extract_prompt_loses_no_segment_information() {
+        use serde_json::Value;
+
+        let segments = vec![
+            ExtractSegment {
+                index: Some(1),
+                role: Some("user".into()),
+                timestamp: Some("2026-04-23T12:00:00Z".into()),
+                text: "first turn".into(),
+            },
+            ExtractSegment {
+                index: Some(2),
+                role: Some("assistant".into()),
+                timestamp: Some("2026-04-23T12:00:30Z".into()),
+                text: "reply with \"quotes\" and\nnewlines".into(),
+            },
+            ExtractSegment {
+                index: Some(3),
+                role: Some("user".into()),
+                timestamp: None, // some agents miss timestamps on system turns
+                text: "no timestamp on this one".into(),
+            },
+            ExtractSegment {
+                index: Some(4),
+                role: Some("tool".into()),
+                timestamp: Some("2026-04-23T12:01:00Z".into()),
+                text: "tool output with unicode: ✓ ☃ and a tab\there".into(),
+            },
+        ];
+        let job = job_for_test(segments.clone(), "/path/to/session.jsonl", None);
+        let p = build_extract_prompt(&job);
+
+        let body = p
+            .strip_prefix("[TASK: EXTRACT]\n\n")
+            .expect("missing [TASK: EXTRACT] header")
+            .trim_end();
+        let parsed: Value = serde_json::from_str(body)
+            .expect("prompt body must be valid JSON");
+
+        let segs = parsed["segments"].as_array().expect("segments must be an array");
+        assert_eq!(segs.len(), segments.len(), "all segments must be preserved");
+
+        for (i, expected) in segments.iter().enumerate() {
+            let actual = &segs[i];
+            assert_eq!(
+                actual["text"].as_str(),
+                Some(expected.text.as_str()),
+                "segment {i} text must round-trip exactly (special chars too)",
+            );
+            assert_eq!(
+                actual["role"].as_str(),
+                expected.role.as_deref(),
+                "segment {i} role must match",
+            );
+            match &expected.timestamp {
+                Some(ts) => assert_eq!(
+                    actual["timestamp"].as_str(),
+                    Some(ts.as_str()),
+                    "segment {i} timestamp must match when present",
+                ),
+                None => assert!(
+                    actual.get("timestamp").is_none(),
+                    "segment {i} missing timestamp must be absent in output, not null",
+                ),
+            }
+            match expected.index {
+                Some(idx) => assert_eq!(
+                    actual["index"].as_u64(),
+                    Some(idx as u64),
+                    "segment {i} index must match",
+                ),
+                None => assert!(actual.get("index").is_none()),
+            }
+        }
+        assert_eq!(
+            parsed["source"].as_str(),
+            Some("/path/to/session.jsonl"),
+            "source must be preserved in envelope",
+        );
     }
 }

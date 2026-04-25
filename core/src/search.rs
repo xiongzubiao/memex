@@ -686,6 +686,53 @@ pub fn resolve_ref(conn: &rusqlite::Connection, reference: &str) -> Result<Vec<D
 // Bm25Search
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobType {
+    Transcript,
+    Document,
+}
+
+impl JobType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobType::Transcript => "transcript",
+            JobType::Document => "document",
+        }
+    }
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "transcript" => Some(JobType::Transcript),
+            "document" => Some(JobType::Document),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingJob {
+    pub job_id: String,
+    pub job_type: JobType,
+    pub source_path: String,
+    pub agent: Option<String>,
+    pub content_hash: String,
+    pub memex_root: String,
+    pub collections: Vec<String>,
+}
+
+/// One row of the `memex source list` output. Exposed as a public type so the
+/// CLI can format it (or emit JSON via serde).
+#[derive(Debug, serde::Serialize)]
+pub struct SourceListRow {
+    pub docid: String,
+    pub path: String,
+    pub title: String,
+    pub size_bytes: usize,
+    pub created_at: String,
+    pub updated_at: String,
+    pub collections: Vec<String>,
+}
+
 /// BM25 full-text search backed by SQLite FTS5.
 ///
 /// Uses the new content-addressable schema (content/documents/documents_fts)
@@ -888,6 +935,93 @@ impl Bm25Search {
         let path_str = path.to_string_lossy();
         self.query_single_string("SELECT docid FROM documents WHERE path = ?1", &path_str)
             .map(|opt| opt.filter(|s| !s.is_empty()))
+    }
+
+    /// Get the docid for a source document by its content hash. Used by
+    /// `handle_source_add` to dedup repeated identical content.
+    pub fn lookup_source_docid_by_hash(&self, hash: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        let mut stmt = conn
+            .prepare("SELECT docid FROM documents WHERE doc_type = 'source' AND hash = ?1 LIMIT 1")
+            .map_err(sqlite_err)?;
+        let docid: Option<String> = stmt
+            .query_row(rusqlite::params![hash], |row| row.get(0))
+            .optional()
+            .map_err(sqlite_err)?;
+        Ok(docid)
+    }
+
+    /// Look up a source document by its source path. Used by
+    /// `handle_source_delete` to resolve the `path:<source-path>` ref form.
+    pub fn lookup_source_by_path(
+        &self,
+        source_path: &str,
+    ) -> Result<Option<crate::types::Document>> {
+        use rusqlite::OptionalExtension;
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, doc_type, path, title, hash, docid, tags, summary, created_at, updated_at \
+                 FROM documents WHERE doc_type = 'source' AND path = ?1 LIMIT 1",
+            )
+            .map_err(sqlite_err)?;
+        let doc = stmt
+            .query_row(rusqlite::params![source_path], |row| {
+                Ok(crate::types::Document {
+                    id: row.get(0)?,
+                    doc_type: row.get(1)?,
+                    path: row.get(2)?,
+                    title: row.get(3)?,
+                    hash: row.get(4)?,
+                    docid: row.get(5)?,
+                    tags: row.get(6)?,
+                    summary: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })
+            .optional()
+            .map_err(sqlite_err)?;
+        Ok(doc)
+    }
+
+    /// Return wiki page slugs whose frontmatter `sources:` field contains
+    /// `source_path`. Implementation: scan all wiki page rows, parse each
+    /// frontmatter as a generic YAML map (so we tolerate pages missing the
+    /// strict required `created_at`/`updated_at` fields), and check the
+    /// sources list. The row scan is simple and small (wiki page counts
+    /// are typically < 1000).
+    pub fn wiki_pages_referencing_source(&self, source_path: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT d.path, c.doc FROM documents d \
+                 JOIN content c ON c.hash = d.hash \
+                 WHERE d.doc_type = 'wiki'",
+            )
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let path: String = row.get(0)?;
+                let body: String = row.get(1)?;
+                Ok((path, body))
+            })
+            .map_err(sqlite_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (path, body) = row.map_err(sqlite_err)?;
+            if frontmatter_lists_source(&body, source_path) {
+                // Wiki path is `wiki/<slug>.md`; extract slug.
+                let slug = std::path::Path::new(&path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&path)
+                    .to_string();
+                out.push(slug);
+            }
+        }
+        Ok(out)
     }
 
     /// Get the collection names attached to a document by doc_type and path.
@@ -1266,17 +1400,34 @@ impl Bm25Search {
     pub fn insert_ingest_job(
         &self,
         job_id: &str,
-        transcript_path: &str,
+        job_type: JobType,
+        source_path: &str,
+        agent: Option<&str>,
         content_hash: &str,
-        agent: &str,
         memex_root: &str,
+        collections: &[String],
     ) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
         let now = now_rfc3339();
+        let collections_json = serde_json::to_string(collections)
+            .map_err(|e| crate::error::MemexError::Internal(format!("collections json: {e}")))?;
         conn.execute(
-            "INSERT OR IGNORE INTO ingest_jobs (job_id, transcript_path, content_hash, agent, memex_root, status, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
-            rusqlite::params![job_id, transcript_path, content_hash, agent, memex_root, &now, &now],
-        ).map_err(sqlite_err)?;
+            "INSERT OR IGNORE INTO ingest_jobs \
+             (job_id, job_type, source_path, agent, content_hash, memex_root, collections, status, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9)",
+            rusqlite::params![
+                job_id,
+                job_type.as_str(),
+                source_path,
+                agent,
+                content_hash,
+                memex_root,
+                collections_json,
+                &now,
+                &now
+            ],
+        )
+        .map_err(sqlite_err)?;
         Ok(())
     }
 
@@ -1296,19 +1447,44 @@ impl Bm25Search {
         Ok(())
     }
 
-    pub fn pending_ingest_jobs(&self) -> Result<Vec<(String, String, String, String)>> {
+    pub fn pending_ingest_jobs(&self) -> Result<Vec<PendingJob>> {
         let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
         let mut stmt = conn.prepare(
-            "SELECT job_id, transcript_path, agent, memex_root FROM ingest_jobs WHERE status IN ('pending', 'processing')"
-        ).map_err(sqlite_err)?;
+            "SELECT job_id, job_type, source_path, agent, content_hash, memex_root, collections \
+             FROM ingest_jobs WHERE status IN ('pending', 'processing')",
+        )
+        .map_err(sqlite_err)?;
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                let job_type_s: String = row.get(1)?;
+                let collections_s: String = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    job_type_s,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    collections_s,
+                ))
             })
             .map_err(sqlite_err)?;
         let mut jobs = Vec::new();
         for row in rows {
-            jobs.push(row.map_err(sqlite_err)?);
+            let (job_id, job_type_s, source_path, agent, content_hash, memex_root, collections_s) =
+                row.map_err(sqlite_err)?;
+            let job_type = JobType::from_str(&job_type_s)
+                .ok_or_else(|| crate::error::MemexError::Internal(format!("bad job_type: {job_type_s}")))?;
+            let collections: Vec<String> = serde_json::from_str(&collections_s).unwrap_or_default();
+            jobs.push(PendingJob {
+                job_id,
+                job_type,
+                source_path,
+                agent,
+                content_hash,
+                memex_root,
+                collections,
+            });
         }
         Ok(jobs)
     }
@@ -1323,6 +1499,54 @@ impl Bm25Search {
             )
             .map_err(sqlite_err)?;
         Ok(count as usize)
+    }
+
+    /// List source documents (doc_type = 'source'). When `collection_filter`
+    /// is non-empty, only sources belonging to one of the named collections
+    /// are returned. Sorted by `updated_at DESC`.
+    pub fn list_sources(&self, collection_filter: &[String]) -> Result<Vec<SourceListRow>> {
+        let sql = "SELECT d.docid, d.path, d.title, LENGTH(c.doc) AS size, d.created_at, d.updated_at \
+                   FROM documents d JOIN content c ON c.hash = d.hash \
+                   WHERE d.doc_type = 'source' \
+                   ORDER BY d.updated_at DESC";
+        let rows = {
+            let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
+            let mut stmt = conn.prepare(sql).map_err(sqlite_err)?;
+            let iter = stmt
+                .query_map([], |row| {
+                    Ok(SourceListRow {
+                        docid: row.get(0)?,
+                        path: row.get(1)?,
+                        title: row.get(2)?,
+                        size_bytes: row.get::<_, i64>(3)? as usize,
+                        created_at: row.get(4)?,
+                        updated_at: row.get(5)?,
+                        collections: Vec::new(),
+                    })
+                })
+                .map_err(sqlite_err)?;
+            let mut out: Vec<SourceListRow> = Vec::new();
+            for r in iter {
+                out.push(r.map_err(sqlite_err)?);
+            }
+            out
+        };
+        // Drop the lock before `document_collections_by_path`, which re-locks.
+        let mut filtered = Vec::with_capacity(rows.len());
+        for mut row in rows {
+            row.collections = self
+                .document_collections_by_path("source", &row.path)
+                .unwrap_or_default();
+            if collection_filter.is_empty()
+                || row
+                    .collections
+                    .iter()
+                    .any(|c| collection_filter.iter().any(|f| f == c))
+            {
+                filtered.push(row);
+            }
+        }
+        Ok(filtered)
     }
 
     /// Return all wiki documents (doc_type = 'wiki').
@@ -1767,6 +1991,36 @@ fn file_mtime_iso(path: &Path) -> String {
             dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         })
         .unwrap_or_default()
+}
+
+/// Best-effort check: does the YAML frontmatter at the head of `body` list
+/// `source_path` under `sources:`? Tolerant of pages missing `created_at`
+/// or `updated_at` (the strict `PageFrontmatter` schema rejects those, but
+/// we don't care about those fields for this query). Returns false on any
+/// parse failure or missing frontmatter.
+fn frontmatter_lists_source(body: &str, source_path: &str) -> bool {
+    let trimmed = body.trim_start();
+    let after = match trimmed.strip_prefix("---\n").or_else(|| trimmed.strip_prefix("---")) {
+        Some(s) => s,
+        None => return false,
+    };
+    let close = match after.find("\n---") {
+        Some(i) => i,
+        None => return false,
+    };
+    let yaml_block = &after[..close];
+    // Try generic YAML parse to find a `sources:` array.
+    let parsed: serde_yaml::Value = match serde_yaml::from_str(yaml_block) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let sources = match parsed.get("sources").and_then(|v| v.as_sequence()) {
+        Some(s) => s,
+        None => return false,
+    };
+    sources
+        .iter()
+        .any(|v| v.as_str().map(|s| s == source_path).unwrap_or(false))
 }
 
 /// Convert a rusqlite error into a MemexError::Io.
@@ -3098,6 +3352,50 @@ mod tests {
 
         let missing = search.lookup_title("nonexistent").unwrap();
         assert_eq!(missing, None);
+    }
+
+    #[test]
+    fn ingest_jobs_inserts_and_lists_transcript_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
+        let s = memex.search();
+        s.insert_ingest_job(
+            "job-t1",
+            crate::search::JobType::Transcript,
+            "/abs/path/to/session.jsonl",
+            Some("claude-code"),
+            "deadbeef".repeat(8).as_str(),
+            dir.path().to_str().unwrap(),
+            &["default".to_string()],
+        )
+        .unwrap();
+        let jobs = s.pending_ingest_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "job-t1");
+        assert_eq!(jobs[0].job_type, crate::search::JobType::Transcript);
+        assert_eq!(jobs[0].agent.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn ingest_jobs_inserts_and_lists_document_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
+        let s = memex.search();
+        s.insert_ingest_job(
+            "job-d1",
+            crate::search::JobType::Document,
+            "https://example.com/post",
+            None,
+            "cafebabe".repeat(8).as_str(),
+            dir.path().to_str().unwrap(),
+            &["team-a".to_string(), "incidents".to_string()],
+        )
+        .unwrap();
+        let jobs = s.pending_ingest_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, crate::search::JobType::Document);
+        assert_eq!(jobs[0].agent, None);
+        assert_eq!(jobs[0].collections, vec!["team-a", "incidents"]);
     }
 }
 

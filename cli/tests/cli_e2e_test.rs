@@ -715,47 +715,32 @@ fn write_force_preserves_docid() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn write_creates_wiki_page_with_source() {
+fn write_direct_rejects_source_flag() {
+    // Task 18: --direct does not support --source (the daemon path
+    // attaches sources by docid; --direct is an escape hatch that
+    // bypasses the daemon, and source-docid lookup needs the daemon's
+    // resolution path).
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("memex");
-
-    // Create a source file on disk.
-    let source_path = dir.path().join("meeting-notes.txt");
-    std::fs::write(
-        &source_path,
-        "Meeting notes from 2026-04-10: discussed caching strategies.\n",
-    )
-    .unwrap();
 
     let content = make_page(
         "Caching Strategy",
         "We decided on LRU-based caching with TTL eviction.",
     );
-    let source_arg = source_path.to_string_lossy().to_string();
     let output = run_write(
         &root,
         "caching-strategy",
         &content,
-        &["--source", &source_arg],
+        &["--source", "src-doesnotexist"],
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        output.status.success(),
-        "write with source should succeed, stderr: {stderr}"
+        !output.status.success(),
+        "--direct --source should fail, stderr: {stderr}"
     );
     assert!(
-        stdout.contains("written:"),
-        "expected 'written:' in output, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("wiki_pages:"),
-        "expected 'wiki_pages:' in output, got: {stdout}"
-    );
-    // Wiki page should exist on disk.
-    assert!(
-        root.join("wiki/caching-strategy.md").exists(),
-        "wiki page file should exist"
+        stderr.contains("--source attachment not supported with --direct"),
+        "expected explicit error message, got: {stderr}"
     );
 }
 
@@ -935,41 +920,10 @@ fn write_populates_chunks_table() {
     );
 }
 
-#[test]
-fn write_source_populates_chunks_table() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
+// Task 18: --direct does not attach sources. Source-attachment
+// integration is exercised via the daemon path in
+// `cli/tests/source_add_test.rs::write_with_source_docid_succeeds`.
 
-    // Create a source file.
-    let source_path = dir.path().join("notes.txt");
-    std::fs::write(
-        &source_path,
-        "Source document content for embedding test.\n",
-    )
-    .unwrap();
-
-    let content = make_page("With Source", "A page with an attached source document.");
-    let source_arg = source_path.to_string_lossy().to_string();
-    let out = run_write(&root, "with-source", &content, &["--source", &source_arg]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "write with source should succeed, stderr: {stderr}"
-    );
-
-    // Open DB and count distinct hashes in chunks table.
-    let db_path = root.join(".search.db");
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let distinct_hashes: i64 = conn
-        .query_row("SELECT COUNT(DISTINCT hash) FROM chunks", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert!(
-        distinct_hashes >= 2,
-        "expected chunks for both wiki page and source doc, got {distinct_hashes} distinct hashes"
-    );
-}
 
 #[test]
 fn write_force_replaces_chunks() {
@@ -1333,31 +1287,9 @@ fn lint_detects_dangling_after_delete() {
 // ---------------------------------------------------------------------------
 // Multiple sources
 // ---------------------------------------------------------------------------
-
-#[test]
-fn write_with_multiple_sources() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path().join("memex");
-
-    let src_a = dir.path().join("notes-a.txt");
-    let src_b = dir.path().join("notes-b.txt");
-    std::fs::write(&src_a, "Alpha source content about caching.\n").unwrap();
-    std::fs::write(&src_b, "Beta source content about networking.\n").unwrap();
-
-    let content = make_page("Multi-Source Page", "A page with two source attachments.");
-    let output = run_write(
-        &root,
-        "multi-source",
-        &content,
-        &[
-            "--source",
-            src_a.to_str().unwrap(),
-            "--source",
-            src_b.to_str().unwrap(),
-        ],
-    );
-    assert!(output.status.success());
-}
+// Task 18: --source is now Option<String>, not Vec<String>. Multi-source
+// attachment is no longer a CLI concept; the daemon's Write path attaches
+// at most one source by docid.
 
 // ---------------------------------------------------------------------------
 // --force on non-existent page

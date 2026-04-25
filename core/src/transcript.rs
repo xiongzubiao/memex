@@ -37,6 +37,23 @@ pub enum SessionFilter {
     InternalSession,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptAgent {
+    ClaudeCode,
+    Codex,
+    GeminiCli,
+}
+
+impl TranscriptAgent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TranscriptAgent::ClaudeCode => "claude-code",
+            TranscriptAgent::Codex => "codex",
+            TranscriptAgent::GeminiCli => "gemini-cli",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CleanedTranscript {
     pub turns: Vec<TranscriptTurn>,
@@ -76,7 +93,7 @@ pub fn strip_tags(s: &str) -> String {
 
 /// Redact common secret patterns from a string.
 /// Uses Cow to avoid allocation when no secrets are found.
-fn redact_secrets(s: &str) -> String {
+pub fn redact_secrets(s: &str) -> String {
     let mut result = std::borrow::Cow::Borrowed(s);
     for re in SECRET_PATTERNS.iter() {
         if let std::borrow::Cow::Owned(replaced) = re.replace_all(&result, "[REDACTED]") {
@@ -574,4 +591,137 @@ pub fn parse_gemini_cli_session(json_str: &str) -> Result<CleanedTranscript, Str
         first_user_message,
         filter,
     })
+}
+
+/// Inspect a file's content to determine which agent's transcript format it
+/// matches, if any. Returns None if the file doesn't look like a transcript
+/// (extension mismatch, malformed JSON, no recognizable signature keys).
+///
+/// Used by the CLI when `--agent` is omitted to choose between transcript
+/// mode and document file mode. The daemon never calls this — it receives
+/// fully-typed IngestSource requests.
+pub fn detect_transcript_agent(path: &std::path::Path) -> Option<TranscriptAgent> {
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+
+    match ext {
+        "json" => {
+            // Gemini: single JSON object with `messages` field.
+            let raw = std::fs::read_to_string(path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            if v.is_object()
+                && v.get("messages").map(|m| m.is_array()).unwrap_or(false)
+            {
+                Some(TranscriptAgent::GeminiCli)
+            } else {
+                None
+            }
+        }
+        "jsonl" => {
+            use std::io::BufRead;
+            let f = std::fs::File::open(path).ok()?;
+            let r = std::io::BufReader::new(f);
+            for line in r.lines() {
+                let line = line.ok()?;
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let v: serde_json::Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(_) => return None,
+                };
+                if v.get("type").is_some()
+                    && (v.get("uuid").is_some() || v.get("parentUuid").is_some())
+                {
+                    return Some(TranscriptAgent::ClaudeCode);
+                }
+                if v.get("event_msg").is_some() || v.get("response_id").is_some() {
+                    return Some(TranscriptAgent::Codex);
+                }
+                return None;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_secrets_redacts_known_patterns() {
+        let s = "key sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA bla AKIAABCDEFGHIJKLMNOP after\npassword=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let out = redact_secrets(s);
+        assert!(!out.contains("sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {out}");
+        assert!(!out.contains("AKIAABCDEFGHIJKLMNOP"), "got: {out}");
+        assert!(!out.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {out}");
+    }
+
+    #[test]
+    fn detect_claude_code_jsonl() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"user","uuid":"abc","message":{"role":"user","content":"hi"}}
+{"type":"assistant","parentUuid":"abc","message":{"role":"assistant","content":"hello"}}
+"#,
+        ).unwrap();
+        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::ClaudeCode));
+    }
+
+    #[test]
+    fn detect_codex_jsonl() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"event_msg":"started","response_id":"r1"}
+"#,
+        ).unwrap();
+        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::Codex));
+    }
+
+    #[test]
+    fn detect_gemini_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(
+            &path,
+            r#"{"messages": [{"role": "user", "parts": [{"text": "hi"}]}]}"#,
+        ).unwrap();
+        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+    }
+
+    #[test]
+    fn detect_returns_none_for_markdown_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, "# Title\n\nbody\n").unwrap();
+        assert_eq!(detect_transcript_agent(&path), None);
+    }
+
+    #[test]
+    fn detect_returns_none_for_jsonl_with_unknown_schema() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("data.jsonl");
+        std::fs::write(&path, "{\"id\": 1, \"value\": \"foo\"}\n").unwrap();
+        assert_eq!(detect_transcript_agent(&path), None);
+    }
+
+    #[test]
+    fn detect_returns_none_for_malformed_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("broken.jsonl");
+        std::fs::write(&path, "not json\n").unwrap();
+        assert_eq!(detect_transcript_agent(&path), None);
+    }
+
+    #[test]
+    fn detect_returns_none_for_nonexistent_file() {
+        let path = std::path::PathBuf::from("/tmp/does-not-exist-12345.jsonl");
+        assert_eq!(detect_transcript_agent(&path), None);
+    }
 }

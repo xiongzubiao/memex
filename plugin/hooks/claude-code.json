@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "memex ingest --agent claude-code",
+            "command": "node ${MEMEX_PLUGIN_DIR}/hooks/claude-code-session-end.js",
             "timeout": 10
           }
         ]

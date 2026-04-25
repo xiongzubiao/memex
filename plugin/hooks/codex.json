@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "memex ingest --agent codex",
+            "command": "node ${MEMEX_PLUGIN_DIR}/hooks/codex-stop.js",
             "timeout": 10
           }
         ]

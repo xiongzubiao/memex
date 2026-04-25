@@ -79,6 +79,16 @@ function copyLibFiles(dir, dest, prefix) {
   }
 }
 
+/** Rewrite ${MEMEX_PLUGIN_DIR} placeholders in a hooks JSON to absolute path. */
+function rewriteHooksFile(hooksPath, pluginDir) {
+  if (!fs.existsSync(hooksPath)) return;
+  const raw = fs.readFileSync(hooksPath, "utf8");
+  const rewritten = raw.replace(/\$\{MEMEX_PLUGIN_DIR\}/g, pluginDir);
+  if (rewritten !== raw) {
+    fs.writeFileSync(hooksPath, rewritten);
+  }
+}
+
 /** Check common system locations for an existing ONNX Runtime install. */
 function findSystemOrt(libName) {
   // Respect explicit env var.
@@ -165,6 +175,20 @@ async function main() {
       fs.rmSync(archiveDest, { force: true });
       console.log("ONNX Runtime ready.");
     }
+  }
+
+  // 4. Rewrite ${MEMEX_PLUGIN_DIR} placeholders in hooks JSON to absolute paths.
+  const PLUGIN_DIR = __dirname;
+  rewriteHooksFile(path.join(PLUGIN_DIR, "hooks", "claude-code.json"), PLUGIN_DIR);
+  rewriteHooksFile(path.join(PLUGIN_DIR, "hooks", "codex.json"), PLUGIN_DIR);
+  rewriteHooksFile(path.join(PLUGIN_DIR, "hooks", "gemini-cli.json"), PLUGIN_DIR);
+
+  // 5. Stop any running memex daemon so the next request loads the new binary.
+  try {
+    execSync(`${JSON.stringify(binaryDest)} daemon stop`, { stdio: "pipe" });
+    console.log("Stopped any running memex daemon (will relaunch on next CLI use)");
+  } catch (e) {
+    // No-op: daemon wasn't running, or stop failed harmlessly.
   }
 
   console.log("memex ready.");
