@@ -6,14 +6,23 @@ use std::fmt;
 pub enum DaemonError {
     BadRequest(String),
     VersionMismatch { supported: Vec<u32> },
-    NotImplemented(String),
-    RetrievalEmpty,
+    /// Retrieval returned no results. `collections` carries the user's
+    /// filter (empty = no filter); `Display` formats it as either
+    /// "no indexed content for MEMEX_ROOT" or "no documents matched in
+    /// collection(s): X, Y".
+    RetrievalEmpty { collections: Vec<String> },
     Internal(String),
     SubprocessTimeout,
     /// Subprocess crashed. Carries the diagnostic (combined context +
     /// drained stderr) so the user sees why, not just a generic message.
     SubprocessCrashed(String),
     BackendUnavailable(String),
+    /// Operation blocked by a dependency (e.g. backlinks referencing the page
+    /// being deleted). The message explains what is blocking and how to override.
+    Conflict(String),
+    /// Storage/database error. Wraps the string representation of the underlying
+    /// MemexError so that DaemonError keeps its Clone + PartialEq + Eq derives.
+    Storage(String),
 }
 
 impl DaemonError {
@@ -21,12 +30,13 @@ impl DaemonError {
         match self {
             DaemonError::BadRequest(_) => "bad_request",
             DaemonError::VersionMismatch { .. } => "version_mismatch",
-            DaemonError::NotImplemented(_) => "not_implemented",
-            DaemonError::RetrievalEmpty => "retrieval_empty",
+            DaemonError::RetrievalEmpty { .. } => "retrieval_empty",
             DaemonError::Internal(_) => "internal",
             DaemonError::SubprocessTimeout => "subprocess_timeout",
             DaemonError::SubprocessCrashed(_) => "subprocess_crashed",
             DaemonError::BackendUnavailable(_) => "backend_unavailable",
+            DaemonError::Conflict(_) => "conflict",
+            DaemonError::Storage(_) => "storage_error",
         }
     }
 
@@ -37,32 +47,45 @@ impl DaemonError {
         }
     }
 
+    /// Inner reason carried by the variant — the data, no English prefix
+    /// that duplicates `code_str()`. Variants with no payload supply a
+    /// short description that adds context beyond the code (e.g. which
+    /// config knob is involved). `Display` drops the trailing colon when
+    /// this returns an empty string.
     pub fn message(&self) -> String {
         match self {
-            DaemonError::BadRequest(msg) => msg.clone(),
-            DaemonError::VersionMismatch { supported } => {
-                format!("protocol version not supported (supported: {supported:?})")
+            DaemonError::BadRequest(reason) => reason.clone(),
+            DaemonError::VersionMismatch { supported } => format!("{supported:?}"),
+            DaemonError::RetrievalEmpty { collections } => {
+                if collections.is_empty() {
+                    "no indexed content for MEMEX_ROOT".to_string()
+                } else {
+                    format!(
+                        "no documents matched in collection(s): {}",
+                        collections.join(", ")
+                    )
+                }
             }
-            DaemonError::NotImplemented(op) => format!("op '{op}' not implemented in this build"),
-            DaemonError::RetrievalEmpty => "no indexed content for MEMEX_ROOT".to_string(),
-            DaemonError::Internal(msg) => msg.clone(),
-            DaemonError::SubprocessTimeout => "backend subprocess timed out".to_string(),
-            DaemonError::SubprocessCrashed(reason) if reason.is_empty() => {
-                "backend subprocess crashed".to_string()
+            DaemonError::Internal(reason) => reason.clone(),
+            DaemonError::SubprocessTimeout => {
+                "no reply within daemon.worker.timeout_sec".to_string()
             }
-            DaemonError::SubprocessCrashed(reason) => {
-                format!("backend subprocess crashed: {reason}")
-            }
-            DaemonError::BackendUnavailable(reason) => {
-                format!("configured backend provider not available: {reason}")
-            }
+            DaemonError::SubprocessCrashed(reason) => reason.clone(),
+            DaemonError::BackendUnavailable(reason) => reason.clone(),
+            DaemonError::Conflict(msg) => msg.clone(),
+            DaemonError::Storage(msg) => msg.clone(),
         }
     }
 }
 
 impl fmt::Display for DaemonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code_str(), self.message())
+        let reason = self.message();
+        if reason.is_empty() {
+            write!(f, "{}", self.code_str())
+        } else {
+            write!(f, "{}: {}", self.code_str(), reason)
+        }
     }
 }
 
@@ -126,6 +149,52 @@ mod tests {
             }
             other => panic!("expected BackendUnavailable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn display_drops_colon_when_message_is_empty() {
+        // Variants whose payload is empty render as just the code.
+        assert_eq!(
+            DaemonError::SubprocessCrashed("".into()).to_string(),
+            "subprocess_crashed"
+        );
+        assert_eq!(
+            DaemonError::BackendUnavailable("".into()).to_string(),
+            "backend_unavailable"
+        );
+        // Variants with a populated payload render as `code: payload`.
+        assert_eq!(
+            DaemonError::SubprocessCrashed("EOF".into()).to_string(),
+            "subprocess_crashed: EOF"
+        );
+        assert_eq!(
+            DaemonError::BackendUnavailable("[404] missing".into()).to_string(),
+            "backend_unavailable: [404] missing"
+        );
+        // Field-less variants supply a short description that adds info
+        // beyond the code (which config knob, what's missing, etc.).
+        assert_eq!(
+            DaemonError::SubprocessTimeout.to_string(),
+            "subprocess_timeout: no reply within daemon.worker.timeout_sec"
+        );
+        assert_eq!(
+            DaemonError::RetrievalEmpty { collections: vec![] }.to_string(),
+            "retrieval_empty: no indexed content for MEMEX_ROOT"
+        );
+        assert_eq!(
+            DaemonError::RetrievalEmpty {
+                collections: vec!["notes".into()]
+            }
+            .to_string(),
+            "retrieval_empty: no documents matched in collection(s): notes"
+        );
+        assert_eq!(
+            DaemonError::RetrievalEmpty {
+                collections: vec!["a".into(), "b".into()]
+            }
+            .to_string(),
+            "retrieval_empty: no documents matched in collection(s): a, b"
+        );
     }
 
     #[test]

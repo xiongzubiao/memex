@@ -1,21 +1,52 @@
 pub mod chunk;
+pub mod chunking;
 pub mod config;
-pub mod content;
 pub mod crosslink;
 pub mod docid;
 pub mod embed;
 pub mod error;
 pub mod index;
+pub mod index_raw;
+pub mod index_wiki;
+pub mod llm_cache;
 pub mod lint;
 pub mod model;
+pub mod raw;
+pub mod reconcile;
 pub mod retrieval;
 pub mod schema;
 pub mod search;
+pub mod snippet;
 pub mod storage;
 pub mod transcript;
 pub mod types;
 pub mod validate;
 pub mod vector;
+pub mod wiki;
+
+/// Read a document body from disk under `memex_root` and strip any leading
+/// YAML frontmatter. Used by query/lint paths that materialize chunk
+/// snippets via `(pos, len)` offsets — the returned body bytes MUST match
+/// what `commit_doc` hashed at write time, otherwise `body[pos..pos+len]`
+/// shifts by a byte and snippets misalign.
+pub fn read_body_from_disk(
+    memex_root: &std::path::Path,
+    doc_type: &str,
+    rel_path: &str,
+) -> error::Result<String> {
+    let abs = memex_root.join(rel_path);
+    let bytes = std::fs::read(&abs).map_err(|e| error::MemexError::FileOpFailed {
+        path: abs.clone(),
+        operation: "read body",
+        source: e,
+    })?;
+    let s = String::from_utf8(bytes).map_err(|e| {
+        error::MemexError::Other(anyhow::anyhow!("non-utf8 body at {rel_path}: {e}"))
+    })?;
+    let _ = doc_type;
+    let body = storage::split_frontmatter(&s).map_or(s.as_str(), |(_, b)| b);
+    Ok(body.to_string())
+}
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,7 +55,7 @@ use config::Config;
 use search::Bm25Search;
 
 /// Filename for the BM25 + content SQLite database.
-pub const SEARCH_DB_NAME: &str = ".search.db";
+pub const INDEX_DB_NAME: &str = "index.db";
 
 /// RAII writer lock. Releases OS-level flock on Drop. OS also releases on
 /// process crash, so no manual cleanup needed even on SIGKILL.
@@ -65,33 +96,35 @@ impl Memex {
     /// returns empty, lint scans work.
     ///
     /// Propagates Config::load errors (MalformedConfig, InvalidEnvVar) rather
-    /// than silently defaulting — the spec requires every command to fail
-    /// with a clear error when the user's configured timeout is unusable.
+    /// than silently defaulting — every command must fail with a clear
+    /// error when the user's configured timeout is unusable.
     pub fn open(root: PathBuf) -> error::Result<Self> {
         let config = Config::load(&root)?;
-        if !root.join("wiki").is_dir() {
-            let wiki_dir = root.join("wiki");
-            fs::create_dir_all(&wiki_dir).map_err(|e| error::MemexError::FileOpFailed {
-                path: wiki_dir.clone(),
-                operation: "create wiki dir",
-                source: e,
-            })?;
-        }
-        let search = Bm25Search::open(&root.join(SEARCH_DB_NAME))?;
+        let wiki_dir = config.wiki_dir(&root);
+        let raw_dir = config.raw_dir(&root);
+        fs::create_dir_all(&wiki_dir).map_err(|e| error::MemexError::FileOpFailed {
+            path: wiki_dir.clone(),
+            operation: "create wiki dir",
+            source: e,
+        })?;
+        fs::create_dir_all(&raw_dir).map_err(|e| error::MemexError::FileOpFailed {
+            path: raw_dir.clone(),
+            operation: "create raw dir",
+            source: e,
+        })?;
+        let search = Bm25Search::open(&root.join(INDEX_DB_NAME))?;
 
         // Migration hint: if DB is empty but wiki/ has .md files, suggest rebuild.
         // Spec Section 7 — r1 auto-rebuilt here; we moved that to open_writer to
         // eliminate the two-reader rebuild race. Now hint instead.
-        if search.is_empty()? {
-            let wiki_dir = root.join("wiki");
-            if wiki_dir.is_dir() && any_md_file(&wiki_dir) {
+        if search.is_empty()?
+            && wiki_dir.is_dir() && any_md_file(&wiki_dir) {
                 eprintln!(
                     "note: search index is empty but `{}` contains markdown files; \
                      run `memex lint --fix` or any write command to rebuild.",
                     wiki_dir.display()
                 );
             }
-        }
 
         Ok(Self {
             root,
@@ -110,14 +143,18 @@ impl Memex {
     }
 
     fn open_writer_with_config(root: PathBuf, config: Config) -> error::Result<Self> {
-        if !root.join("wiki").is_dir() {
-            let wiki_dir = root.join("wiki");
-            fs::create_dir_all(&wiki_dir).map_err(|e| error::MemexError::FileOpFailed {
-                path: wiki_dir.clone(),
-                operation: "create wiki dir",
-                source: e,
-            })?;
-        }
+        let wiki_dir = config.wiki_dir(&root);
+        let raw_dir = config.raw_dir(&root);
+        fs::create_dir_all(&wiki_dir).map_err(|e| error::MemexError::FileOpFailed {
+            path: wiki_dir.clone(),
+            operation: "create wiki dir",
+            source: e,
+        })?;
+        fs::create_dir_all(&raw_dir).map_err(|e| error::MemexError::FileOpFailed {
+            path: raw_dir.clone(),
+            operation: "create raw dir",
+            source: e,
+        })?;
 
         let lock_path = root.join(".lock");
         let lock_file =
@@ -135,13 +172,10 @@ impl Memex {
             })?;
         let writer_lock = WriterLock { file: lock_file };
 
-        let search = Bm25Search::open(&root.join(SEARCH_DB_NAME))?;
-        if search.is_empty()? {
-            search.rebuild(&root)?;
-        }
+        let search = Bm25Search::open(&root.join(INDEX_DB_NAME))?;
 
         // Stale tmp cleanup — safe because we hold the writer flock.
-        storage::cleanup_stale_tmp_files(&root.join("wiki"));
+        storage::cleanup_stale_tmp_files(&wiki_dir);
 
         Ok(Self {
             root,
@@ -156,7 +190,11 @@ impl Memex {
     }
 
     pub fn wiki_dir(&self) -> PathBuf {
-        self.root.join("wiki")
+        self.config.wiki_dir(&self.root)
+    }
+
+    pub fn raw_dir(&self) -> PathBuf {
+        self.config.raw_dir(&self.root)
     }
 
     pub fn search(&self) -> &Bm25Search {
@@ -236,7 +274,7 @@ impl Memex {
 
         // Fresh connection — sees the latest committed state, not the reader's
         // pinned WAL snapshot from process start.
-        let fresh = search::Bm25Search::open(&self.root.join(SEARCH_DB_NAME))?;
+        let fresh = search::Bm25Search::open(&self.root.join(INDEX_DB_NAME))?;
 
         if !lint::is_issue_still_present(&fresh, &self.root, issue)? {
             return Ok(FixOutcome::Stale);
@@ -258,6 +296,9 @@ impl Memex {
             root,
             Config {
                 lock_timeout: timeout,
+                wiki_override: None,
+                raw_override: None,
+                poll_interval_sec: 300,
             },
         )
     }
@@ -285,7 +326,7 @@ mod tests {
         let root = dir.path().join("memex");
         let memex = Memex::open(root.clone()).unwrap();
         assert!(root.join("wiki").is_dir());
-        assert!(root.join(SEARCH_DB_NAME).exists());
+        assert!(root.join(INDEX_DB_NAME).exists());
         assert_eq!(memex.root(), root);
     }
 
@@ -303,7 +344,29 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("memex");
         let _memex = Memex::open(root.clone()).unwrap();
-        assert!(root.join(SEARCH_DB_NAME).exists());
+        assert!(root.join(INDEX_DB_NAME).exists());
+    }
+
+    /// Regression: `read_body_from_disk` MUST return byte-identical bytes to
+    /// what `commit_doc` hashed at write time. Until this fix, lib.rs had its
+    /// own frontmatter stripper that left an extra leading `\n` on canonical
+    /// files, shifting every chunk snippet by 1 byte at retrieval time.
+    #[test]
+    fn read_body_from_disk_matches_commit_doc_body() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+        let content =
+            "---\ntitle: T\ntags: []\nsources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\n---\n\nbody content\n";
+        std::fs::write(root.join("wiki/p.md"), content).unwrap();
+
+        let from_disk = read_body_from_disk(&root, "wiki", "wiki/p.md").unwrap();
+        let from_writer =
+            storage::split_frontmatter(content).map_or(content, |(_, b)| b);
+        assert_eq!(
+            from_disk, from_writer,
+            "read_body_from_disk must match commit_doc's body so chunk pos/len align"
+        );
     }
 
     #[test]
@@ -381,5 +444,36 @@ mod tests {
         };
         let outcome = reader.apply_fix_locked(&bogus).unwrap();
         assert!(matches!(outcome, FixOutcome::Stale));
+    }
+
+    #[test]
+    fn open_creates_default_wiki_and_raw_dirs() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        let memex = Memex::open(root.clone()).unwrap();
+        assert!(memex.wiki_dir().is_dir());
+        assert!(memex.raw_dir().is_dir());
+        assert_eq!(memex.wiki_dir(), root.join("wiki"));
+        assert_eq!(memex.raw_dir(), root.join("raw"));
+        assert!(root.join("index.db").exists());
+    }
+
+    #[test]
+    fn open_honors_configured_wiki_and_raw_paths() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("memex");
+        let custom_wiki = dir.path().join("vault/wiki");
+        let custom_raw = dir.path().join("archive/raw");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("config.toml"),
+            format!("[storage]\nwiki = {:?}\nraw = {:?}\n", custom_wiki, custom_raw),
+        ).unwrap();
+        let memex = Memex::open(root.clone()).unwrap();
+        assert_eq!(memex.wiki_dir(), custom_wiki);
+        assert_eq!(memex.raw_dir(), custom_raw);
+        assert!(custom_wiki.is_dir());
+        assert!(custom_raw.is_dir());
+        assert!(!root.join("wiki").exists(), "default wiki dir must not be auto-created when wiki is configured elsewhere");
     }
 }

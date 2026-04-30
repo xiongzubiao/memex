@@ -1,48 +1,12 @@
 use tempfile::TempDir;
 
 #[test]
-fn content_exists_and_source_count() {
-    let tmp = TempDir::new().unwrap();
-    let memex = memex_core::Memex::open(tmp.path().join("memex")).unwrap();
-    let search = memex.search();
-
-    // Initially no content
-    let hash = memex_core::storage::content_hash(b"test content");
-    assert!(!search.content_exists(&hash).unwrap());
-    assert_eq!(search.source_count().unwrap(), 0);
-
-    // Insert content and source document
-    let stored_hash = search.insert_content("test content").unwrap();
-    assert!(search.content_exists(&stored_hash).unwrap());
-
-    let existing: Vec<String> = search.existing_docids().unwrap().into_iter().collect();
-    let docid =
-        memex_core::docid::allocate_docid(&stored_hash, "source", "/tmp/test.jsonl", &existing);
-    let now = chrono::Utc::now().to_rfc3339();
-    search
-        .upsert_document(
-            "source",
-            "/tmp/test.jsonl",
-            "test",
-            &stored_hash,
-            &docid,
-            "",
-            "",
-            &now,
-            &now,
-        )
-        .unwrap();
-
-    assert_eq!(search.source_count().unwrap(), 1);
-}
-
-#[test]
 fn open_creates_wiki_directory() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("memex");
     let _memex = memex_core::Memex::open(root.clone()).unwrap();
     assert!(root.join("wiki").is_dir());
-    assert!(root.join(memex_core::SEARCH_DB_NAME).exists());
+    assert!(root.join(memex_core::INDEX_DB_NAME).exists());
 }
 
 #[test]

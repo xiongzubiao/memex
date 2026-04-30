@@ -3,40 +3,47 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// A single chunk-level vector search result.
+///
+/// Body text is no longer stored in `chunks`; callers slice the doc body
+/// from disk using `(pos, len)` to materialize the snippet.
 pub struct VectorResult {
     pub hash: String,
     pub seq: i32,
-    pub chunk_text: String,
+    pub pos: usize,
+    pub len: usize,
     /// Cosine similarity in [0, 1]: 1.0 = identical direction, 0.0 = orthogonal.
     /// Converted from sqlite-vec's cosine distance via `1 - distance`.
     pub score: f32,
 }
 
-/// Store a chunk: text metadata in `chunks`, embedding in the sqlite-vec
+/// Store a chunk: position metadata in `chunks`, embedding in the sqlite-vec
 /// `chunks_vec` virtual table. The two rows are keyed so `chunks.hash ||
 /// '_' || chunks.seq == chunks_vec.hash_seq`.
-#[allow(clippy::too_many_arguments)]
 pub fn store_chunk(
     conn: &Connection,
     hash: &str,
     seq: i32,
-    text: &str,
     pos: usize,
     len: usize,
-    model: &str,
     embedding: &[f32],
 ) -> Result<()> {
-    let now = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT OR REPLACE INTO chunks (hash, seq, chunk_text, pos, len, model, embedded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![hash, seq, text, pos as i64, len as i64, model, now],
+        "INSERT OR REPLACE INTO chunks (hash, seq, pos, len) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![hash, seq, pos as i64, len as i64],
     )?;
 
     let hash_seq = format!("{hash}_{seq}");
     let blob = embedding_to_blob(embedding);
+    // sqlite-vec's vec0 virtual tables silently ignore `INSERT OR REPLACE`'s
+    // conflict clause — a duplicate hash_seq leaves the old vector in
+    // place. Use DELETE-then-INSERT so re-embed paths actually update.
+    // (QMD's store.ts:3247-3251 documents this gotcha.)
     conn.execute(
-        "INSERT OR REPLACE INTO chunks_vec (hash_seq, embedding) VALUES (?1, ?2)",
+        "DELETE FROM chunks_vec WHERE hash_seq = ?1",
+        rusqlite::params![&hash_seq],
+    )?;
+    conn.execute(
+        "INSERT INTO chunks_vec (hash_seq, embedding) VALUES (?1, ?2)",
         rusqlite::params![hash_seq, blob],
     )?;
     Ok(())
@@ -53,10 +60,11 @@ pub fn vector_search(
     conn: &Connection,
     query_embedding: &[f32],
     limit: usize,
-    doc_type: Option<&str>,
+    doc_type: &str,
 ) -> Result<Vec<VectorResult>> {
     let q_blob = embedding_to_blob(query_embedding);
-    let k = if doc_type.is_some() { limit * 3 } else { limit };
+    // Over-fetch 3x so the doc_type filter has slack before truncation.
+    let k = limit * 3;
 
     // Step 1: pull top-k hash_seq + distance from the vec0 index.
     // sqlite-vec's virtual table doesn't tolerate JOINs in the MATCH query
@@ -76,45 +84,31 @@ pub fn vector_search(
         return Ok(Vec::new());
     }
 
-    // Step 2: look up chunk_text and (optionally) apply doc_type filter.
+    // Step 2: look up chunk position metadata and apply doc_type filter.
     let distance_by_key: std::collections::HashMap<String, f64> = raw.iter().cloned().collect();
-    let placeholders: String = std::iter::repeat("?")
-        .take(raw.len())
+    let placeholders: String = std::iter::repeat_n("?", raw.len())
         .collect::<Vec<_>>()
         .join(",");
-    let (sql, extra_param): (String, Option<String>) = match doc_type {
-        Some(c) => (
-            format!(
-                "SELECT c.hash, c.seq, c.chunk_text
-                 FROM chunks c JOIN documents d ON d.hash = c.hash
-                 WHERE c.hash || '_' || c.seq IN ({placeholders}) AND d.doc_type = ?"
-            ),
-            Some(c.to_string()),
-        ),
-        None => (
-            format!(
-                "SELECT hash, seq, chunk_text FROM chunks
-                 WHERE hash || '_' || seq IN ({placeholders})"
-            ),
-            None,
-        ),
-    };
+    let sql = format!(
+        "SELECT c.hash, c.seq, c.pos, c.len
+         FROM chunks c JOIN documents d ON d.hash = c.hash
+         WHERE c.hash || '_' || c.seq IN ({placeholders}) AND d.doc_type = ?"
+    );
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = raw
         .iter()
         .map(|(hs, _)| Box::new(hs.clone()) as Box<dyn rusqlite::ToSql>)
         .collect();
-    if let Some(c) = extra_param {
-        params_vec.push(Box::new(c));
-    }
+    params_vec.push(Box::new(doc_type.to_string()));
     let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
 
     let mut stmt2 = conn.prepare(&sql)?;
-    let rows: Vec<(String, i32, String)> = stmt2
+    let rows: Vec<(String, i32, i64, i64)> = stmt2
         .query_map(param_refs.as_slice(), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i32>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?
         .filter_map(|r| r.ok())
@@ -123,12 +117,13 @@ pub fn vector_search(
     // Re-attach the distance from step 1 and convert to similarity score.
     let mut results: Vec<VectorResult> = rows
         .into_iter()
-        .filter_map(|(hash, seq, chunk_text)| {
+        .filter_map(|(hash, seq, pos, len)| {
             let key = format!("{hash}_{seq}");
             distance_by_key.get(&key).map(|dist| VectorResult {
                 hash,
                 seq,
-                chunk_text,
+                pos: pos as usize,
+                len: len as usize,
                 score: (1.0 - dist) as f32,
             })
         })
@@ -150,7 +145,7 @@ pub fn vector_search_collapsed(
     conn: &Connection,
     query_embedding: &[f32],
     limit: usize,
-    doc_type: Option<&str>,
+    doc_type: &str,
 ) -> Result<Vec<VectorResult>> {
     // Over-fetch chunk-level results so that collapsing to doc-level still
     // yields `limit` distinct docs. Worst case: all top-K chunks belong to
@@ -181,6 +176,21 @@ pub fn vector_search_collapsed(
     });
     collapsed.truncate(limit);
     Ok(collapsed)
+}
+
+/// List `(pos, len)` for all chunks of a given content hash, in seq order.
+/// Used by the BM25 snippet backfill path to score and pick the best
+/// chunk for a query+intent before rendering the snippet.
+/// Returns empty when the doc was indexed without embedding (no chunks).
+pub fn list_chunks_by_hash(conn: &Connection, hash: &str) -> Result<Vec<(usize, usize)>> {
+    let mut stmt = conn.prepare("SELECT pos, len FROM chunks WHERE hash = ?1 ORDER BY seq")?;
+    let rows = stmt
+        .query_map([hash], |row| {
+            Ok((row.get::<_, i64>(0)? as usize, row.get::<_, i64>(1)? as usize))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
 }
 
 /// Delete all chunks for a given content hash from both the chunks table
@@ -225,12 +235,14 @@ mod tests {
         conn
     }
 
-    /// Insert a placeholder row into the `content` table so that the
-    /// foreign-key constraint on `chunks.hash` is satisfied.
-    fn insert_content_row(conn: &Connection, hash: &str) {
+    /// Insert a minimal `wiki` documents row keyed by `hash` so the
+    /// `vector_search` JOIN finds it. Test helper — production code
+    /// goes through `commit_doc`.
+    fn insert_wiki_doc(conn: &Connection, hash: &str) {
         conn.execute(
-            "INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![hash, format!("doc for {hash}"), "2026-01-01T00:00:00Z"],
+            "INSERT OR IGNORE INTO documents (doc_type, path, title, hash, tags, source, mtime, size, embed_model, embedded_at)
+             VALUES ('wiki', ?1, '', ?2, '', NULL, '', 0, NULL, NULL)",
+            rusqlite::params![format!("wiki/{hash}.md"), hash],
         )
         .unwrap();
     }
@@ -250,19 +262,9 @@ mod tests {
     #[test]
     fn store_and_search_vectors() {
         let conn = setup_db();
-        insert_content_row(&conn, "hash1");
-        store_chunk(
-            &conn,
-            "hash1",
-            0,
-            "chunk text",
-            0,
-            10,
-            "test-model",
-            &fake_embedding(0.5),
-        )
-        .unwrap();
-        let results = vector_search(&conn, &fake_embedding(0.5), 10, None).unwrap();
+        insert_wiki_doc(&conn, "hash1");
+        store_chunk(&conn, "hash1", 0, 0, 10, &fake_embedding(0.5)).unwrap();
+        let results = vector_search(&conn, &fake_embedding(0.5), 10, "wiki").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hash, "hash1");
         assert!(results[0].score > 0.99); // identical direction
@@ -271,25 +273,48 @@ mod tests {
     #[test]
     fn chunk_to_doc_collapse() {
         let conn = setup_db();
-        insert_content_row(&conn, "hash1");
-        insert_content_row(&conn, "hash2");
+        insert_wiki_doc(&conn, "hash1");
+        insert_wiki_doc(&conn, "hash2");
 
         let query = dir_embedding(1.0, 0.0);
 
         let emb_a = dir_embedding(0.95, 0.05);
-        store_chunk(&conn, "hash1", 0, "chunk a", 0, 7, "m", &emb_a).unwrap();
+        store_chunk(&conn, "hash1", 0, 0, 7, &emb_a).unwrap();
 
         let emb_b = dir_embedding(0.9, 0.1);
-        store_chunk(&conn, "hash1", 1, "chunk b", 0, 7, "m", &emb_b).unwrap();
+        store_chunk(&conn, "hash1", 1, 0, 7, &emb_b).unwrap();
 
         let emb_c = dir_embedding(0.5, 0.5);
-        store_chunk(&conn, "hash2", 0, "chunk c", 0, 7, "m", &emb_c).unwrap();
+        store_chunk(&conn, "hash2", 0, 0, 7, &emb_c).unwrap();
 
-        let results = vector_search_collapsed(&conn, &query, 10, None).unwrap();
+        let results = vector_search_collapsed(&conn, &query, 10, "wiki").unwrap();
         // One row per hash; hash1 should win with its better chunk.
         let hashes: Vec<_> = results.iter().map(|r| r.hash.clone()).collect();
         assert!(hashes.contains(&"hash1".to_string()));
         assert!(hashes.contains(&"hash2".to_string()));
         assert_eq!(results[0].hash, "hash1");
+    }
+
+    #[test]
+    fn store_chunk_inserts_pos_len_and_vec() {
+        let conn = setup_db();
+        store_chunk(&conn, "hash1", 0, 42, 100, &fake_embedding(0.5)).unwrap();
+        let (pos, len): (i64, i64) = conn
+            .query_row(
+                "SELECT pos, len FROM chunks WHERE hash='hash1' AND seq=0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pos, 42);
+        assert_eq!(len, 100);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_vec WHERE hash_seq='hash1_0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

@@ -157,29 +157,115 @@ fn random_nonce_hex() -> String {
     format!("{n:08x}")
 }
 
-/// Atomic write with retry.
+/// Atomic write with retry + fsync durability.
 ///
-/// Writes to `.{filename}.{pid}.{nonce}.tmp` (e.g., `.rest-patterns.md.12345.a1b2c3d4.tmp`)
-/// then renames over the target path. Both steps are retried with a bounded
-/// schedule (`retry_io`) when the I/O error is transient. Permanent errors
-/// (`NotFound`, `InvalidInput`, etc.) fail fast through `MemexError::FileOpFailed`.
+/// Sequence: write tmp, fsync(tmp), close, rename, fsync(parent_dir).
+/// Step 3's tmp fsync guarantees content durability after a crash; step
+/// 6's parent fsync guarantees the rename's directory entry survives.
+/// Skipping either leaves a window where the file's content or its
+/// visibility is undefined after power loss.
+///
+/// Writes to `.{filename}.{nonce}.tmp` (e.g., `.rest-patterns.md.a1b2c3d4.tmp`)
+/// then renames over the target path. Write and rename are retried with
+/// a bounded schedule (`retry_io`) when the I/O error is transient.
+/// Permanent errors (`NotFound`, `InvalidInput`, etc.) fail fast through
+/// `MemexError::FileOpFailed`.
 pub fn atomic_write(path: &Path, content: &[u8]) -> crate::error::Result<()> {
     let nonce = random_nonce_hex();
+    // Format: `.{filename}.{nonce}.tmp`. The nonce is 8 hex chars = 32
+    // bits — birthday collision is statistically irrelevant given the
+    // writer-lock serializes all atomic_write calls per memex root.
+    // Earlier versions also included {pid}, but that added up to 11
+    // bytes to the temp name (eating into NAME_MAX) without buying
+    // anything the lock didn't already give us.
     let temp_name = format!(
-        ".{}.{}.{}.tmp",
+        ".{}.{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id(),
         nonce,
     );
     let temp = path.with_file_name(temp_name);
 
-    retry_io(&temp, "write temp", || fs::write(&temp, content))?;
+    // Write + fsync the tmp file: contents durable on disk.
+    if let Err(e) = retry_io(&temp, "write temp", || {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp)?;
+        std::io::Write::write_all(&mut f, content)?;
+        f.sync_all()?;
+        Ok(())
+    }) {
+        let _ = fs::remove_file(&temp);
+        return Err(e);
+    }
 
     if let Err(e) = retry_io(path, "rename", || fs::rename(&temp, path)) {
         let _ = fs::remove_file(&temp);
         return Err(e);
     }
+
+    // fsync the parent dir: rename durable in the directory entry.
+    // Required, not best-effort. A failure here means the rename's
+    // directory entry isn't guaranteed to survive a crash.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir = fs::File::open(parent).map_err(|e| crate::error::MemexError::FileOpFailed {
+            path: parent.to_path_buf(),
+            operation: "atomic_write: open parent dir for fsync",
+            source: e,
+        })?;
+        dir.sync_all().map_err(|e| crate::error::MemexError::FileOpFailed {
+            path: parent.to_path_buf(),
+            operation: "atomic_write: fsync parent dir",
+            source: e,
+        })?;
+    }
+
     Ok(())
+}
+
+/// Forward-slash-normalized lossy path string. Memex stores all paths in
+/// the DB with `/` separators regardless of host OS so wiki/raw lookups
+/// work the same on Windows and Unix.
+pub fn rel_path_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Split a `---\n<yaml>\n---\n<body>` frontmatter block into its YAML and
+/// body slices. Schema-agnostic. Returns `None` when the input lacks a
+/// well-formed leading frontmatter fence pair — callers that want body-only
+/// use `split_frontmatter(c).map_or(c, |(_, b)| b)`.
+///
+/// Single source of truth for body bytes: hash, FTS body, snippet positions,
+/// and lint's stale-index check all flow from this function so they agree
+/// byte-for-byte.
+pub fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
+    let trimmed = content.trim_start_matches('\u{feff}');
+    let rest = trimmed.strip_prefix("---\n")?;
+    let close = rest.find("\n---")?;
+    let yaml = &rest[..close];
+    let after = &rest[close + 4..];
+    let body = after
+        .strip_prefix("\n\n")
+        .or_else(|| after.strip_prefix('\n'))
+        .unwrap_or(after);
+    Some((yaml, body))
+}
+
+/// File mtime as RFC-3339 with seconds precision (e.g. `2026-04-27T14:42:07Z`).
+/// Returns "" if metadata cannot be read. Used as the change-detection key
+/// in `documents.mtime`; format must be stable across all writers (indexer,
+/// rebuild_from_filesystem, watcher) so reconcile's mtime equality holds.
+pub fn file_mtime_iso(path: &Path) -> String {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Utc> = t.into();
+            dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
+        .unwrap_or_default()
 }
 
 /// Try to acquire exclusive flock on `lock_path`, polling every 10ms until
@@ -268,22 +354,19 @@ const STALE_TMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 6
 
 /// Strict match for memex-generated tmp names.
 ///
-/// Format: `.{filename}.{pid}.{nonce}.tmp` where filename = `{stem}.md`.
-/// Example: `.rest-patterns.md.12345.a1b2c3d4.tmp`.
+/// Format: `.{filename}.{nonce}.tmp` where filename = `{stem}.md` and
+/// nonce is 8 ASCII hex chars.
+/// Example: `.rest-patterns.md.a1b2c3d4.tmp`.
 pub(crate) fn is_memex_tmp_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix('.').and_then(|s| s.strip_suffix(".tmp")) else {
         return false;
     };
-    let mut parts = rest.rsplitn(3, '.');
-    let (Some(nonce), Some(pid), Some(basename)) = (parts.next(), parts.next(), parts.next())
-    else {
+    let mut parts = rest.rsplitn(2, '.');
+    let (Some(nonce), Some(basename)) = (parts.next(), parts.next()) else {
         return false;
     };
 
     if nonce.len() != 8 || !nonce.chars().all(|c| c.is_ascii_hexdigit()) {
-        return false;
-    }
-    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
     let Some(stem) = basename.strip_suffix(".md") else {
@@ -329,6 +412,34 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// `validate::parse_frontmatter`'s body must be byte-identical to
+    /// `split_frontmatter`'s. If they ever diverge, lint will compute a
+    /// different hash than `commit_doc` did at write time and report a
+    /// false `stale-index`. Pinning the invariant here keeps a future
+    /// edit to either function from silently regressing.
+    #[test]
+    fn validate_and_split_extract_identical_body() {
+        const FM: &str =
+            "title: T\ntags: []\nsources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z";
+        let bodies = [
+            "body content\n",                   // canonical
+            "body content",                     // no trailing newline
+            "body content\n\n\n",               // trailing blank lines
+            "  body with leading spaces\n",     // body whitespace preserved
+            "body",                             // minimal
+        ];
+        for body in bodies {
+            let content = format!("---\n{FM}\n---\n\n{body}");
+            let split_body = split_frontmatter(&content).map(|(_, b)| b).unwrap();
+            let (_, validate_body) = crate::validate::parse_frontmatter(&content).unwrap();
+            assert_eq!(
+                split_body, validate_body,
+                "extractor mismatch for body {body:?}: split={split_body:?} validate={validate_body:?}"
+            );
+            assert_eq!(split_body, body, "split should return the exact body bytes");
+        }
+    }
+
     #[test]
     fn atomic_write_creates_file() {
         let dir = TempDir::new().unwrap();
@@ -344,6 +455,33 @@ mod tests {
         fs::write(&path, "old").unwrap();
         atomic_write(&path, b"new").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_tmp_files_on_success() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("hello.md");
+        atomic_write(&target, b"x").unwrap();
+        let entries: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["hello.md".to_string()],
+            "no .tmp files should remain after a successful write"
+        );
+    }
+
+    #[test]
+    fn atomic_write_in_nested_dir() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a/b/c");
+        fs::create_dir_all(&nested).unwrap();
+        let target = nested.join("page.md");
+        atomic_write(&target, b"deep").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"deep");
     }
 
     #[test]
@@ -507,8 +645,8 @@ mod tests {
 
     #[test]
     fn is_memex_tmp_name_matches_valid() {
-        assert!(is_memex_tmp_name(".rest-patterns.md.12345.a1b2c3d4.tmp"));
-        assert!(is_memex_tmp_name(".foo.md.1.00000000.tmp"));
+        assert!(is_memex_tmp_name(".rest-patterns.md.a1b2c3d4.tmp"));
+        assert!(is_memex_tmp_name(".foo.md.00000000.tmp"));
     }
 
     #[test]
@@ -518,26 +656,22 @@ mod tests {
         assert!(!is_memex_tmp_name("rest-patterns.md"));
         assert!(
             !is_memex_tmp_name(".rest-patterns.md.tmp"),
-            "missing pid+nonce"
+            "missing nonce"
         );
         assert!(
-            !is_memex_tmp_name(".rest.patterns.md.12345.a1b2c3d4.tmp"),
+            !is_memex_tmp_name(".rest.patterns.md.a1b2c3d4.tmp"),
             "stem must not contain dots"
         );
         assert!(
-            !is_memex_tmp_name(".rest-patterns.txt.12345.a1b2c3d4.tmp"),
+            !is_memex_tmp_name(".rest-patterns.txt.a1b2c3d4.tmp"),
             "must end in .md"
         );
         assert!(
-            !is_memex_tmp_name(".rest-patterns.md.abc.a1b2c3d4.tmp"),
-            "pid must be digits"
-        );
-        assert!(
-            !is_memex_tmp_name(".rest-patterns.md.12345.xxxxxxxx.tmp"),
+            !is_memex_tmp_name(".rest-patterns.md.xxxxxxxx.tmp"),
             "nonce must be hex"
         );
         assert!(
-            !is_memex_tmp_name(".rest-patterns.md.12345.a1b2c3d.tmp"),
+            !is_memex_tmp_name(".rest-patterns.md.a1b2c3d.tmp"),
             "nonce must be 8 chars"
         );
     }
@@ -549,7 +683,7 @@ mod tests {
         let wiki = dir.path().join("wiki");
         std::fs::create_dir_all(&wiki).unwrap();
 
-        let stale_path = wiki.join(".foo.md.99999.deadbeef.tmp");
+        let stale_path = wiki.join(".foo.md.deadbeef.tmp");
         OpenOptions::new()
             .create(true)
             .truncate(true)
@@ -577,7 +711,7 @@ mod tests {
         let wiki = dir.path().join("wiki");
         std::fs::create_dir_all(&wiki).unwrap();
 
-        let fresh_path = wiki.join(".foo.md.99999.deadbeef.tmp");
+        let fresh_path = wiki.join(".foo.md.deadbeef.tmp");
         OpenOptions::new()
             .create(true)
             .truncate(true)

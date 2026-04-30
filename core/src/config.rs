@@ -1,5 +1,5 @@
 use crate::error::{MemexError, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -9,13 +9,28 @@ const TIMEOUT_RANGE_SECS: std::ops::RangeInclusive<u64> = 1..=3600;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub lock_timeout: Duration,
+    pub wiki_override: Option<PathBuf>,
+    pub raw_override: Option<PathBuf>,
+    pub poll_interval_sec: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             lock_timeout: Duration::from_secs(120),
+            wiki_override: None,
+            raw_override: None,
+            poll_interval_sec: 300,
         }
+    }
+}
+
+impl Config {
+    pub fn wiki_dir(&self, root: &Path) -> PathBuf {
+        self.wiki_override.clone().unwrap_or_else(|| root.join("wiki"))
+    }
+    pub fn raw_dir(&self, root: &Path) -> PathBuf {
+        self.raw_override.clone().unwrap_or_else(|| root.join("raw"))
     }
 }
 
@@ -55,6 +70,11 @@ impl Config {
                 }
                 cfg.lock_timeout = Duration::from_secs(secs);
             }
+            if let Some(storage) = parsed.storage {
+                cfg.wiki_override = storage.wiki.map(PathBuf::from);
+                cfg.raw_override = storage.raw.map(PathBuf::from);
+                if let Some(p) = storage.poll_interval_sec { cfg.poll_interval_sec = p; }
+            }
         }
 
         if let Ok(v) = std::env::var("MEMEX_LOCK_TIMEOUT_SECONDS") {
@@ -79,11 +99,19 @@ impl Config {
 #[derive(serde::Deserialize)]
 struct TomlConfig {
     locking: Option<TomlLocking>,
+    storage: Option<TomlStorage>,
 }
 
 #[derive(serde::Deserialize)]
 struct TomlLocking {
     timeout_seconds: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct TomlStorage {
+    wiki: Option<String>,
+    raw: Option<String>,
+    poll_interval_sec: Option<u64>,
 }
 
 #[cfg(test)]
@@ -264,5 +292,29 @@ mod tests {
         contents.extend_from_slice(b"[locking]\ntimeout_seconds = 30\n");
         std::fs::write(dir.path().join("config.toml"), contents).unwrap();
         let _ = Config::load(dir.path()); // either Ok or Err MalformedConfig; no panic
+    }
+
+    #[test]
+    #[serial(env)]
+    fn config_loads_custom_wiki_and_raw_paths() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[storage]\nwiki = \"/Users/me/Notes/wiki\"\nraw = \"/mnt/nas/raw\"\npoll_interval_sec = 90\n"
+        ).unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        assert_eq!(cfg.wiki_dir(dir.path()), std::path::PathBuf::from("/Users/me/Notes/wiki"));
+        assert_eq!(cfg.raw_dir(dir.path()), std::path::PathBuf::from("/mnt/nas/raw"));
+        assert_eq!(cfg.poll_interval_sec, 90);
+    }
+
+    #[test]
+    #[serial(env)]
+    fn config_defaults_wiki_and_raw_under_root() {
+        let dir = TempDir::new().unwrap();
+        let cfg = Config::load(dir.path()).unwrap();
+        assert_eq!(cfg.wiki_dir(dir.path()), dir.path().join("wiki"));
+        assert_eq!(cfg.raw_dir(dir.path()), dir.path().join("raw"));
+        assert_eq!(cfg.poll_interval_sec, 300);
     }
 }

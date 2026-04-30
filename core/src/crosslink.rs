@@ -84,6 +84,147 @@ pub fn backward_link_page(
     (updated, was_linked)
 }
 
+/// Auto-link eligibility: a stem is eligible for forward/backward
+/// auto-linking if it is multi-token (contains `-`).
+///
+/// Single-token stems are always skipped, even longer ones like
+/// `caching` or `kubernetes` — they double as everyday English and
+/// the case-insensitive title match can't tell a navigation cue from
+/// generic prose. Multi-token names (`auth-tokens`, `rest-patterns`,
+/// `oauth-migration`) are distinctive enough that a body mention is
+/// almost always a deliberate reference.
+///
+/// For single-token entities (`bob`, `alice`, `kubernetes`,
+/// `performance`) the LLM is responsible for typing `[[stem]]`
+/// explicitly when it intends a navigation reference. The
+/// `/memex-ingest` skill prompt covers this path.
+pub fn auto_link_eligible(stem: &str) -> bool {
+    stem.contains('-')
+}
+
+/// Walk the wiki dir, add `[[new_stem]]` to every existing page whose
+/// body mentions `new_title` or `new_stem` (and isn't already linked),
+/// rewrite the file, and reindex (including embeddings). Returns
+/// stems of pages that got a new backlink.
+///
+/// Caller is expected to gate on `auto_link_eligible(new_stem)` —
+/// when ineligible, this function should not be called at all.
+///
+/// Body-only rewrite: frontmatter (including `updated_at`) is
+/// preserved verbatim, since adding a backlink doesn't change the
+/// page's knowledge content.
+///
+/// Re-embed each rewritten page. The body's content hash changes
+/// when `[[link]]` text is inserted; `commit_doc` detects that
+/// change and drops the old chunks. If we don't re-embed in the same
+/// pass, the page would survive in FTS5 but disappear from vector
+/// search until a later reconcile or `lint --fix` re-embedded it.
+/// Embedding cost (~50 ms per page) is the price of correctness.
+pub fn maintain_backlinks(
+    memex: &crate::Memex,
+    new_stem: &str,
+    new_title: &str,
+    embedder: &mut dyn crate::embed::Embedder,
+) -> crate::error::Result<Vec<String>> {
+    maintain_backlinks_batch(memex, &[(new_stem, new_title)], embedder)
+}
+
+/// Walk every wiki page once, applying every `(new_stem, new_title)`
+/// entry against each, and re-embed each touched page exactly once.
+///
+/// Single-page callers go through `maintain_backlinks`. The ingest
+/// pipeline uses this directly: a 10-page batch over a 10k-page wiki
+/// went from 100k `read_to_string` calls to 10k under the previous
+/// shape. Each existing page is also re-embedded at most once even
+/// when several new entries link into it, instead of once per new
+/// entry.
+pub fn maintain_backlinks_batch(
+    memex: &crate::Memex,
+    new_entries: &[(&str, &str)],
+    embedder: &mut dyn crate::embed::Embedder,
+) -> crate::error::Result<Vec<String>> {
+    let wiki_dir = memex.wiki_dir();
+    let mut backlinked: Vec<String> = Vec::new();
+    if new_entries.is_empty() {
+        return Ok(backlinked);
+    }
+    let iter = match std::fs::read_dir(&wiki_dir) {
+        Ok(it) => it,
+        Err(_) => return Ok(backlinked),
+    };
+    for entry in iter.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let other_stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let Ok(other_content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok((_, other_body)) = crate::validate::parse_frontmatter(&other_content) else {
+            continue;
+        };
+        // Apply every entry to this page's body in one pass. `body`
+        // accumulates each rewrite so a page can be backlinked to
+        // multiple new pages in one ingest. `touched` short-circuits
+        // the atomic_write + re-embed if no entry matched.
+        let mut body = other_body.to_string();
+        let mut touched = false;
+        for (new_stem, new_title) in new_entries {
+            if other_stem == *new_stem {
+                continue;
+            }
+            let (next, was_linked) =
+                backward_link_page(&body, new_stem, new_title, &other_stem);
+            if was_linked {
+                body = next;
+                touched = true;
+            }
+        }
+        if !touched {
+            continue;
+        }
+        let updated_content = replace_body_preserving_frontmatter(&other_content, &body);
+        if crate::storage::atomic_write(&path, updated_content.as_bytes()).is_ok() {
+            // Re-embed under the same writer pass to keep chunks
+            // consistent with the new body hash.
+            let _ = crate::index_wiki::index_wiki_file(memex, &path, Some(&mut *embedder));
+            backlinked.push(other_stem);
+        }
+    }
+    Ok(backlinked)
+}
+
+/// Replace the body after frontmatter with `new_body`, preserving the
+/// frontmatter block verbatim. Used to rewrite backlinks without
+/// bumping `updated_at`.
+pub fn replace_body_preserving_frontmatter(original: &str, new_body: &str) -> String {
+    let trimmed = original.trim_start();
+    if !trimmed.starts_with("---") {
+        return original.to_string();
+    }
+    let after_open = &trimmed[3..];
+    let Some(close_idx) = after_open.find("---") else {
+        return original.to_string();
+    };
+    let trim_offset = original.len() - trimmed.len();
+    let body_region_start = trim_offset + 3 + close_idx + 3;
+
+    if let Ok((_, old_body)) = crate::validate::parse_frontmatter(original)
+        && !old_body.is_empty()
+        && let Some(rel) = original[body_region_start..].find(&old_body)
+    {
+        let abs = body_region_start + rel;
+        return format!("{}{}", &original[..abs], new_body);
+    }
+    let prefix = original[..body_region_start].trim_end();
+    format!("{prefix}\n\n{new_body}")
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -296,6 +437,110 @@ mod tests {
         assert!(
             out.contains("patterns in depth"),
             "text after replacement must be preserved, got: {out}"
+        );
+    }
+
+    #[test]
+    fn auto_link_eligible_skips_all_single_token() {
+        // Every single-token stem is skipped — short generic words
+        // and longer common-noun names alike. The case-insensitive
+        // title match can't tell a navigation cue from generic prose
+        // for single-token names; the LLM types `[[stem]]` manually
+        // when it means a reference.
+        assert!(!auto_link_eligible("api"));
+        assert!(!auto_link_eligible("auth"));
+        assert!(!auto_link_eligible("cache"));
+        assert!(!auto_link_eligible("oauth"));
+        assert!(!auto_link_eligible("caching"));
+        assert!(!auto_link_eligible("kubernetes"));
+        assert!(!auto_link_eligible("performance"));
+        assert!(!auto_link_eligible("database"));
+        assert!(!auto_link_eligible("bob"));
+        assert!(!auto_link_eligible("alice"));
+    }
+
+    #[test]
+    fn auto_link_eligible_allows_multi_token() {
+        // Multi-token stems are eligible — distinctive enough that a
+        // body mention is almost always a deliberate reference.
+        assert!(auto_link_eligible("auth-tokens"));
+        assert!(auto_link_eligible("rest-patterns"));
+        assert!(auto_link_eligible("oauth-migration"));
+        assert!(auto_link_eligible("performance-tuning"));
+        assert!(auto_link_eligible("kubernetes-deployment"));
+    }
+
+    /// Batched form must apply EVERY new entry to each existing page in
+    /// one walk and re-embed the page exactly once even when several
+    /// entries match. The previous per-entry loop did N walks and
+    /// re-embedded once per entry, so two new pages backlinking into
+    /// the same existing page meant two re-embeds.
+    #[test]
+    fn maintain_backlinks_batch_applies_all_entries_in_one_pass() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
+        let wiki_dir = memex.wiki_dir();
+
+        // Existing page mentions BOTH "Auth Tokens" and "REST Patterns"
+        // verbatim, neither linked yet.
+        let existing = "---\ntitle: API Design\ntags: []\nsources: []\n\
+            created_at: 2026-04-30T00:00:00Z\nupdated_at: 2026-04-30T00:00:00Z\n\
+            ---\n\nWe use Auth Tokens for clients and REST Patterns for resources.\n";
+        std::fs::write(wiki_dir.join("api-design.md"), existing).unwrap();
+
+        // Two new entries; both should bracket their mention in the
+        // existing page in one walk.
+        let mut model = crate::embed::MockEmbedder;
+        let backlinked = maintain_backlinks_batch(
+            &memex,
+            &[("auth-tokens", "Auth Tokens"), ("rest-patterns", "REST Patterns")],
+            &mut model,
+        )
+        .unwrap();
+        assert_eq!(
+            backlinked,
+            vec!["api-design".to_string()],
+            "page should be reported once even though two entries matched"
+        );
+
+        let after = std::fs::read_to_string(wiki_dir.join("api-design.md")).unwrap();
+        assert!(
+            after.contains("[[auth-tokens]]"),
+            "first entry should be bracketed, got: {after}"
+        );
+        assert!(
+            after.contains("[[rest-patterns]]"),
+            "second entry should also be bracketed (single-pass batched), got: {after}"
+        );
+    }
+
+    /// A new entry whose stem equals an existing page's stem must NOT
+    /// rewrite that page (the page would be backlinking to itself).
+    #[test]
+    fn maintain_backlinks_batch_skips_self() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
+        let wiki_dir = memex.wiki_dir();
+
+        let body = "---\ntitle: Auth Tokens\ntags: []\nsources: []\n\
+            created_at: 2026-04-30T00:00:00Z\nupdated_at: 2026-04-30T00:00:00Z\n\
+            ---\n\nThe Auth Tokens system manages session lifetimes.\n";
+        std::fs::write(wiki_dir.join("auth-tokens.md"), body).unwrap();
+
+        let mut model = crate::embed::MockEmbedder;
+        let backlinked = maintain_backlinks_batch(
+            &memex,
+            &[("auth-tokens", "Auth Tokens")],
+            &mut model,
+        )
+        .unwrap();
+        assert!(
+            backlinked.is_empty(),
+            "self-page must not be rewritten, got: {backlinked:?}"
         );
     }
 }

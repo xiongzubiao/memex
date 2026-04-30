@@ -44,6 +44,8 @@ pub struct ExpandReply {
 #[derive(Debug)]
 pub struct ExpandJob {
     pub question: String,
+    /// Optional intent prefix. Forwarded to `apply_intent_prefix` in the worker.
+    pub intent: Option<String>,
     pub reply: oneshot::Sender<ExpandResult>,
 }
 
@@ -63,6 +65,8 @@ pub struct SynthJob {
     pub context: String,
     /// The user's question, verbatim.
     pub question: String,
+    /// Optional intent prefix. Forwarded to `apply_intent_prefix` in the worker.
+    pub intent: Option<String>,
     /// Worker sends the result here.
     pub reply: oneshot::Sender<SynthResult>,
 }
@@ -196,6 +200,7 @@ mod tests {
         tx.send(BackendJob::Synth(SynthJob {
             context: "ctx".into(),
             question: "q".into(),
+            intent: None,
             reply: reply_tx,
         }))
         .await

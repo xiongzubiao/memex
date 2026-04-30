@@ -7,17 +7,17 @@ pub mod client;
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod fs_kind;
 pub mod handler;
 pub mod lock;
 pub mod logging;
-pub mod memex_cache;
+pub mod memex_handle;
 pub mod pidfile;
 pub mod protocol;
 pub mod queue;
 pub mod retrieval;
 pub mod server;
-#[cfg(any(test, feature = "test-harness"))]
-pub mod test_harness;
+pub mod watcher;
 pub mod worker;
 
 use crate::memex_root;
@@ -97,6 +97,18 @@ pub fn default_config_path() -> PathBuf {
 /// If `foreground` is true, skip forking and run in terminal (for debugging).
 pub fn start_background(foreground: bool) -> Result<i32> {
     if !foreground {
+        // Pre-fork check: if a daemon is already responsive, the spawned
+        // child would otherwise fail to acquire the daemon flock and
+        // exit cleanly without telling the user anything. Print here so
+        // `memex daemon start` always confirms what happened.
+        let paths = DaemonPaths::default_under(&memex_root());
+        if let Some(pid) = pidfile::read(&paths.pid)?
+            && pidfile::is_alive(pid)
+            && socket_responsive(&paths.socket)
+        {
+            println!("daemon: already running (pid {pid})");
+            return Ok(0);
+        }
         // SAFETY: must happen before any tokio runtime or thread setup — forking
         // a multithreaded process with async runtimes/mutexes is undefined.
         unsafe {
@@ -147,6 +159,24 @@ pub async fn warm_up() -> Result<()> {
     Ok(())
 }
 
+/// Probe whether a Unix socket is accepting connections within 500ms.
+/// Used by both `start_background` (to detect a live daemon before
+/// forking) and `stop` (to confirm a pid file's daemon is actually
+/// ours before sending SIGTERM).
+fn socket_responsive(socket_path: &std::path::Path) -> bool {
+    let Ok(rt) = tokio::runtime::Runtime::new() else {
+        return false;
+    };
+    rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::net::UnixStream::connect(socket_path),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok())
+    })
+}
+
 /// `memex daemon stop` entrypoint.
 ///
 /// Reads the PID file, sends SIGTERM, waits up to 10s for the process to exit.
@@ -169,18 +199,7 @@ pub fn stop() -> Result<i32> {
     // the read of the pidfile and the kill, the real daemon could have
     // exited and its PID been reused by an unrelated process. If the
     // socket is alive, the PID is ours.
-    let socket_alive = {
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
-            tokio::time::timeout(
-                Duration::from_millis(500),
-                tokio::net::UnixStream::connect(&paths.socket),
-            )
-            .await
-            .is_ok_and(|r| r.is_ok())
-        })
-    };
-    if !socket_alive {
+    if !socket_responsive(&paths.socket) {
         println!(
             "daemon: pid {pid} exists but socket is not responsive; refusing to signal (possible PID reuse)"
         );
@@ -192,15 +211,16 @@ pub fn stop() -> Result<i32> {
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
-    // Wait up to 10s.
-    for _ in 0..100 {
+    // Wait up to ~6 s — covers the daemon's 3 s drain plus tokio
+    // runtime teardown overhead.
+    for _ in 0..60 {
         if !pidfile::is_alive(pid) {
             println!("daemon: stopped (pid {pid})");
             return Ok(0);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("daemon: still running after 10s SIGTERM; giving up");
+    eprintln!("daemon: still running after 6s SIGTERM; giving up");
     Ok(1)
 }
 
@@ -256,7 +276,6 @@ pub fn status() -> Result<i32> {
 pub async fn ingest_async(
     transcript_path: &str,
     agent: &str,
-    root: &str,
     collections: Vec<String>,
 ) -> Result<i32> {
     let paths = DaemonPaths::default_under(&memex_root());
@@ -280,7 +299,6 @@ pub async fn ingest_async(
                 agent: agent_enum,
             },
             collections,
-            memex_root: root.to_string(),
         },
     )
     .await?;
@@ -310,11 +328,10 @@ pub async fn ingest_async(
 pub fn ingest(
     transcript_path: &str,
     agent: &str,
-    root: &str,
     collections: Vec<String>,
 ) -> Result<i32> {
     let rt = tokio::runtime::Runtime::new()?;
-    match rt.block_on(ingest_async(transcript_path, agent, root, collections)) {
+    match rt.block_on(ingest_async(transcript_path, agent, collections)) {
         Ok(code) => Ok(code),
         Err(e) => {
             eprintln!("memex ingest: {e}");
@@ -330,10 +347,11 @@ pub fn query_raw(
     question: &str,
     top_k: usize,
     collections: Vec<String>,
+    intent: Option<String>,
     memex_root_override: Option<&std::path::Path>,
 ) -> Result<i32> {
     let paths = DaemonPaths::default_under(&memex_root());
-    let root = memex_root_override
+    let _root = memex_root_override
         .map(|p| p.to_path_buf())
         .unwrap_or_else(memex_root);
 
@@ -352,7 +370,7 @@ pub fn query_raw(
                 raw: true,
                 top_k,
                 collections,
-                memex_root: root.to_string_lossy().to_string(),
+                intent,
             },
         )
         .await?;
@@ -409,10 +427,11 @@ pub fn query_synth(
     question: &str,
     top_k: usize,
     collections: Vec<String>,
+    intent: Option<String>,
     memex_root_override: Option<&std::path::Path>,
 ) -> Result<i32> {
     let paths = server::DaemonPaths::default_under(&memex_root());
-    let root = memex_root_override
+    let _root = memex_root_override
         .map(|p| p.to_path_buf())
         .unwrap_or_else(memex_root);
 
@@ -431,7 +450,7 @@ pub fn query_synth(
                 raw: false,
                 top_k,
                 collections,
-                memex_root: root.to_string_lossy().to_string(),
+                intent,
             },
         )
         .await?;
