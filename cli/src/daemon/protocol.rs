@@ -46,7 +46,8 @@ pub enum Request {
         top_k: usize,
         #[serde(default)]
         collections: Vec<String>,
-        memex_root: String,
+        #[serde(default)]
+        intent: Option<String>,
     },
 
     // --- Mutations (daemon is the single writer) ---
@@ -59,20 +60,17 @@ pub enum Request {
         source: Option<String>,
         #[serde(default)]
         force: bool,
-        memex_root: String,
     },
     Ingest {
         source: IngestSource,
         #[serde(default)]
         collections: Vec<String>,
-        memex_root: String,
     },
     SourceAdd {
         source_path: String,
         content: String,
         #[serde(default)]
         collections: Vec<String>,
-        memex_root: String,
     },
     SourceDelete {
         /// `src-...` docid OR `path:<source-path>`
@@ -80,19 +78,28 @@ pub enum Request {
         ref_: String,
         #[serde(default)]
         force: bool,
-        memex_root: String,
     },
     Delete {
         slug: String,
-        memex_root: String,
+        #[serde(default)]
+        force: bool,
     },
-    LintFix {
-        memex_root: String,
+    /// Title→slug lookup. BM25 + vector re-rank when ambiguous, BM25-only
+    /// short-circuit when the top hit dominates. Routed through the daemon
+    /// so the warm embedding model is reused — direct path would reload
+    /// ONNX every CLI invocation.
+    Search {
+        title: String,
     },
+    /// `memex lint --fix` — apply auto-fixes for `StaleIndex` and
+    /// `OutdatedEmbedding` issues. Daemon-routed so the daemon
+    /// remains the single writer; concurrent ingests/writes serialize
+    /// against the same lock the daemon uses for everything else.
+    LintFix {},
 }
 
 fn default_top_k() -> usize {
-    5
+    10
 }
 
 /// Outgoing message on the response stream. Multiple events may be sent
@@ -136,6 +143,21 @@ pub enum Event {
     Written {
         slug: String,
         docid: String,
+        /// Existing pages this write auto-linked into the new body
+        /// (forward link). Filtered by `auto_link_eligible` — short
+        /// single-token stems are skipped to avoid false positives
+        /// on common English words.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        linked: Vec<String>,
+        /// Existing pages whose body now backlinks to the new page.
+        /// Same eligibility filter applied to the new page's stem.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        backlinked: Vec<String>,
+        /// `[[stem]]` references in the body whose target page does
+        /// not exist. Pure information — the daemon does not modify
+        /// the body. Surfaced as "suggest-create: ..." in CLI output.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        suggest_create: Vec<String>,
     },
     Deleted {
         slug: String,
@@ -143,6 +165,28 @@ pub enum Event {
     LintResult {
         fixed: u32,
         remaining: u32,
+    },
+    /// One per-fix progress event from `Request::LintFix`. `kind` is
+    /// the LintIssueKind that was repaired (e.g. "stale_index",
+    /// "outdated_embedding").
+    LintFixed {
+        page: String,
+        kind: String,
+    },
+    /// One event for an issue that was already resolved by the time
+    /// the daemon got to it (e.g. user re-saved the file between scan
+    /// and fix). Mirrors `apply_fix_locked`'s `FixOutcome::Stale`.
+    LintAlreadyFixed {
+        page: String,
+    },
+    /// Issue surfaced by the read-only lint scan that has no auto-fix
+    /// path (dangling links, untracked files, etc.). Streamed by
+    /// `Request::LintFix` after all fixable issues have been processed
+    /// so the user sees what's left.
+    LintRemaining {
+        page: String,
+        kind: String,
+        target: String,
     },
     Parsing {
         job_id: String,
@@ -167,6 +211,10 @@ pub enum Event {
         /// They become dangling — `memex lint` reports them.
         dangling_wiki_pages: Vec<String>,
     },
+    /// Reply to `Request::Search`. `slug` is `None` when nothing matches.
+    SearchResult {
+        slug: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -181,21 +229,20 @@ mod tests {
 
     #[test]
     fn query_request_deserializes_with_defaults() {
-        let r: Request =
-            serde_json::from_str(r#"{"op":"query","question":"q","memex_root":"/x"}"#).unwrap();
+        let r: Request = serde_json::from_str(r#"{"op":"query","question":"q"}"#).unwrap();
         match r {
             Request::Query {
                 question,
                 raw,
                 top_k,
                 collections,
-                memex_root,
+                intent,
             } => {
                 assert_eq!(question, "q");
                 assert!(!raw);
-                assert_eq!(top_k, 5);
+                assert_eq!(top_k, 10);
                 assert!(collections.is_empty());
-                assert_eq!(memex_root, "/x");
+                assert!(intent.is_none());
             }
             _ => panic!("expected Query"),
         }
@@ -204,7 +251,7 @@ mod tests {
     #[test]
     fn query_request_deserializes_with_collections() {
         let r: Request = serde_json::from_str(
-            r#"{"op":"query","question":"q","memex_root":"/x","collections":["default","project-a"]}"#,
+            r#"{"op":"query","question":"q","collections":["default","project-a"]}"#,
         )
         .unwrap();
         match r {
@@ -240,6 +287,31 @@ mod tests {
     }
 
     #[test]
+    fn search_request_deserializes() {
+        let r: Request =
+            serde_json::from_str(r#"{"op":"search","title":"Auth Tokens"}"#).unwrap();
+        match r {
+            Request::Search { title } => assert_eq!(title, "Auth Tokens"),
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn search_result_event_serializes_and_handles_none() {
+        let hit = Event::SearchResult {
+            slug: Some("auth-tokens".into()),
+        };
+        let s = serde_json::to_string(&hit).unwrap();
+        assert!(s.contains(r#""type":"search_result""#));
+        assert!(s.contains(r#""slug":"auth-tokens""#));
+
+        let miss = Event::SearchResult { slug: None };
+        let s = serde_json::to_string(&miss).unwrap();
+        assert!(s.contains(r#""type":"search_result""#));
+        assert!(s.contains(r#""slug":null"#));
+    }
+
+    #[test]
     fn unknown_op_is_rejected() {
         let err = serde_json::from_str::<Request>(r#"{"op":"bogus"}"#).unwrap_err();
         assert!(err.to_string().contains("bogus") || err.to_string().contains("variant"));
@@ -247,10 +319,8 @@ mod tests {
 
     #[test]
     fn write_request_deserializes() {
-        let r: Request = serde_json::from_str(
-            r#"{"op":"write","title":"Test","content":"body","memex_root":"/x"}"#,
-        )
-        .unwrap();
+        let r: Request =
+            serde_json::from_str(r#"{"op":"write","title":"Test","content":"body"}"#).unwrap();
         match r {
             Request::Write {
                 title, content, tags, source, force, ..
@@ -268,7 +338,7 @@ mod tests {
     #[test]
     fn write_request_with_source_docid_deserializes() {
         let r: Request = serde_json::from_str(
-            r#"{"op":"write","title":"T","content":"b","source":"src-deadbeef","memex_root":"/x"}"#,
+            r#"{"op":"write","title":"T","content":"b","source":"src-deadbeef"}"#,
         )
         .unwrap();
         match r {
@@ -280,7 +350,7 @@ mod tests {
     #[test]
     fn source_add_request_deserializes() {
         let r: Request = serde_json::from_str(
-            r##"{"op":"source_add","source_path":"https://x/p","content":"# T\n","memex_root":"/x"}"##,
+            r##"{"op":"source_add","source_path":"https://x/p","content":"# T\n"}"##,
         )
         .unwrap();
         match r {
@@ -303,7 +373,7 @@ mod tests {
     #[test]
     fn source_delete_request_deserializes() {
         let r: Request = serde_json::from_str(
-            r#"{"op":"source_delete","ref":"src-abc","force":true,"memex_root":"/x"}"#,
+            r#"{"op":"source_delete","ref":"src-abc","force":true}"#,
         )
         .unwrap();
         match r {
@@ -330,11 +400,11 @@ mod tests {
     #[test]
     fn ingest_request_transcript_deserializes() {
         let r: Request = serde_json::from_str(
-            r#"{"op":"ingest","source":{"kind":"transcript","path":"/tmp/s.jsonl","agent":"claude-code"},"memex_root":"/x"}"#,
+            r#"{"op":"ingest","source":{"kind":"transcript","path":"/tmp/s.jsonl","agent":"claude-code"}}"#,
         )
         .unwrap();
         match r {
-            Request::Ingest { source, collections, memex_root } => {
+            Request::Ingest { source, collections } => {
                 match source {
                     IngestSource::Transcript { path, agent } => {
                         assert_eq!(path, "/tmp/s.jsonl");
@@ -343,7 +413,6 @@ mod tests {
                     _ => panic!("expected Transcript"),
                 }
                 assert!(collections.is_empty());
-                assert_eq!(memex_root, "/x");
             }
             _ => panic!("expected Ingest"),
         }
@@ -352,7 +421,7 @@ mod tests {
     #[test]
     fn ingest_request_document_deserializes() {
         let r: Request = serde_json::from_str(
-            r##"{"op":"ingest","source":{"kind":"document","source_path":"https://example.com/post","content":"# Title\n\nbody\n"},"collections":["team-a"],"memex_root":"/x"}"##,
+            r##"{"op":"ingest","source":{"kind":"document","source_path":"https://example.com/post","content":"# Title\n\nbody\n"},"collections":["team-a"]}"##,
         )
         .unwrap();
         match r {
@@ -373,14 +442,8 @@ mod tests {
     #[test]
     fn delete_request_deserializes() {
         let r: Request =
-            serde_json::from_str(r#"{"op":"delete","slug":"my-page","memex_root":"/x"}"#).unwrap();
+            serde_json::from_str(r#"{"op":"delete","slug":"my-page"}"#).unwrap();
         assert!(matches!(r, Request::Delete { .. }));
-    }
-
-    #[test]
-    fn lint_fix_request_deserializes() {
-        let r: Request = serde_json::from_str(r#"{"op":"lint_fix","memex_root":"/x"}"#).unwrap();
-        assert!(matches!(r, Request::LintFix { .. }));
     }
 
     #[test]
@@ -388,10 +451,29 @@ mod tests {
         let e = Event::Written {
             slug: "my-page".into(),
             docid: "wiki-abc".into(),
+            linked: vec![],
+            backlinked: vec![],
+            suggest_create: vec![],
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""type":"written""#));
         assert!(s.contains(r#""slug":"my-page""#));
+        // Empty lists elided from wire payload.
+        assert!(!s.contains("linked"));
+        assert!(!s.contains("backlinked"));
+        assert!(!s.contains("suggest_create"));
+
+        let e = Event::Written {
+            slug: "my-page".into(),
+            docid: "wiki-abc".into(),
+            linked: vec!["caching".into()],
+            backlinked: vec!["api-design".into()],
+            suggest_create: vec!["ghost".into()],
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""linked":["caching"]"#));
+        assert!(s.contains(r#""backlinked":["api-design"]"#));
+        assert!(s.contains(r#""suggest_create":["ghost"]"#));
     }
 
     #[test]

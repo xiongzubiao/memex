@@ -1,0 +1,2 @@
+- Merge mode A and B in EXTRACT task
+- TaskKind::Rerank for --raw

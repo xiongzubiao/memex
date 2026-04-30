@@ -26,60 +26,45 @@ pub fn register_sqlite_vec_once() {
     });
 }
 
-fn register_strip_frontmatter(conn: &Connection) -> Result<()> {
-    conn.create_scalar_function(
-        "strip_frontmatter",
-        1,
-        rusqlite::functions::FunctionFlags::SQLITE_UTF8
-            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        |ctx| {
-            let doc: String = ctx.get(0)?;
-            let trimmed = doc.trim();
-            if !trimmed.starts_with("---") {
-                return Ok(doc);
-            }
-            let after_first = &trimmed[3..];
-            match after_first.find("---") {
-                Some(end) => Ok(after_first[end + 3..].trim().to_string()),
-                None => Ok(doc),
-            }
-        },
-    )?;
-    Ok(())
-}
-
 const SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS content (
-    hash       TEXT PRIMARY KEY,
-    doc        TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS documents (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    doc_type    TEXT NOT NULL,
-    path        TEXT NOT NULL,
-    title       TEXT NOT NULL,
-    hash        TEXT NOT NULL REFERENCES content(hash),
-    docid       TEXT NOT NULL,
-    tags        TEXT NOT NULL DEFAULT '',
-    summary     TEXT NOT NULL DEFAULT '',
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    doc_type     TEXT NOT NULL CHECK (doc_type IN ('wiki', 'raw')),
+    path         TEXT NOT NULL,
+    title        TEXT NOT NULL,
+    hash         TEXT NOT NULL,
+    tags         TEXT NOT NULL DEFAULT '',
+    source       TEXT,
+    mtime        TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    embed_model  TEXT,
+    embedded_at  TEXT,
     UNIQUE(doc_type, path)
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_docid ON documents(docid) WHERE docid != '';
+CREATE INDEX IF NOT EXISTS idx_documents_hash ON documents(hash);
+CREATE INDEX IF NOT EXISTS idx_documents_path ON documents(path);
 
 CREATE TABLE IF NOT EXISTS collections (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     name    TEXT NOT NULL UNIQUE
 );
-
 CREATE TABLE IF NOT EXISTS document_collections (
     document_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     collection_id   INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
     PRIMARY KEY(document_id, collection_id)
+);
+
+CREATE TABLE IF NOT EXISTS chunks (
+    hash    TEXT NOT NULL,
+    seq     INTEGER NOT NULL,
+    pos     INTEGER NOT NULL,
+    len     INTEGER NOT NULL,
+    PRIMARY KEY(hash, seq)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
+    hash_seq TEXT PRIMARY KEY,
+    embedding float[768] distance=cosine
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
@@ -88,62 +73,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
     tokenize='porter unicode61'
 );
 
-CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-    INSERT INTO documents_fts(rowid, path, title, tags, body)
-    VALUES (
-        new.id, new.path, new.title, new.tags,
-        (SELECT strip_frontmatter(doc) FROM content WHERE hash = new.hash)
-    );
-END;
-
-CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-    INSERT INTO documents_fts(documents_fts, rowid, path, title, tags, body)
-    VALUES ('delete', old.id, old.path, old.title, old.tags,
-        (SELECT strip_frontmatter(doc) FROM content WHERE hash = old.hash)
-    );
-END;
-
-CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-    INSERT INTO documents_fts(documents_fts, rowid, path, title, tags, body)
-    VALUES ('delete', old.id, old.path, old.title, old.tags,
-        (SELECT strip_frontmatter(doc) FROM content WHERE hash = old.hash)
-    );
-    INSERT INTO documents_fts(rowid, path, title, tags, body)
-    VALUES (
-        new.id, new.path, new.title, new.tags,
-        (SELECT strip_frontmatter(doc) FROM content WHERE hash = new.hash)
-    );
-END;
-
-CREATE TABLE IF NOT EXISTS chunks (
-    hash        TEXT NOT NULL REFERENCES content(hash),
-    seq         INTEGER NOT NULL,
-    chunk_text  TEXT NOT NULL,
-    pos         INTEGER NOT NULL,
-    len         INTEGER NOT NULL,
-    model       TEXT NOT NULL,
-    embedded_at TEXT NOT NULL,
-    PRIMARY KEY(hash, seq)
+CREATE TABLE IF NOT EXISTS llm_cache (
+    hash        TEXT PRIMARY KEY,
+    result      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
 );
 
--- sqlite-vec virtual table for similarity search. Keyed by
--- "{hash}_{seq}" so each chunk has a stable row ID that joins back to
--- `chunks` for snippet text and back to `documents` via `chunks.hash`.
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
-    hash_seq TEXT PRIMARY KEY,
-    embedding float[768] distance=cosine
-);
-
-DROP TABLE IF EXISTS ingest_jobs;
-CREATE TABLE ingest_jobs (
+CREATE TABLE IF NOT EXISTS ingest_jobs (
     job_id        TEXT PRIMARY KEY,
     job_type      TEXT NOT NULL CHECK (job_type IN ('transcript', 'document')),
     source_path   TEXT NOT NULL,
     agent         TEXT,
     content_hash  TEXT NOT NULL,
-    memex_root    TEXT NOT NULL,
     collections   TEXT NOT NULL DEFAULT '[]',
-    status        TEXT NOT NULL DEFAULT 'pending',
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
     error         TEXT
@@ -152,7 +96,6 @@ CREATE TABLE ingest_jobs (
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    register_strip_frontmatter(conn)?;
     conn.execute_batch(SCHEMA_SQL)?;
     Ok(())
 }
@@ -162,31 +105,104 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    #[test]
-    fn strip_frontmatter_removes_yaml() {
+    fn open_with_schema() -> Connection {
         register_sqlite_vec_once();
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        let result: String = conn
-            .query_row(
-                "SELECT strip_frontmatter('---\ntitle: Test\n---\nBody here')",
-                [],
-                |r| r.get(0),
-            )
+        conn
+    }
+
+    fn columns_of(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
             .unwrap();
-        assert_eq!(result, "Body here");
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect()
     }
 
     #[test]
-    fn strip_frontmatter_no_frontmatter_passthrough() {
-        register_sqlite_vec_once();
-        let conn = Connection::open_in_memory().unwrap();
-        init_schema(&conn).unwrap();
-        let result: String = conn
-            .query_row("SELECT strip_frontmatter('No frontmatter here')", [], |r| {
-                r.get(0)
-            })
+    fn documents_has_new_columns() {
+        let conn = open_with_schema();
+        let cols = columns_of(&conn, "documents");
+        for expected in [
+            "id",
+            "doc_type",
+            "path",
+            "title",
+            "hash",
+            "tags",
+            "source",
+            "mtime",
+            "size",
+            "embed_model",
+            "embedded_at",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == expected),
+                "expected `{expected}` column in documents, got: {cols:?}"
+            );
+        }
+        for absent in ["docid", "summary", "active", "created_at"] {
+            assert!(
+                !cols.iter().any(|c| c == absent),
+                "did not expect `{absent}` column in documents, got: {cols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunks_has_no_text_or_model_columns() {
+        let conn = open_with_schema();
+        let cols = columns_of(&conn, "chunks");
+        for required in ["hash", "seq", "pos", "len"] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "expected `{required}` column in chunks, got: {cols:?}"
+            );
+        }
+        for absent in ["chunk_text", "model", "embedded_at", "algo_version"] {
+            assert!(
+                !cols.iter().any(|c| c == absent),
+                "did not expect `{absent}` column in chunks, got: {cols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_cache_table_exists() {
+        let conn = open_with_schema();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='llm_cache'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(result, "No frontmatter here");
+        assert_eq!(count, 1, "expected llm_cache table to exist");
+    }
+
+    #[test]
+    fn content_table_does_not_exist() {
+        let conn = open_with_schema();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='content'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "did not expect a `content` table");
+    }
+
+    #[test]
+    fn ingest_jobs_has_no_memex_root_column() {
+        let conn = open_with_schema();
+        let cols = columns_of(&conn, "ingest_jobs");
+        assert!(
+            !cols.iter().any(|c| c == "memex_root"),
+            "did not expect `memex_root` column in ingest_jobs, got: {cols:?}"
+        );
     }
 }

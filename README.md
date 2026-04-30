@@ -84,9 +84,14 @@ No `--collection` behavior:
   for synthesis and session ingestion. `memex query --raw` and
   `memex search` work without an agent.
 - **Optional**: ONNX embedding model at
-  `~/.memex/models/embedding-gemma-300m.onnx`. Without it, memex falls
-  back to hash-based embedding (BM25 still works, vector retrieval is
-  degraded).
+  `~/.memex/models/embedding-gemma-300m.onnx` plus its companion
+  tokenizer `~/.memex/models/embedding-gemma-300m-tokenizer.json`.
+  Without the model, memex falls back to hash-based embedding (BM25
+  still works, vector retrieval is degraded). Without the tokenizer
+  the model still embeds via a chars-as-tokens fallback, but is
+  ~4× slower per chunk and produces lower-quality vectors. Existing
+  installs upgrading to this version should re-run the plugin
+  postinstall to fetch `tokenizer.json`.
 - **Optional**: any HTML→Markdown / PDF→Markdown / document-to-Markdown
   converter, for ingesting non-text sources via `memex ingest --source`.
   [`markitdown`](https://github.com/microsoft/markitdown) is a convenient
@@ -176,6 +181,17 @@ The daemon exits after `idle_timeout_min` minutes without activity.
 
 **Low-quality vector results** -- ONNX model not loaded. Download to
 `~/.memex/models/embedding-gemma-300m.onnx` and restart the daemon.
+
+## Tests
+
+```bash
+cargo test --workspace --release
+```
+
+Tests that load the embedding model (`~/.memex/models/embedding-gemma-300m.onnx`)
+skip cleanly when it's not present, so a fresh clone can run the suite
+without setup. To exercise that path, install the model via the plugin
+postinstall — embedding-dependent tests will then run automatically.
 
 ## License
 

@@ -82,11 +82,54 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
     // 4. Bind.
     let listener = UnixListener::bind(&paths.socket)
         .with_context(|| format!("binding socket {:?}", paths.socket))?;
+    // Restrict the socket to the owning user. Without this it inherits
+    // umask (typically 0755), letting any local user connect and submit
+    // ingest/write requests against the daemon's bound root.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        if let Err(e) = std::fs::set_permissions(&paths.socket, perms) {
+            tracing::warn!(?e, socket = %paths.socket.display(), "set socket mode 0600 failed");
+        }
+    }
     info!(socket = %paths.socket.display(), pid, "daemon listening");
 
-    let memex_cache = crate::daemon::memex_cache::MemexCache::new();
-    let retrieval_tx = crate::daemon::retrieval::spawn(memex_cache.clone())
-        .context("spawning retrieval actor (check ONNX model + libonnxruntime)")?;
+    // Install signal handlers BEFORE the slow startup work (model load,
+    // reconcile, watcher). Otherwise SIGTERM during startup hits the
+    // default handler and kills the process without graceful logging,
+    // and a user who runs `daemon stop` right after `daemon start` sees
+    // a half-initialized daemon vanish silently. The Notify is created
+    // here and consumed by the main accept loop later — `notify_one`
+    // stores a permit if the loop hasn't reached `notified()` yet, so
+    // an early signal isn't lost.
+    let shutdown = Arc::new(Notify::new());
+    {
+        let shutdown_signal = shutdown.clone();
+        tokio::spawn(async move {
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(?e, "failed to install SIGTERM handler");
+                    return;
+                }
+            };
+            let mut sigint = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(?e, "failed to install SIGINT handler");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = sigterm.recv() => info!("received SIGTERM"),
+                _ = sigint.recv() => info!("received SIGINT"),
+            }
+            shutdown_signal.notify_one();
+        });
+    }
+
+    let memex_handle = crate::daemon::memex_handle::MemexHandle::new();
 
     // Create local settings to disable plugins for benchmarking.
     let root = memex_root();
@@ -96,43 +139,243 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
         let _ = std::fs::write(&settings_path, r#"{"enabledPlugins":{}}"#);
     }
 
-    let pool = crate::daemon::worker::WorkerPool::new(cfg.daemon.worker.clone());
+    // Load the embedding model once at startup — fatal if it can't load.
+    // The daemon is the single owner of the warm model; the handler
+    // (search/dedup/embed_document) and the retrieval actor (query
+    // embeds) share this single instance via `Arc<TokioMutex<...>>`.
+    // Silently running without one used to return wrong slugs from
+    // BM25-only fallbacks, which corrupted ingest dedup.
+    memex_core::embed::init_runtime().map_err(|e| {
+        anyhow::anyhow!(
+            "ONNX runtime init failed: {e}. Install libonnxruntime via \
+             `brew install onnxruntime` (macOS), your distro's package \
+             manager (Linux), or download from \
+             https://github.com/microsoft/onnxruntime/releases and place \
+             the dylib at ~/.memex/lib/."
+        )
+    })?;
+    let model = memex_core::retrieval::load_default_model().map_err(|e| {
+        anyhow::anyhow!(
+            "embedding model load failed: {e}. Set MEMEX_EMBED_MODEL_PATH \
+             or run `memex models install`."
+        )
+    })?;
+    let embed_model = crate::daemon::handler::shared_embedder(model);
+
+    let retrieval_tx =
+        crate::daemon::retrieval::spawn(memex_handle.clone(), embed_model.clone());
+
+    let pool = crate::daemon::worker::WorkerPool::new(cfg.daemon.worker.clone(), memex_handle.clone());
     let cfg = Arc::new(cfg);
+    let reader_session = crate::daemon::handler::ReaderSession {
+        bound_root: root.clone(),
+        memex_handle: memex_handle.clone(),
+        embed_model: embed_model.clone(),
+    };
+    let writer_session = crate::daemon::handler::WriterSession {
+        reader: reader_session,
+        slug_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
     let state = Arc::new(HandlerState {
         pid,
         started_at: Utc::now(),
         retrieval: retrieval_tx,
         jobs: Arc::new(pool),
-        memex_cache,
-        slug_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         config: cfg.clone(),
+        writer: writer_session,
     });
 
-    // 5. Accept loop with idle timeout + SIGTERM.
-    let shutdown = Arc::new(Notify::new());
-    let shutdown_signal = shutdown.clone();
-    tokio::spawn(async move {
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(?e, "failed to install SIGTERM handler");
-                return;
+    // 5. Startup reconcile: recover from a missing or corrupt index.db.
+    // Pass the warm embedder so reconcile fills in vector chunks for
+    // any newly-indexed files. Without this, files indexed at startup
+    // land in `documents` + FTS but skip embedding, and the stat-based
+    // skip in `index_wiki_file` then prevents any later write path
+    // from filling them in — queries return `retrieval_empty`.
+    match state.writer.memex_handle().get_or_open(&root) {
+        Ok(memex) => {
+            // Housekeeping: prune terminal `ingest_jobs` rows older than
+            // 30 days, and `llm_cache` rows older than 90 days. Bounds
+            // table growth on long-running daemons without losing
+            // recent history. The cache TTL is longer because each
+            // entry is more expensive to rebuild (one LLM call) and
+            // because `cache_key` already includes the model name —
+            // model upgrades produce new keys; old entries age out
+            // naturally rather than serving stale results.
+            if let Err(e) = memex.search().prune_terminal_ingest_jobs(30) {
+                warn!(?e, "ingest_jobs prune failed; continuing");
             }
-        };
-        let mut sigint = match signal(SignalKind::interrupt()) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(?e, "failed to install SIGINT handler");
-                return;
+            match memex.search().prune_llm_cache(90) {
+                Ok(n) if n > 0 => info!(
+                    cache_pruned = n,
+                    "pruned stale llm_cache entries (older than 90 days)"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(?e, "llm_cache prune failed; continuing"),
             }
-        };
-        tokio::select! {
-            _ = sigterm.recv() => info!("received SIGTERM"),
-            _ = sigint.recv() => info!("received SIGINT"),
+
+            // Stuck-job recovery: any rows still in `pending` or
+            // `processing` were left there by a daemon that crashed
+            // mid-job (or was killed before the worker handed back a
+            // result). Mark them `failed` with a clear reason so the
+            // table doesn't hold them as in-flight forever; the user
+            // re-runs ingest if they still want the work done.
+            match memex.search().recover_stuck_ingest_jobs() {
+                Ok(n) if n > 0 => info!(stuck_jobs = n, "marked stuck ingest jobs as failed"),
+                Ok(_) => {}
+                Err(e) => warn!(?e, "stuck-job recovery failed; continuing"),
+            }
+
+            let mut guard = embed_model.lock().await;
+            let result = memex_core::reconcile::reconcile_with_embed(
+                &memex,
+                Default::default(),
+                guard.as_mut(),
+            );
+            match result {
+                Ok(r) => info!(
+                    indexed = r.indexed,
+                    deleted = r.deleted,
+                    hash_mismatches = r.hash_mismatches,
+                    skipped_symlinks = r.skipped_symlinks,
+                    "startup reconcile complete"
+                ),
+                Err(e) => warn!(?e, "startup reconcile failed; continuing with current DB"),
+            }
         }
-        shutdown_signal.notify_waiters();
-    });
+        Err(e) => {
+            // If index.db exists and is non-empty but failed to open
+            // (e.g. truncated, garbage bytes from a partial write, an
+            // SQLite version mismatch), back it up and rebuild from
+            // the filesystem. The wiki+raw trees are canonical.
+            let db_path = root.join(memex_core::INDEX_DB_NAME);
+            let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+            if db_size > 0 {
+                let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+                let backup = root.join(format!("{}.corrupt-{stamp}", memex_core::INDEX_DB_NAME));
+                warn!(
+                    ?e,
+                    backup = %backup.display(),
+                    "index.db open failed; backing up corrupt file and rebuilding from disk"
+                );
+                let mut recovered = false;
+                if let Err(e2) = std::fs::rename(&db_path, &backup) {
+                    warn!(?e2, "could not move corrupt index.db aside; deferring recovery");
+                } else {
+                    // Stale WAL/SHM from the corrupt DB are also unusable.
+                    let _ = std::fs::remove_file(root.join(format!(
+                        "{}-wal", memex_core::INDEX_DB_NAME
+                    )));
+                    let _ = std::fs::remove_file(root.join(format!(
+                        "{}-shm", memex_core::INDEX_DB_NAME
+                    )));
+                    match state.writer.memex_handle().get_or_open(&root) {
+                        Ok(memex) => {
+                            info!("rebuilt fresh index.db after corruption; running reconcile");
+                            let mut guard = embed_model.lock().await;
+                            match memex_core::reconcile::reconcile_with_embed(
+                                &memex,
+                                Default::default(),
+                                guard.as_mut(),
+                            ) {
+                                Ok(r) => {
+                                    info!(
+                                        indexed = r.indexed,
+                                        deleted = r.deleted,
+                                        hash_mismatches = r.hash_mismatches,
+                                        skipped_symlinks = r.skipped_symlinks,
+                                        "post-corruption reconcile complete"
+                                    );
+                                    recovered = true;
+                                }
+                                Err(e3) => {
+                                    warn!(?e3, "post-corruption reconcile failed");
+                                }
+                            }
+                        }
+                        Err(e3) => {
+                            warn!(?e3, "could not re-open index.db even after backing up corrupt file");
+                        }
+                    }
+                }
+                if !recovered {
+                    warn!("DB recovery did not complete; daemon running in degraded state");
+                }
+            } else {
+                warn!(?e, "could not open memex for startup reconcile; deferring");
+            }
+        }
+    }
 
+    // 6. Watcher: detect external edits and re-index.
+    let watch_root = state.writer.bound_root().to_path_buf();
+    match state.writer.memex_handle().get_or_open(&watch_root) {
+        Ok(watch_memex) => {
+            let (watch_tx, watch_rx) =
+                tokio::sync::mpsc::channel::<crate::daemon::watcher::WatcherEvent>(64);
+            // Native watchers (inotify/FSEvents/etc.) don't deliver
+            // events reliably across NFS/SMB/etc. Probe both wiki and
+            // raw dirs; if either is on a network FS, force polling so
+            // we don't silently miss changes.
+            let wiki_dir = watch_memex.wiki_dir();
+            let raw_dir = watch_memex.raw_dir();
+            let force_polling = crate::daemon::fs_kind::is_network_fs(&wiki_dir)
+                || crate::daemon::fs_kind::is_network_fs(&raw_dir);
+            if force_polling {
+                info!(
+                    poll_interval_sec = watch_memex.config().poll_interval_sec,
+                    "watcher: network filesystem detected; using polling"
+                );
+            }
+            match crate::daemon::watcher::spawn_watcher(
+                crate::daemon::watcher::WatcherConfig {
+                    wiki_dir,
+                    raw_dir,
+                    poll_interval: std::time::Duration::from_secs(
+                        watch_memex.config().poll_interval_sec,
+                    ),
+                    force_polling,
+                },
+                watch_tx,
+            ) {
+                Ok(_watcher) => {
+                    // Keep watcher alive for daemon lifetime by storing in a task.
+                    let memex_handle_for_watch = state.writer.memex_handle().clone();
+                    let embed_model_for_watch = embed_model.clone();
+                    tokio::spawn(async move {
+                        let _keep_alive = _watcher;
+                        let mut watch_rx = watch_rx;
+                        while let Some(evt) = watch_rx.recv().await {
+                            if let Err(e) = crate::daemon::watcher::handle_watch_event(
+                                &memex_handle_for_watch,
+                                &embed_model_for_watch,
+                                evt,
+                            )
+                            .await
+                            {
+                                tracing::warn!(?e, "watch event handling failed");
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!(?e, "watcher startup failed; daemon will run without filesystem watching");
+                }
+            }
+        }
+        Err(e) => {
+            warn!(?e, "could not open memex for watcher; skipping watcher startup");
+        }
+    }
+
+    // 7. Accept loop with idle timeout + SIGTERM. Signal handlers were
+    // installed early (just after socket bind) so SIGTERM during slow
+    // startup doesn't kill the process before tracing flushes; the
+    // shared Notify carries the signal across the gap. `notify_one`
+    // stores a permit if the main loop hasn't reached `notified()` yet,
+    // so an early signal isn't lost. notify_waiters would lose the
+    // signal whenever the main loop is between `select!` calls (e.g.
+    // mid-accept dispatch), causing the daemon to keep serving
+    // requests after SIGTERM until the idle timeout.
     let idle_timeout = Duration::from_secs(cfg.daemon.idle_timeout_min * 60);
     // Shared across all connection tasks so long-running queries keep the
     // daemon alive: we only time out when in_flight == 0 AND last_activity
@@ -140,20 +383,38 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
     let last_activity = Arc::new(Mutex::new(Instant::now()));
     let in_flight = Arc::new(AtomicUsize::new(0));
 
+    // Self-reap heartbeat: every `SOCKET_CHECK_INTERVAL` we stat the
+    // socket file. If it's gone, our memex root has been deleted out
+    // from under us (typical: a test's TempDir was dropped) — exit
+    // immediately so we don't leak. Without this, the daemon keeps
+    // running until the 15-minute idle timeout, and concurrent tests
+    // each spawn fresh daemons that pile up.
+    const SOCKET_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+    let socket_path = paths.socket.clone();
+
     loop {
         let elapsed = last_activity.lock().unwrap().elapsed();
         if in_flight.load(Ordering::Acquire) == 0 && elapsed >= idle_timeout {
             info!(idle_for_secs = elapsed.as_secs(), "idle timeout reached");
             break;
         }
-        let sleep_for = idle_timeout.saturating_sub(elapsed);
+        if !socket_path.exists() {
+            info!(
+                socket = %socket_path.display(),
+                "socket file removed; bound root is gone, exiting"
+            );
+            break;
+        }
+        let sleep_for = idle_timeout
+            .saturating_sub(elapsed)
+            .min(SOCKET_CHECK_INTERVAL);
         tokio::select! {
             _ = shutdown.notified() => {
                 info!("shutting down from signal");
                 break;
             }
             _ = tokio::time::sleep(sleep_for) => {
-                // Next iteration's idle check will break if we're over.
+                // Next iteration re-checks idle timeout AND socket presence.
             }
             accept = listener.accept() => {
                 match accept {
@@ -180,19 +441,24 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
         }
     }
 
-    // Graceful drain: stop accepting new connections, then wait up to
-    // `DRAIN_TIMEOUT` for in-flight work to finish. Each worker's agent
-    // subprocess is killed on drop via `kill_on_drop`, so exceeding the
-    // deadline still exits cleanly; the user's in-flight query just fails
-    // with a dropped reply channel rather than undefined half-written state.
+    // Graceful drain: stop accepting new connections, then give a brief
+    // window for in-flight work to finish. Short tasks (writes, cached
+    // queries) complete in well under a second; long ones (cold LLM
+    // expand/synth) typically run 5–30 s and won't finish within any
+    // reasonable shutdown budget anyway. Each worker's agent subprocess
+    // is killed on drop via `kill_on_drop`, so exceeding the deadline
+    // still exits cleanly; the user's in-flight query fails with a
+    // dropped reply channel. Keep the drain short — `daemon stop`
+    // means "stop now," not "let me finish that 30 s LLM call first."
     drop(listener);
-    const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+    let drain_timeout = Duration::from_secs(state.config.daemon.drain_timeout_sec);
     let drain_start = Instant::now();
     while in_flight.load(Ordering::Acquire) > 0 {
-        if drain_start.elapsed() >= DRAIN_TIMEOUT {
+        if drain_start.elapsed() >= drain_timeout {
             warn!(
                 in_flight = in_flight.load(Ordering::Acquire),
-                "drain timeout — exiting with in-flight jobs"
+                drain_timeout_sec = state.config.daemon.drain_timeout_sec,
+                "drain timeout — exiting with in-flight jobs (raise [daemon] drain_timeout_sec for LLM-heavy workloads)"
             );
             break;
         }

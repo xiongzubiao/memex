@@ -9,6 +9,10 @@ const VERSION = "0.1.0";
 // macOS, so 1.23.x is the last minor with full platform coverage.
 const ORT_VERSION = "1.23.2";
 const MODEL_URL = "https://huggingface.co/LeePark/gemma-embedding-300M-onnx-int8/resolve/main/model_int8.onnx";
+// HuggingFace tokenizer.json for embeddinggemma-300m. Hosted in onnx-community
+// because the upstream `google/embeddinggemma-300m` repo is gated; the
+// onnx-community mirror has the same tokenizer.
+const TOKENIZER_URL = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main/tokenizer.json";
 const RELEASE_BASE = `https://github.com/memverge/memex/releases/download/v${VERSION}`;
 const ORT_RELEASE_BASE = `https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}`;
 
@@ -145,6 +149,18 @@ async function main() {
     console.log("Downloading embedding model (~329MB)...");
     await download(MODEL_URL, modelDest);
     console.log("Model downloaded.");
+  }
+
+  // 2b. Download tokenizer.json for the embedding model. Without it,
+  // memex falls back to a chars-as-tokens encoding that is ~4× slower
+  // and produces lower-quality embeddings. Existing memex installs
+  // upgrading from older versions should re-run this postinstall to
+  // fetch the tokenizer.
+  const tokenizerDest = path.join(modelDir, "embedding-gemma-300m-tokenizer.json");
+  if (!fs.existsSync(tokenizerDest)) {
+    console.log("Downloading tokenizer.json (~20MB)...");
+    await download(TOKENIZER_URL, tokenizerDest);
+    console.log("Tokenizer downloaded.");
   }
 
   // 3. Download ONNX Runtime shared library (skip if already installed).

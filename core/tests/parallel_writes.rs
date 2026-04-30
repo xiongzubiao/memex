@@ -89,6 +89,14 @@ fn stress_10_parallel_open_writer() {
 #[test]
 fn lock_acquire_io_preserves_error_taxonomy() {
     // Permission-denied on lock creation → LockAcquireIo, not LockTimeout.
+    // Root bypasses file-mode permissions on Linux/POSIX (chmod 000 is a
+    // no-op for uid 0), so this test can't observe the EACCES path it
+    // wants to assert on. Skip cleanly instead of false-failing.
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("SKIP: running as root; chmod 000 doesn't deny root access");
+        return;
+    }
     let (_dir, root) = setup_temp_memex();
     let lock_path = root.join(".lock");
     // Create and chmod 000 so opening it for write fails.

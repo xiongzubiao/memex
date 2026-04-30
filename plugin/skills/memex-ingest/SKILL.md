@@ -185,15 +185,49 @@ When merging, **preserve every specific fact from both sides**. Extend
 existing H2 sections or add new ones. The merged body is the union, not the
 intersection.
 
-## Step 5: verify
+After each write, read the command's output and react:
+
+- **`linked: a, b`** — informational; pages `a`, `b` got auto-linked into
+  the new body. No action required.
+- **`backlinked: x, y`** — informational; existing pages `x`, `y` were
+  rewritten with `[[<new-slug>]]`. No action required.
+- **`suggest-create: slug-1, slug-2`** — your body referenced
+  `[[slug-1]]` or `[[slug-2]]` but the daemon found no page with that
+  slug. For each:
+  - **Typo** (you meant a slug that exists, just spelled it wrong) →
+    re-write the page with the corrected reference: `memex write
+    "<title>" --force --source "$src" --quiet < <fixed-body>`.
+  - **Page should exist** (the source material covers it but you
+    missed splitting it out) → write the missing page: `memex write
+    "<title>" --source "$src" --quiet < <body>`.
+  - **Intentional placeholder** (you want to flag a gap for later) →
+    leave it; lint will continue to remind. Mention it to the user.
+
+## Step 5: verify and act on lint findings
 
 ```
 memex lint
 ```
 
-Catches dangling `[[wiki-links]]`, missing cross-references, untracked files
-(disk but no DB row), missing files (DB row but no disk file), and outdated
-embeddings. Report findings to the user.
+Each finding maps to an action:
+
+- **`stale-index: <slug>`** / **`outdated-embeddings: <slug>`** — daemon
+  reconcile and watcher heal these continuously; if you see them, run
+  `memex lint --fix` (daemon-routed, single writer).
+- **`untracked: <file>`** / **`missing-file: <slug>`** — out-of-band
+  filesystem state. Report to the user; don't auto-repair.
+- **`missing-link: <page> -> [[<slug>]]`** — `<page>`'s body mentions
+  `<slug>`'s title or stem-as-words but isn't bracketed. Decide: if the
+  mention is genuinely a navigation cue, re-write `<page>` with explicit
+  `[[<slug>]]`. If it's incidental prose (the mention happens to share
+  text with a page title but isn't really referring to that page), leave
+  it.
+- **`dangling: <page> -> [[<slug>]]`** — `<page>` references a slug that
+  doesn't exist. The target was deleted or renamed. Decide: remove the
+  reference, point it at the correct existing slug, or restore the
+  missing page if it was deleted in error.
+
+After running lint, summarize what you found and what you did to the user.
 
 ## Frontmatter the wiki page should have
 
@@ -215,6 +249,40 @@ Wiki links are kebab-case, matching the filename without `.md`:
 `memex write --source "$src"` injects the `sources:` entry automatically; you
 don't need to put it in the body you pipe in.
 
+## Title choice affects auto cross-linking
+
+`memex write` auto-cross-links body mentions of existing page titles, and
+backlinks existing pages that mention a new page's title. The eligibility
+rule is conservative: only **multi-token titles** auto-link. Single-token
+titles — short OR long — are always skipped because the case-insensitive
+match can't tell a navigation cue from generic English prose.
+
+- **Eligible**: multi-token titles (`oauth-migration`, `auth-tokens`,
+  `rest-patterns`, `performance-tuning`, `kubernetes-deployment`).
+- **Not eligible**: every single-token title — short ones like `api`,
+  `auth`, `bob`, `alice`, AND longer ones like `caching`, `kubernetes`,
+  `performance`, `database`, `testing`. The cutoff isn't about length;
+  it's about whether the title is distinctive enough to mean a
+  reference whenever it appears in prose.
+
+Implications when picking titles:
+
+- Prefer the descriptive phrase form whenever it exists:
+  `caching-strategies` over `caching`, `auth-tokens` over `auth`,
+  `kubernetes-deployment` over `kubernetes`. Multi-token titles
+  integrate into the graph automatically; single-token ones do not.
+- For unavoidable single-token titles (people's names, established
+  acronyms, genuinely-one-word concepts), the LLM types `[[stem]]`
+  explicitly when it means a reference. Auto won't fill it in.
+  Example body: `Alice met [[bob]] in [[italy]].` rather than
+  `Alice met Bob in Italy.`
+
+`memex write` reports what got auto-linked in its output:
+- `linked: a, b` — existing pages this body now references
+- `backlinked: x, y` — existing pages that now link to this page
+- `suggest-create: z` — `[[z]]` references in the body whose target
+  doesn't exist (typo or pending creation)
+
 ## Common mistakes
 
 - **Episode-based slugs** (`alice-promotion-2026-03`) — use `alice` plus an H2
@@ -222,7 +290,15 @@ don't need to put it in the body you pipe in.
 - **A new page per anecdote** — extend the subject page.
 - **Dropping dates / names / numbers / quotes during merge.** These are the
   retrieval handles. Treat them as load-bearing.
-- **Inventing `[[slug]]` targets** without verifying they exist.
+- **Inventing `[[slug]]` targets** without verifying they exist. The
+  daemon will surface these as `suggest-create:` in write output and as
+  `dangling:` in lint output — react to them rather than ignore.
+- **Treating `suggest-create:` as background noise.** It's actionable
+  feedback: typo, missing page to create, or a flagged gap.
+- **Ignoring `missing-link:` from lint** when the mention really is
+  meant as a navigation reference. Single-token titles (`alice`,
+  `bob`, `caching`, `kubernetes`) never auto-link regardless of
+  length; the LLM is the only path to bracket them.
 - **Skipping the dedup check**, or `--force`-ing without asking.
 - **Piping content to `memex ingest --source`** instead of using the
   `source add` + `write` flow above. That bypasses the propose/approve loop

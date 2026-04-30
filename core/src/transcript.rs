@@ -323,7 +323,7 @@ pub fn parse_claude_code_session(reader: impl BufRead) -> Result<CleanedTranscri
                         "file-history-snapshot" | "attachment" | "queue-operation" | "last-prompt"
                     )
                 {
-                    eprintln!("memex: unknown Claude Code message type: {other}");
+                    tracing::warn!(message_type = %other, "transcript parse: unknown Claude Code message type");
                 }
             }
         }

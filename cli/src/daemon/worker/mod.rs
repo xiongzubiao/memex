@@ -20,6 +20,7 @@ pub(crate) const MAX_RESPONSE_BYTES: usize = 1_048_576;
 pub type MockPromptFn = std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 use crate::daemon::config::{Backend, WorkerConfig};
+use crate::daemon::memex_handle::MemexHandle;
 use crate::daemon::queue::{
     BackendJob, ExpandResult, IngestResult, JobReceiver, JobSender, MergeResult, SynthResult,
     WorkerError, queue,
@@ -122,6 +123,12 @@ pub(super) enum JobOutcome {
 /// all `LC_*` locale vars are forwarded unconditionally.
 pub(super) fn prepare_agent_cmd(cmd: &mut tokio::process::Command, allowlist: &[&str]) {
     cmd.env_clear();
+    // Mark this subprocess as memex-internal so the SessionStart hook in
+    // a spawned agent (Claude Code, Codex, Gemini-CLI) exits immediately
+    // instead of trying to ingest the daemon's own subagent transcript.
+    // The transcript filter (`SessionFilter::InternalSession`) is a
+    // belt-and-suspenders backup; this env var is the primary guard.
+    cmd.env("MEMEX_INTERNAL", "1");
     for key in allowlist {
         if let Ok(v) = std::env::var(key) {
             cmd.env(key, v);
@@ -218,6 +225,7 @@ pub struct WorkerPool {
     tx: JobSender,
     rx: JobReceiver,
     cfg: WorkerConfig,
+    memex_handle: Arc<MemexHandle>,
     live: Arc<AtomicUsize>,
     busy: Arc<AtomicUsize>,
     next_worker_id: Arc<AtomicUsize>,
@@ -225,20 +233,21 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     /// Build the pool's fields without spawning any worker tasks.
-    fn empty(cfg: WorkerConfig) -> Self {
+    fn empty(cfg: WorkerConfig, memex_handle: Arc<MemexHandle>) -> Self {
         let (tx, rx) = queue(cfg.max_count);
         Self {
             tx,
             rx,
             cfg,
+            memex_handle,
             live: Arc::new(AtomicUsize::new(0)),
             busy: Arc::new(AtomicUsize::new(0)),
             next_worker_id: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    pub fn new(cfg: WorkerConfig) -> Self {
-        let pool = Self::empty(cfg);
+    pub fn new(cfg: WorkerConfig, memex_handle: Arc<MemexHandle>) -> Self {
+        let pool = Self::empty(cfg, memex_handle);
         pool.spawn_worker(true);
         pool
     }
@@ -276,13 +285,14 @@ impl WorkerPool {
         let worker_id = self.next_worker_id.fetch_add(1, Ordering::Relaxed);
         let rx = self.rx.clone();
         let cfg = self.cfg.clone();
+        let memex_handle = self.memex_handle.clone();
         let live = self.live.clone();
         let busy = self.busy.clone();
         tokio::spawn(async move {
             // RAII: decrement live on drop so a panic in `run()` can't
             // permanently inflate the worker count.
             let _live_guard = CountGuard(live);
-            run(worker_id, rx, cfg, is_min, busy).await;
+            run(worker_id, rx, cfg, memex_handle, is_min, busy).await;
         });
     }
 
@@ -290,7 +300,7 @@ impl WorkerPool {
     /// only exercise code paths that don't reach the queue.
     #[cfg(any(test, feature = "test-harness"))]
     pub fn new_inert_for_test() -> Self {
-        Self::empty(WorkerConfig::default())
+        Self::empty(WorkerConfig::default(), MemexHandle::new())
     }
 
     /// Drain the job queue via test closures instead of LLM subprocesses.
@@ -302,7 +312,7 @@ impl WorkerPool {
         extract: MockPromptFn,
         merge: Option<MockPromptFn>,
     ) -> Self {
-        let pool = Self::empty(WorkerConfig::default());
+        let pool = Self::empty(WorkerConfig::default(), MemexHandle::new());
         // Pretend max-count workers are already alive so `submit()`'s
         // autoscale path never spawns a real subprocess worker. Without
         // this, `submit()` sees `live=0 < max_count` and launches a
@@ -369,6 +379,7 @@ async fn run(
     worker_id: usize,
     rx: JobReceiver,
     cfg: WorkerConfig,
+    memex_handle: Arc<MemexHandle>,
     is_min: bool,
     busy: Arc<AtomicUsize>,
 ) {
@@ -428,7 +439,7 @@ async fn run(
             cumulative_input_tokens = 0;
         }
 
-        let (outcome, input_tokens) = run_job_with_retry(&mut subprocess, &cfg, &job).await;
+        let (outcome, input_tokens) = run_job_with_retry(&mut subprocess, &cfg, &memex_handle, &job).await;
 
         // Count any turn that actually ran to a terminal event. Only skip
         // Crash / Timeout — the subprocess didn't complete a turn. New
@@ -497,23 +508,88 @@ impl Drop for CountGuard {
 async fn run_job_with_retry(
     subprocess: &mut Option<Subprocess>,
     cfg: &WorkerConfig,
+    memex_handle: &Arc<MemexHandle>,
     job: &BackendJob,
 ) -> (JobOutcome, u64) {
+    let model_name = cfg
+        .model
+        .as_deref()
+        .unwrap_or_else(|| cfg.backend.default_model());
+
+    // Two job groups with different prompt-construction needs:
+    //
+    // - Interactive query jobs (Expand, Synth): may carry an `intent`
+    //   from the user's `--intent` flag; if so the worker prompt is
+    //   prefixed with "Intent: <text>\n\n".
+    // - Batch LLM jobs (Ingest, Merge): no intent concept; the prompt
+    //   is built by the dedicated extract/merge helpers and used as-is.
+    //
+    // Each arm produces a fully-formed prompt so the unified machinery
+    // below (cache key, subprocess, parse) doesn't need to know which
+    // group a job came from.
     let (prompt, kind) = match job {
-        BackendJob::Expand(j) => (
-            format!("[TASK: EXPAND]\n\nQuestion: {}\n", j.question),
-            TaskKind::Expand,
-        ),
-        BackendJob::Synth(j) => (
-            format!(
+        BackendJob::Expand(j) => {
+            let body = format!("[TASK: EXPAND]\n\nQuestion: {}\n", j.question);
+            (
+                apply_intent_prefix(&body, j.intent.as_deref()),
+                TaskKind::Expand,
+            )
+        }
+        BackendJob::Synth(j) => {
+            let body = format!(
                 "[TASK: SYNTHESIZE]\n\n{}\n\nQuestion: {}\n",
                 j.context, j.question
-            ),
-            TaskKind::Synthesize,
-        ),
+            );
+            (
+                apply_intent_prefix(&body, j.intent.as_deref()),
+                TaskKind::Synthesize,
+            )
+        }
         BackendJob::Ingest(j) => (build_extract_prompt(j), TaskKind::Extract),
         BackendJob::Merge(j) => (build_merge_prompt(&j.pages), TaskKind::Merge),
     };
+
+    let task_label = match kind {
+        TaskKind::Expand => "expand",
+        TaskKind::Synthesize => "synth",
+        TaskKind::Extract => "extract",
+        TaskKind::Merge => "merge",
+    };
+
+    // Compute the cache key from (model, task, system_prompt, user_prompt).
+    // WORKER_PROMPT is the system prompt shared by all backends.
+    let cache_key = memex_core::llm_cache::cache_key(model_name, task_label, WORKER_PROMPT, &prompt);
+
+    // Try to find a cached result. The MemexHandle is single-root and
+    // pre-populated by the handler before any jobs are enqueued, so
+    // `get` returns the active handle.
+    let cached_memex: Option<std::sync::Arc<memex_core::Memex>> = memex_handle.get();
+
+    if let Some(ref mx) = cached_memex
+        && let Ok(Some(cached_text)) = mx.search().with_connection(|c| {
+            memex_core::llm_cache::lookup_cache(c, &cache_key)
+        }) {
+            tracing::debug!(task_label, "llm_cache hit");
+            let outcome = match kind {
+                TaskKind::Expand => JobOutcome::Expand(
+                    parse::parse_expansion(&cached_text)
+                        .map_err(|e| WorkerError::Backend { message: e.raw, code: None }),
+                ),
+                TaskKind::Synthesize => JobOutcome::Synth(
+                    parse::parse_synthesis(&cached_text)
+                        .map_err(|e| WorkerError::Backend { message: e.raw, code: None }),
+                ),
+                TaskKind::Extract => JobOutcome::Ingest(
+                    parse::parse_ingest(&cached_text)
+                        .map_err(|e| WorkerError::Backend { message: e.raw, code: None }),
+                ),
+                TaskKind::Merge => JobOutcome::Merge(
+                    parse::parse_merge(&cached_text)
+                        .map_err(|e| WorkerError::Backend { message: e.raw, code: None }),
+                ),
+            };
+            return (outcome, 0);
+        }
 
     let timeout = std::time::Duration::from_secs(cfg.timeout_sec);
     let mut last_err: WorkerError = WorkerError::Crash("no attempt completed".into());
@@ -557,6 +633,13 @@ async fn run_job_with_retry(
 
         match turn {
             Ok(Ok(TurnOutcome::Ok { text, input_tokens })) => {
+                // Populate cache on success.
+                if let Some(ref mx) = cached_memex {
+                    let _ = mx.search().with_connection(|c| {
+                        memex_core::llm_cache::insert_cache(c, &cache_key, &text)?;
+                        Ok(())
+                    });
+                }
                 let outcome = match kind {
                     TaskKind::Expand => JobOutcome::Expand(
                         parse::parse_expansion(&text).map_err(|e| parse_err(e, "expand")),
@@ -601,6 +684,15 @@ async fn run_job_with_retry(
         }
     }
     (as_err(last_err), 0)
+}
+
+/// Prepend "Intent: <text>\n\n" to the user prompt when intent is non-blank.
+/// Returns the original string unchanged when intent is None or blank.
+fn apply_intent_prefix(user: &str, intent: Option<&str>) -> String {
+    match intent {
+        Some(t) if !t.trim().is_empty() => format!("Intent: {t}\n\n{user}"),
+        _ => user.to_string(),
+    }
 }
 
 pub(crate) fn build_extract_prompt(job: &crate::daemon::queue::IngestJob) -> String {
@@ -667,6 +759,20 @@ mod tests {
             chunk,
             reply: tx,
         }
+    }
+
+    #[test]
+    fn intent_prefix_helper_prepends_intent_when_set() {
+        let user = "user question".to_string();
+        let with = apply_intent_prefix(&user, Some("web page load times"));
+        assert!(with.starts_with("Intent: web page load times\n\n"));
+        assert!(with.ends_with("user question"));
+
+        let without = apply_intent_prefix(&user, None);
+        assert_eq!(without, user);
+
+        let empty = apply_intent_prefix(&user, Some("   "));
+        assert_eq!(empty, user, "blank intent should not prefix");
     }
 
     #[test]
@@ -856,6 +962,67 @@ mod tests {
             parsed["source"].as_str(),
             Some("/path/to/session.jsonl"),
             "source must be preserved in envelope",
+        );
+    }
+
+    /// Verify that the LLM cache wiring is reachable from the worker:
+    /// open a real Memex in a tempdir, pre-populate the llm_cache table,
+    /// and confirm that `MemexHandle::get` returns the handle and that
+    /// `lookup_cache` / `insert_cache` round-trip correctly through
+    /// `Bm25Search::with_connection`.
+    #[test]
+    fn llm_cache_accessible_via_memex_handle_get() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("memex");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let cache = MemexHandle::new();
+        // Empty cache returns None.
+        assert!(cache.get().is_none(), "empty cache must return None");
+
+        // Pre-populate via get_or_open (same as the handler does before dispatching jobs).
+        let memex = cache.get_or_open(&root).unwrap();
+        let got = cache.get();
+        assert!(got.is_some(), "get must return handle after get_or_open");
+        assert!(
+            std::sync::Arc::ptr_eq(got.as_ref().unwrap(), &memex),
+            "get must return the same Arc"
+        );
+
+        // Verify cache round-trip through with_connection.
+        let key = memex_core::llm_cache::cache_key("test-model", "synth", WORKER_PROMPT, "Intent: auth\n\nwhat are tokens?");
+        let miss = memex.search().with_connection(|c| {
+            memex_core::llm_cache::lookup_cache(c, &key)
+        }).unwrap();
+        assert!(miss.is_none(), "fresh db must have no cache entry");
+
+        memex.search().with_connection(|c| {
+            memex_core::llm_cache::insert_cache(c, &key, r#"{"answer":"tokens are...","citations":[]}"#)?;
+            Ok(())
+        }).unwrap();
+
+        let hit = memex.search().with_connection(|c| {
+            memex_core::llm_cache::lookup_cache(c, &key)
+        }).unwrap();
+        assert_eq!(
+            hit.as_deref(),
+            Some(r#"{"answer":"tokens are...","citations":[]}"#),
+            "cache must return inserted value"
+        );
+
+        // Duplicate insert must be ignored (INSERT OR IGNORE).
+        memex.search().with_connection(|c| {
+            memex_core::llm_cache::insert_cache(c, &key, "overwrite-attempt")?;
+            Ok(())
+        }).unwrap();
+        let still_first = memex.search().with_connection(|c| {
+            memex_core::llm_cache::lookup_cache(c, &key)
+        }).unwrap();
+        assert_eq!(
+            still_first.as_deref(),
+            Some(r#"{"answer":"tokens are...","citations":[]}"#),
+            "INSERT OR IGNORE must preserve first value"
         );
     }
 }

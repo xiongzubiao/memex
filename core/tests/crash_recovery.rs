@@ -8,7 +8,7 @@ fn stale_tmp_files_cleaned_on_next_open_writer() {
     let (_dir, root) = common::setup_temp_memex();
     let wiki = root.join("wiki");
 
-    let stale = wiki.join(".foo.md.99999.deadbeef.tmp");
+    let stale = wiki.join(".foo.md.deadbeef.tmp");
     std::fs::write(&stale, "stale").unwrap();
     let two_hours_ago = SystemTime::now() - Duration::from_secs(7200);
     filetime::set_file_mtime(&stale, filetime::FileTime::from_system_time(two_hours_ago)).unwrap();
@@ -22,7 +22,7 @@ fn fresh_tmp_files_preserved_on_open_writer() {
     let (_dir, root) = common::setup_temp_memex();
     let wiki = root.join("wiki");
 
-    let fresh = wiki.join(".foo.md.12345.abcd1234.tmp");
+    let fresh = wiki.join(".foo.md.abcd1234.tmp");
     std::fs::write(&fresh, "fresh").unwrap();
 
     let _m = Memex::open_writer(root).unwrap();

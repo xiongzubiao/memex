@@ -28,6 +28,15 @@ pub struct DaemonConfig {
     pub idle_timeout_min: u64,
     pub log_file: PathBuf,
     pub worker: WorkerConfig,
+    /// Seconds the daemon waits for in-flight requests to finish after
+    /// SIGTERM before forcibly exiting. Default is short (3s) — `daemon
+    /// stop` means "stop now," not "let me finish that LLM call." Bump
+    /// for LLM-heavy workloads where typical ingest takes 10-30s and
+    /// you'd rather not abandon them. The CLI's `daemon stop` polls
+    /// for up to 6s; if you set this above 6 the CLI will print "daemon
+    /// still running after 6s SIGTERM; giving up" and return, but the
+    /// daemon will continue draining until this timeout expires.
+    pub drain_timeout_sec: u64,
 }
 
 impl Default for DaemonConfig {
@@ -36,6 +45,7 @@ impl Default for DaemonConfig {
             idle_timeout_min: 15,
             log_file: memex_root().join("daemon.log"),
             worker: WorkerConfig::default(),
+            drain_timeout_sec: 3,
         }
     }
 }
@@ -120,11 +130,22 @@ impl Backend {
 #[serde(default)]
 pub struct QueryConfig {
     pub top_k: usize,
+    /// Hard cap on how long the daemon waits for the retrieval actor to
+    /// reply before giving up and returning a clean error to the client.
+    /// Without this, any bug or unexpected slow embed inside the actor
+    /// can stall the client indefinitely (no read timeout downstream).
+    /// Default 60s — generous enough to absorb a cold-load + heavy
+    /// expansion, tight enough that an actor stuck in a real bug surfaces
+    /// to the user instead of silently hanging.
+    pub retrieval_timeout_sec: u64,
 }
 
 impl Default for QueryConfig {
     fn default() -> Self {
-        Self { top_k: 5 }
+        Self {
+            top_k: 5,
+            retrieval_timeout_sec: 60,
+        }
     }
 }
 
@@ -190,6 +211,12 @@ impl Config {
         let q = &self.query;
         if !(1..=20).contains(&q.top_k) {
             bail!("query.top_k = {} out of range 1..=20", q.top_k);
+        }
+        if !(1..=600).contains(&q.retrieval_timeout_sec) {
+            bail!(
+                "query.retrieval_timeout_sec = {} out of range 1..=600",
+                q.retrieval_timeout_sec
+            );
         }
         let i = &self.ingest;
         if !(1024..=500 * 1024 * 1024).contains(&i.fetch_max_bytes) {

@@ -74,9 +74,16 @@ pub enum LintIssueKind {
     UntrackedFile,
     MissingFile,
     OutdatedEmbedding,
+    /// Raw file's body sha256 doesn't match the hash encoded in its
+    /// path: external body edit to a `raw/<hh>/<rest>` file invalidates
+    /// the content-addressed name. `lint --fix` repairs by renaming the
+    /// file to its new body hash, dropping old chunks/embeddings, and
+    /// re-embedding at the new hash. `target` carries the recomputed
+    /// body hash so the fix path doesn't re-read the file.
+    RawHashMismatch,
 }
 
-/// A document in the content-addressable store (wiki or source).
+/// A document in the content-addressable store (wiki or raw).
 #[derive(Debug, Clone)]
 pub struct Document {
     pub id: i64,
@@ -84,11 +91,7 @@ pub struct Document {
     pub path: String,
     pub title: String,
     pub hash: String,
-    pub docid: String,
     pub tags: String,
-    pub summary: String,
-    pub created_at: String,
-    pub updated_at: String,
 }
 
 #[cfg(test)]

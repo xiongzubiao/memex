@@ -4,21 +4,21 @@ use std::path::Path;
 
 /// Parse YAML frontmatter from a wiki page string.
 /// Returns (frontmatter, body) or error if frontmatter is missing/invalid.
+///
+/// Body extraction goes through `storage::split_frontmatter` so the bytes
+/// here are byte-for-byte identical to what `commit_doc` hashes — keeps
+/// lint's stale-index check from disagreeing with writers.
 pub fn parse_frontmatter(content: &str) -> Result<(PageFrontmatter, String)> {
-    let trimmed = content.trim();
-    if !trimmed.starts_with("---") {
-        return Err(MemexError::ValidationFailure {
-            details: "Page missing YAML frontmatter (must start with ---)".to_string(),
-        });
-    }
-    let after_first = &trimmed[3..];
-    let end = after_first
-        .find("---")
-        .ok_or_else(|| MemexError::ValidationFailure {
-            details: "Unclosed frontmatter (missing closing ---)".to_string(),
-        })?;
-    let yaml_str = &after_first[..end];
-    let body = after_first[end + 3..].trim().to_string();
+    let (yaml_str, body) = crate::storage::split_frontmatter(content).ok_or_else(|| {
+        let details = if content.trim_start_matches('\u{feff}').starts_with("---") {
+            "Unclosed frontmatter (missing closing ---)"
+        } else {
+            "Page missing YAML frontmatter (must start with ---)"
+        };
+        MemexError::ValidationFailure {
+            details: details.to_string(),
+        }
+    })?;
     // Try parsing YAML as-is first
     let fm: PageFrontmatter = match serde_yaml::from_str(yaml_str) {
         Ok(fm) => fm,
@@ -31,7 +31,7 @@ pub fn parse_frontmatter(content: &str) -> Result<(PageFrontmatter, String)> {
             })?
         }
     };
-    Ok((fm, body))
+    Ok((fm, body.to_string()))
 }
 
 /// Validate a complete wiki page (frontmatter + body).
