@@ -92,21 +92,58 @@ Render the plan once for the user:
 memex plan show < /tmp/memex-plan-<docid>.json
 ```
 
-Paste the output to chat. Then collect edits via `AskUserQuestion` using these
-heuristics by proposal count:
+Paste the output to chat, then collect the user's review. The review
+must give the user three capabilities:
 
-- **1–5 proposals:** Ask per-proposal — `rename slug`, `drop`, `accept`.
-- **6–20 proposals:** Ask only about proposals you flag as suspect (slug
-  contains a date like `2026-04`, a version qualifier like `v3`, an episode
-  word like `milestone`/`session`, or duplicates an obvious subject already
-  in the wiki). Other proposals are accepted by default.
-- **>20 proposals:** Editor-handoff. Tell the user the plan is at
-  `/tmp/memex-plan-<docid>.json`; ask them to open it in their editor, edit
-  `slug` / `title` / `dropped` fields, then say "apply". Wait for confirmation.
+1. **Accept the plan as-is** and proceed to apply.
+2. **Rename one or more slugs** before apply (e.g. user wants `python`
+   → `cpython` or `rust` to merge into an existing `rust-lang` page).
+3. **Drop one or more proposals** before apply.
 
-To apply slug or `dropped` edits, use the **Edit tool** against
-`/tmp/memex-plan-<docid>.json` (diff-only — never re-emit the whole plan).
+How you ask is up to you, but **the question(s) you issue must let the
+user act on each individual slug**. A single high-level question like
+"split into N pages or 1 combined?" is NOT sufficient — it doesn't
+expose per-slug rename or drop. If you ask one consolidated question
+first and the user picks "edit", follow up with per-slug questions to
+collect the actual rename/drop decisions.
+
+Mechanism choice:
+
+- For **≤20 proposals**, use `AskUserQuestion` (structured chips). The
+  schema allows 1–4 questions per call; batch accordingly. Free-text
+  rename values come back via the `Other` channel.
+- For **>20 proposals**, skip `AskUserQuestion` and use editor handoff:
+  tell the user the plan is at `/tmp/memex-plan-<docid>.json`, ask them
+  to open it in their editor, edit `slug` / `title` / `dropped` fields,
+  then reply with "apply".
+
+For 6–20 proposals you MAY narrow the per-slug questions to suspects
+only (slug contains a date like `2026-04`, a version qualifier like
+`v3`, an episode word like `milestone`/`session`, or duplicates an
+obvious wiki subject); non-suspects auto-Accept.
+
+Apply each rename/drop via the **Edit tool** against
+`/tmp/memex-plan-<docid>.json` — single-field swap on the affected
+proposal (`slug` or `dropped`), diff-only. Never re-emit the whole
+plan via `jq` or any rewrite path.
+
 Title edits go through the editor handoff regardless of proposal count.
+
+**Key constraint:** the user must be able to rename or drop *any
+specific slug*. If your review flow doesn't reach that level of
+control by the time you call `plan apply`, the review is incomplete.
+
+**Free-text safety valve.** When pasting `plan show` output, end your
+chat message with a single line:
+
+> *Reply with `apply` to commit as-is, or send specific edits like*
+> *`drop python; rename rust to oxidation` *before approving.*
+
+If the user replies with edits, parse the directives and apply each
+via the Edit tool against `/tmp/memex-plan-<docid>.json` (set `slug`
+or `dropped: true` per directive), then re-run `plan show` and
+proceed. This catches per-slug intent the agent's `AskUserQuestion`
+phrasing might miss.
 
 ### Step 4 — Apply, with bounded re-review loop
 
