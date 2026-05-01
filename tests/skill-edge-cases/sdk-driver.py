@@ -49,7 +49,9 @@ def pick_label(options: list, policy: str) -> str:
     if policy == "abort":
         return find("abort", "cancel", "skip", "stop") or labels[-1]
     if policy == "rename-slug":
-        return find("rename") or find("accept") or labels[0]
+        # Match the SKILL.md's chat-based directive style if Apply/Edit
+        # options exist; otherwise fall through to AskUserQuestion-style.
+        return find("edit", "rename") or find("accept") or labels[0]
     if policy == "drop-all":
         return find("drop", "skip", "discard") or labels[-1]
     if policy == "retry":
@@ -127,7 +129,7 @@ async def main():
                 "content": (
                     f"Use the /memex-ingest skill to ingest this local file: {test_file}. "
                     "The binary `memex` is on PATH. Follow the SKILL.md exactly. "
-                    "Use AskUserQuestion when the skill calls for it; I'm here to answer."
+                    "Follow the skill exactly. I.m here to answer any review prompts."
                 ),
             },
         }
@@ -140,6 +142,12 @@ async def main():
             "Bash", "Edit", "Read", "Write", "Glob", "Grep",
             "AskUserQuestion", "Skill", "ToolSearch",
         ],
+        # Load the worktree's plugin (latest SKILL.md), NOT the
+        # marketplace copy (which is stale).
+        plugins=[{
+            "type": "local",
+            "path": PLUGIN_DIR,
+        }],
     )
 
     final_text = None
