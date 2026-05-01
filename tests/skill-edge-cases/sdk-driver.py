@@ -27,8 +27,9 @@ from claude_agent_sdk.types import (
     PermissionResultDeny,
 )
 
-PLUGIN_DIR = "/Users/zxiong/MemVerge/memex-ingest-skill-redesign/plugin"
-NEW_BIN_DIR = "/Users/zxiong/MemVerge/memex-ingest-skill-redesign/target/release"
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PLUGIN_DIR = os.path.join(_REPO_ROOT, "plugin")
+NEW_BIN_DIR = os.path.join(_REPO_ROOT, "target", "release")
 
 
 def pick_label(options: list, policy: str) -> str:
