@@ -5,7 +5,8 @@ against a live `memex daemon`, using **claude-agent-sdk** (Python).
 
 | File | Path | Mode |
 |------|------|------|
-| `path_a.py` | A | Single-turn. Agent uses `AskUserQuestion`; driver answers via a selection policy. |
+| `path_a.py` | A | Single-turn. Single policy applied to all proposals. |
+| `path_a_mixed.py` | A | Single-turn. Per-slug policy: drop one, rename one, accept one in a single batched call. |
 | `path_b.py` | B | Multi-turn. Driver denies `AskUserQuestion` via `can_use_tool`, forcing chat-directive fallback; injects user reply when the agent reaches the directive prompt. |
 | `_common.py` | — | Shared SDK options builder, plugin-loading config, no-op `PreToolUse` hook. |
 
@@ -94,3 +95,46 @@ inspect `~/.memex/wiki/` and `~/.memex/daemon.log.*` after the run.
   wiki state between `source plan` and `plan apply`.
 - **These drivers** — agent's interpretation of the SKILL.md and the
   full agent → CLI → daemon → wiki round-trip across all three paths.
+
+## Verified scenarios
+
+End-to-end across these drivers + manual CLI smoke:
+
+**Path A (chip-driven):**
+- accept-all (3 proposals → 3 wiki pages)
+- drop-all (0 wiki pages, plan cleaned up)
+- rename via `Other` free-text (rust → oxidation)
+- mixed actions in one batched call (drop one + rename one + accept one)
+- 26 unrelated subjects → routes to Path C editor handoff
+
+**Path B (chat-directive):**
+- `apply` reply (3 proposals → 3 wiki pages)
+- `drop X; rename Y to Z; apply` (correct subset committed)
+- `cancel` reply (plan removed, no commits)
+- invalid directive (`drop nonexistent`) — agent refuses to silently
+  ignore, lists actual slugs, offers recovery options
+
+**Daemon / CLI:**
+- Re-ingest dedup (content-addressed docid)
+- Slug collision in plan → validation error
+- Empty extract (trivial / no-subject content) → 0-byte plan, clean exit
+- MERGE proposal (existing wiki + overlapping ingest) → daemon emits
+  unified diff, apply commits merged content with source attribution
+- rc=3 re-review (wiki mutated between plan and apply) → daemon emits
+  refreshed plan with new merge_target_hash + regenerated diff
+- rc=4 partial commit (one target write fails, others succeed)
+- rc=4 all-fail (wiki dir read-only) → all proposals errored
+- Phased re-MERGE: rename proposal slug to match existing wiki page →
+  daemon detects stale state, re-MERGEs in phase 2
+- Lint after apply correctly flags dangling `[[link]]` refs
+- Stale socket recovery (SIGKILL daemon → CLI auto-respawns)
+- Daemon-down → CLI auto-spawns daemon transparently
+- Large source (~22KB, 10 distinct subjects) → 10 subject-named proposals
+
+**Bugs caught and fixed during testing:**
+- `memex write` produced duplicate frontmatter when stdin already had a
+  `---` block (parse_frontmatter strict-deserialize fell back to whole
+  content; fixed by using delimiter-only `split_frontmatter` instead).
+- Hybrid SKILL.md initially let the agent reframe Path A → Path B for
+  "clean-looking" plans. Tightened the decision rule to "no judgment,
+  no reframing": if AskUserQuestion is available, use Path A.
