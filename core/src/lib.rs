@@ -76,6 +76,7 @@ impl Drop for WriterLock {
 /// on `{root}/.lock`. Mutating methods check this via `require_writer()`.
 pub struct Memex {
     root: PathBuf,
+    canonical_root: std::sync::OnceLock<PathBuf>,
     search: Bm25Search,
     _writer_lock: Option<WriterLock>,
     config: Config,
@@ -128,6 +129,7 @@ impl Memex {
 
         Ok(Self {
             root,
+            canonical_root: std::sync::OnceLock::new(),
             search,
             _writer_lock: None,
             config,
@@ -179,6 +181,7 @@ impl Memex {
 
         Ok(Self {
             root,
+            canonical_root: std::sync::OnceLock::new(),
             search,
             _writer_lock: Some(writer_lock),
             config,
@@ -187,6 +190,28 @@ impl Memex {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Symlink-resolved form of `root()`, cached after first call. Use this
+    /// for `strip_prefix` against filesystem-walked paths — on macOS,
+    /// `WalkDir` over `/var/folders/...` yields `/private/var/folders/...`
+    /// because `/var → /private/var`. Stripping with the non-canonical root
+    /// fails and the indexer falls back to absolute paths in the DB.
+    pub fn canonical_root(&self) -> &Path {
+        self.canonical_root.get_or_init(|| {
+            fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone())
+        })
+    }
+
+    /// Best-effort relative path from this memex's root. Tries the canonical
+    /// root first (matches paths from `WalkDir(canonicalize(root))`), then
+    /// falls back to the user-supplied root (matches paths constructed from
+    /// `memex.wiki_dir()` / `memex.raw_dir()`). Returns the input unchanged
+    /// if neither prefix matches.
+    pub fn relativize<'a>(&self, path: &'a Path) -> &'a Path {
+        path.strip_prefix(self.canonical_root())
+            .or_else(|_| path.strip_prefix(&self.root))
+            .unwrap_or(path)
     }
 
     pub fn wiki_dir(&self) -> PathBuf {

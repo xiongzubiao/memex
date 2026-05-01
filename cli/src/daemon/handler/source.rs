@@ -65,7 +65,7 @@ pub(super) async fn handle_source_add(
 
     if !collections.is_empty() {
         let rel = memex_core::storage::rel_path_string(
-            raw_path.strip_prefix(memex.root()).unwrap_or(&raw_path),
+            memex.relativize(&raw_path),
         );
         if let Err(e) = memex
             .search()
