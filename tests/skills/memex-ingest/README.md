@@ -7,6 +7,7 @@ against a live `memex daemon`, using **claude-agent-sdk** (Python).
 |------|------|------|
 | `path_a.py` | A | Single-turn. Single policy applied to all proposals. |
 | `path_a_mixed.py` | A | Single-turn. Per-slug policy: drop one, rename one, accept one in a single batched call. |
+| `path_a_rereview.py` | A | Single-turn. Mutates wiki mid-flight via a `PreToolUse` hook so `plan apply` returns rc=3; verifies the agent re-shows the refreshed plan and applies on second confirm. |
 | `path_b.py` | B | Multi-turn. Driver denies `AskUserQuestion` via `can_use_tool`, forcing chat-directive fallback; injects user reply when the agent reaches the directive prompt. |
 | `_common.py` | — | Shared SDK options builder, plugin-loading config, no-op `PreToolUse` hook. |
 
@@ -121,7 +122,9 @@ End-to-end across these drivers + manual CLI smoke:
 - MERGE proposal (existing wiki + overlapping ingest) → daemon emits
   unified diff, apply commits merged content with source attribution
 - rc=3 re-review (wiki mutated between plan and apply) → daemon emits
-  refreshed plan with new merge_target_hash + regenerated diff
+  refreshed plan with new merge_target_hash + regenerated diff. Agent
+  walkthrough automated by `path_a_rereview.py` (PreToolUse hook
+  intercepts `Bash` to mutate the wiki just before `plan apply`).
 - rc=4 partial commit (one target write fails, others succeed)
 - rc=4 all-fail (wiki dir read-only) → all proposals errored
 - Phased re-MERGE: rename proposal slug to match existing wiki page →
