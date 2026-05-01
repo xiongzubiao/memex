@@ -138,17 +138,9 @@ fn walk_dir(
     seen: &mut HashSet<String>,
     report: &mut ReconcileReport,
 ) -> Result<Vec<std::path::PathBuf>> {
-    let canonical_root = match std::fs::canonicalize(root) {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(MemexError::FileOpFailed {
-                path: root.to_path_buf(),
-                operation: "canonicalize root",
-                source: e,
-            });
-        }
-    };
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
     // Wiki has a flat namespace: <wiki_dir>/<slug>.md (depth 1).
     // Raw is content-addressed in 2 levels: <raw_dir>/<hh>/<rest> (depth 2).
     // Cap the walk so files dropped into subdirectories aren't silently
@@ -157,7 +149,7 @@ fn walk_dir(
     // forever as `missing-file:` in lint).
     let max_depth = if doc_type == "raw" { 2 } else { 1 };
     let mut out = Vec::new();
-    for entry in WalkDir::new(&canonical_root)
+    for entry in WalkDir::new(root)
         .follow_links(false)
         .max_depth(max_depth)
     {

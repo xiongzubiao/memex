@@ -28,19 +28,27 @@ def prepend_bin_to_path():
     os.environ["PATH"] = BIN_DIR + ":" + os.environ.get("PATH", "")
 
 
-def build_options(*, can_use_tool, allow_askuserquestion: bool) -> ClaudeAgentOptions:
+def build_options(
+    *,
+    can_use_tool,
+    allow_askuserquestion: bool,
+    pre_tool_hooks: list | None = None,
+) -> ClaudeAgentOptions:
     """Construct ClaudeAgentOptions with the worktree plugin loaded.
 
     The `plugins=[{type:local, path:...}]` parameter is required to load
     the worktree's SKILL.md instead of the (stale) marketplace copy at
-    ~/.claude/local-marketplaces/memex-dev/.
+    ~/.claude/local-marketplaces/memex-dev/. Default PreToolUse hooks are
+    a single no-op matcher; pass `pre_tool_hooks` to override (e.g., a
+    Bash matcher that mutates state mid-flight for re-review tests).
     """
     tools = list(DEFAULT_TOOLS)
     if allow_askuserquestion:
         tools.append("AskUserQuestion")
+    hooks = pre_tool_hooks or [HookMatcher(matcher=None, hooks=[noop_hook])]
     return ClaudeAgentOptions(
         can_use_tool=can_use_tool,
-        hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[noop_hook])]},
+        hooks={"PreToolUse": hooks},
         allowed_tools=tools,
         plugins=[{"type": "local", "path": PLUGIN_DIR}],
     )

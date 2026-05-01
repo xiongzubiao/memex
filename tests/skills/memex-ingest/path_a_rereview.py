@@ -101,11 +101,11 @@ async def main():
             },
         }
 
-    options = build_options(can_use_tool=can_use_tool, allow_askuserquestion=True)
-    # Override the no-op hook with the mutate hook for Bash.
-    options.hooks = {
-        "PreToolUse": [HookMatcher(matcher="Bash", hooks=[mutate_before_apply])]
-    }
+    options = build_options(
+        can_use_tool=can_use_tool,
+        allow_askuserquestion=True,
+        pre_tool_hooks=[HookMatcher(matcher="Bash", hooks=[mutate_before_apply])],
+    )
 
     final_text = None
     print("=== Path A rc=3 re-review walkthrough ===", file=sys.stderr)

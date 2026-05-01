@@ -685,10 +685,7 @@ fn run_write(
         anyhow::bail!("empty content");
     }
 
-    // Extract tags from frontmatter if present. Use the delimiter-only
-    // split (not parse_page_for_indexing, which strict-deserializes the
-    // full PageFrontmatter and fails when piped content lacks
-    // created_at/updated_at — silently dropping the user's tags).
+    // Generic-YAML walk; parse_page_for_indexing requires created_at/updated_at.
     let tags = memex_core::storage::split_frontmatter(&content)
         .and_then(|(yaml, _)| serde_yaml::from_str::<serde_yaml::Value>(yaml).ok())
         .and_then(|v| v.get("tags").cloned())
