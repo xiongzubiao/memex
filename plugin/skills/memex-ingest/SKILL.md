@@ -197,7 +197,3 @@ place, or policy. The slug names the *subject*, not an event or date.
 - Plan rendering is `memex plan show` output (table + diff blocks), not raw JSON.
 - Plan mutations use the **Edit tool** against `/tmp/memex-plan-<docid>.json`
   (diff-only), not `jq` re-emission of the whole plan.
-
-## Related
-
-- `memex-query` — for retrieval after ingestion.
