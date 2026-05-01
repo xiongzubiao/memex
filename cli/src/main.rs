@@ -78,6 +78,11 @@ enum Commands {
         #[arg(long)]
         fix: bool,
     },
+    /// Plan-pipeline subcommands (see also: `source plan` and `plan apply`).
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
     /// Manage the memex daemon (query-path persistence)
     Daemon {
         #[command(subcommand)]
@@ -191,6 +196,19 @@ enum SourceAction {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Render plan JSON (stdin) as a human-readable table + diffs (stdout).
+    Show {
+        /// Pass plan JSON through unchanged for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a plan: write each non-dropped proposal as a wiki page.
+    /// Reads plan JSON from stdin; emits refreshed plan or summary.
+    Apply,
 }
 
 /// CLI title→slug lookup. Routes through the daemon (auto-spawning
@@ -566,6 +584,28 @@ fn run_source_add(
     }
     println!("{docid}");
     Ok(())
+}
+
+fn run_plan_show(json_only: bool) -> anyhow::Result<()> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    if buf.trim().is_empty() {
+        anyhow::bail!("empty stdin: pipe a plan JSON file");
+    }
+    let plan: memex_cli::daemon::plan::Plan = serde_json::from_str(&buf)
+        .map_err(|e| anyhow::anyhow!("plan JSON parse: {e}"))?;
+    if json_only {
+        // Pass-through: re-emit (validates parseability).
+        println!("{}", serde_json::to_string(&plan)?);
+        return Ok(());
+    }
+    print!("{}", memex_cli::plan_show::format_plan(&plan));
+    Ok(())
+}
+
+fn run_plan_apply() -> anyhow::Result<()> {
+    anyhow::bail!("plan apply: not yet implemented (Task 15)");
 }
 
 /// Write a wiki page via the daemon. Sends Request::Write.
@@ -1309,6 +1349,10 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             SourceAction::List { collections, json } => run_source_list(&collections, json),
             SourceAction::Show { reference } => run_source_show(&reference),
             SourceAction::Delete { reference, force } => run_source_delete(&reference, force),
+        },
+        Commands::Plan { action } => match action {
+            PlanAction::Show { json } => run_plan_show(json),
+            PlanAction::Apply => run_plan_apply(),
         },
     }
 }
