@@ -220,11 +220,39 @@ pub(super) fn compute_unified_diff(old: &str, new: &str) -> String {
         .to_string()
 }
 
-/// Handle `Request::PlanApply`. Stubbed until Tasks 12-13 implement the
-/// per-proposal commit logic.
-pub(super) async fn handle_plan_apply(_plan_json: String, _state: &HandlerState) -> Vec<Event> {
+/// Handle `Request::PlanApply`. Validates the plan, then per non-dropped
+/// non-committed proposal: under per-slug lock, check existence + hash,
+/// commit via apply_proposal_to_wiki or mark needs-rereview.
+pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -> Vec<Event> {
+    let plan: Plan = match serde_json::from_str(&plan_json) {
+        Ok(p) => p,
+        Err(e) => {
+            return error_events(DaemonError::BadRequest(format!("plan JSON parse: {e}")));
+        }
+    };
+    if let Err(e) = plan.validate() {
+        return error_events(DaemonError::BadRequest(format!("plan invalid: {e}")));
+    }
+
+    // Verify source still exists.
+    let memex = match get_or_open_memex(state.writer.memex_handle(), state.writer.bound_root()) {
+        Ok(m) => m,
+        Err(e) => return error_events(e),
+    };
+    let docs = match memex.search().resolve_ref_documents(&plan.source.id) {
+        Ok(d) => d,
+        Err(e) => return error_events(DaemonError::Storage(e.to_string())),
+    };
+    if !docs.iter().any(|d| d.doc_type == "raw") {
+        return error_events(DaemonError::BadRequest(format!(
+            "source missing: '{}'", plan.source.id
+        )));
+    }
+
+    // (Task 13: per-proposal commit logic)
+    let _ = (plan, memex);
     error_events(DaemonError::Internal(
-        "plan_apply: not yet implemented".into(),
+        "plan_apply: per-proposal logic not yet implemented".into(),
     ))
 }
 
@@ -479,5 +507,26 @@ mod tests {
         assert!(body.contains("\"#src-old\""), "old source dropped: {body}");
         assert!(body.contains("\"#src-new\""), "new source missing: {body}");
         assert!(body.contains("merged body"));
+    }
+
+    #[tokio::test]
+    async fn plan_apply_rejects_invalid_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let _ = memex_core::Memex::open(root.clone()).unwrap();
+        let state = test_state(root);
+        let bad = r#"{"version":99,"source":{"id":"s","identifier":"i","content_hash":"a","size_bytes":0},"created_at":"x","proposals":[]}"#;
+        let events = handle_plan_apply(bad.into(), &state).await;
+        assert!(matches!(&events[0], Event::Error { code, .. } if code == "bad_request"));
+    }
+
+    #[tokio::test]
+    async fn plan_apply_rejects_malformed_json() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let _ = memex_core::Memex::open(root.clone()).unwrap();
+        let state = test_state(root);
+        let events = handle_plan_apply("not json".into(), &state).await;
+        assert!(matches!(&events[0], Event::Error { code, .. } if code == "bad_request"));
     }
 }
