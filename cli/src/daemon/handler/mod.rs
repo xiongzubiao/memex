@@ -19,6 +19,7 @@ use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 mod delete;
 mod ingest;
 mod lint_fix;
+mod plan;
 mod query;
 mod search;
 mod source;
@@ -148,7 +149,6 @@ pub(super) async fn acquire_slug_locks(
 /// Acquire the per-content-hash lock. Held during EXTRACT/MERGE-dry-run
 /// for `source plan`; prevents two simultaneous LLM call chains on the
 /// same source content. Released before stdout streaming.
-#[allow(dead_code)] // first consumer is the upcoming `source plan` handler.
 pub(super) async fn acquire_content_hash_lock(
     writer: &WriterSession,
     content_hash: &str,
@@ -296,12 +296,9 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
 
         Request::LintFix {} => lint_fix::handle_lint_fix(state).await,
 
-        Request::SourcePlan { source_id: _ } => {
-            error_events(DaemonError::Internal("source_plan: not yet implemented".into()))
-        }
-        Request::PlanApply { plan_json: _ } => {
-            error_events(DaemonError::Internal("plan_apply: not yet implemented".into()))
-        }
+        Request::SourcePlan { source_id } => plan::handle_source_plan(source_id, state).await,
+
+        Request::PlanApply { plan_json } => plan::handle_plan_apply(plan_json, state).await,
     }
 }
 
