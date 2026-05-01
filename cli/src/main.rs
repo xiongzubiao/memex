@@ -666,7 +666,7 @@ fn run_plan_apply() -> anyhow::Result<()> {
 }
 
 /// Write a wiki page via the daemon. Sends Request::Write.
-fn run_write_via_daemon(
+fn run_write(
     name: &str,
     force: bool,
     quiet: bool,
@@ -817,7 +817,7 @@ fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
 
 fn run_lint(fix: bool) -> anyhow::Result<()> {
     if fix {
-        return run_lint_fix_via_daemon();
+        return run_lint_fix();
     }
 
     let root = memex_cli::memex_root();
@@ -862,7 +862,7 @@ fn run_lint(fix: bool) -> anyhow::Result<()> {
 
 /// `memex lint --fix` — daemon-routed mutation. The daemon owns all
 /// writes, including stale-index reindex and embedding-model re-embed.
-fn run_lint_fix_via_daemon() -> anyhow::Result<()> {
+fn run_lint_fix() -> anyhow::Result<()> {
     let events = send_to_daemon(memex_cli::daemon::protocol::Request::LintFix {}, 15)?;
     let mut applied = 0u32;
     let mut stale = 0u32;
@@ -1003,7 +1003,7 @@ fn core_agent_to_protocol(
     }
 }
 
-fn run_ingest_client(
+fn run_ingest(
     agent: Option<&Agent>,
     path: Option<&std::path::Path>,
     source: Option<&str>,
@@ -1293,7 +1293,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             force,
             quiet,
             source,
-        } => run_write_via_daemon(&name, force, quiet, source.as_deref()),
+        } => run_write(&name, force, quiet, source.as_deref()),
         Commands::Delete { page_ref, force } => run_delete(&page_ref, force),
         Commands::Lint { fix } => {
             if fix {
@@ -1328,7 +1328,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             path,
             source,
             collections,
-        } => run_ingest_client(
+        } => run_ingest(
             agent.as_ref(),
             path.as_deref(),
             source.as_deref(),
