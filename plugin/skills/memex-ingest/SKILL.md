@@ -22,58 +22,80 @@ files), use `memex backfill <agent>` instead.
 
 ## How it works
 
-The skill is a thin orchestrator around three CLI subcommands:
+The skill is a thin orchestrator around four CLI subcommands:
 
-1. `memex source add <url>` — store the source content in the raw store; daemon returns a docid.
+1. `memex source add <path-or-url>` — store the source content in the raw store; daemon returns a docid.
 2. `memex source plan <docid>` — daemon runs EXTRACT (chunked) + MERGE-dry-run for any overlapping wiki slugs; emits plan JSON to stdout.
 3. `memex plan show < plan.json` — local renderer; produces a human-readable table + diff blocks.
 4. `memex plan apply < plan.json` — daemon validates and writes each non-dropped proposal as a wiki page.
 
-The skill owns its plan file (mktemp); the daemon is stateless on plan content.
+The skill stores the plan at a deterministic path derived from the docid:
+`/tmp/memex-plan-<docid>.json`. The docid is content-addressed (sha256-derived),
+so this path is unique per source content and stable across the multi-step flow.
+The daemon stays stateless on plan content — it only ever sees the JSON via
+stdin/stdout.
+
+## How an agent should execute this
+
+This skill runs as a sequence of **discrete tool calls**, not as a single shell
+script. Each Bash tool call is its own subshell — shell variables (`$docid`,
+`$plan_file`) do **not** persist between calls. To carry state, the agent
+captures the docid from the first call's stdout and **interpolates the literal
+docid value** into every subsequent command (using `/tmp/memex-plan-<docid>.json`
+where `<docid>` is the actual value, e.g., `/tmp/memex-plan-75908e2.json`).
+
+Between Bash calls, the agent uses `AskUserQuestion` to collect review edits and
+the `Edit` tool to mutate the plan JSON file in-place. These are Claude tools,
+not shell commands.
 
 ## Flow
 
-### Step 1: Acquire content
+### Step 1 — Acquire content and store the source (one Bash call)
 
-Use the right converter for the input:
-- URLs: `markitdown <url>`
-- Local PDFs / docs: `markitdown <path>`
-- Plain text: skip the converter, pipe straight into source add
-
-**Do NOT `cat` content into chat.** Pipe directly into `memex source add` so the
-source bytes never enter your context. The daemon hashes content for dedup, so
-re-adding the same source returns the same docid.
+For URLs, pipe `markitdown` directly into `source add`. For local files, pipe
+the file directly. **Do NOT `cat` the content into chat** — the bytes must go
+straight from the converter (or file) into `memex source add`'s stdin.
 
 ```bash
-content_path=$(mktemp /tmp/memex-ingest-content-XXXXXX.md)
-markitdown "$url" > "$content_path"
+# URL case:
+docid=$(markitdown "$url" | memex source add "$url")
+
+# Local file case:
+docid=$(memex source add "$path" < "$path")
+
+echo "DOCID=$docid"
 ```
 
-### Step 2: Store the source
+The agent captures the docid from `DOCID=` and uses the literal value (e.g.
+`75908e2`) in every subsequent step.
+
+If `memex source add` exits non-zero, paste its stderr to chat and abort.
+
+### Step 2 — Generate the plan (one Bash call, deterministic path)
 
 ```bash
-docid=$(memex source add "$url" < "$content_path")
+memex source plan <docid> > /tmp/memex-plan-<docid>.json
+echo "rc=$? size=$(wc -c < /tmp/memex-plan-<docid>.json)"
 ```
 
-### Step 3: Generate the plan
+Substitute `<docid>` with the literal value from Step 1.
+
+- **Empty file (size = 0) and rc=0**: EXTRACT yielded no extractable subjects.
+  Tell the user, `rm -f /tmp/memex-plan-<docid>.json`, and stop.
+- **Invalid JSON** (run `jq -e . /tmp/memex-plan-<docid>.json`): the daemon
+  connection dropped mid-stream. Abort with the message that the user should
+  retry. Then `rm -f /tmp/memex-plan-<docid>.json`.
+- **Non-zero rc**: paste daemon stderr to chat and abort.
+
+### Step 3 — Render and review
+
+Render the plan once for the user:
 
 ```bash
-plan_file=$(mktemp /tmp/memex-plan-XXXXXX.json)
-trap 'rm -f "$content_path" "$plan_file"' EXIT
-memex source plan "$docid" > "$plan_file"
+memex plan show < /tmp/memex-plan-<docid>.json
 ```
 
-Empty plan file (zero bytes) means EXTRACT yielded no extractable subjects;
-tell the user and exit cleanly. Invalid JSON (`jq -e . "$plan_file"` fails)
-means the daemon connection dropped mid-stream; abort with `exit 1`.
-
-### Step 4: Render and review
-
-```bash
-memex plan show < "$plan_file"
-```
-
-Paste the output to chat. Then collect edits via AskUserQuestion using these
+Paste the output to chat. Then collect edits via `AskUserQuestion` using these
 heuristics by proposal count:
 
 - **1–5 proposals:** Ask per-proposal — `rename slug`, `drop`, `accept`.
@@ -81,51 +103,60 @@ heuristics by proposal count:
   contains a date like `2026-04`, a version qualifier like `v3`, an episode
   word like `milestone`/`session`, or duplicates an obvious subject already
   in the wiki). Other proposals are accepted by default.
-- **>20 proposals:** Editor-handoff. Tell the user `the plan is at <path>; open
-  in your editor, edit `slug`, `title`, or set `dropped: true`, then say
-  "apply"`. Wait for confirmation.
+- **>20 proposals:** Editor-handoff. Tell the user the plan is at
+  `/tmp/memex-plan-<docid>.json`; ask them to open it in their editor, edit
+  `slug` / `title` / `dropped` fields, then say "apply". Wait for confirmation.
 
-To apply slug or dropped edits, use the **Edit tool** against `$plan_file`
-(diff-only — never re-emit the whole plan). Title edits go through the editor
-handoff regardless of proposal count.
+To apply slug or `dropped` edits, use the **Edit tool** against
+`/tmp/memex-plan-<docid>.json` (diff-only — never re-emit the whole plan).
+Title edits go through the editor handoff regardless of proposal count.
 
-### Step 5: Apply (with bounded re-review loop)
+### Step 4 — Apply, with bounded re-review loop
+
+The agent runs Step 4 in a loop, capped at `MAX_REREVIEWS = 5`. Each iteration
+is one Bash call that runs `memex plan apply` and decides what to do based on
+the exit code.
+
+**One iteration:**
 
 ```bash
-rereview_count=0
-MAX_REREVIEWS=5
-while true; do
-  out=$(mktemp /tmp/memex-apply-XXXXXX.json)
-  memex plan apply < "$plan_file" > "$out"; rc=$?
-  case $rc in
-    0)
-      cat "$out"   # surface "committed N wiki pages" to chat
-      rm -f "$out" "$plan_file"
-      break
-      ;;
-    3)
-      rereview_count=$((rereview_count + 1))
-      if [ "$rereview_count" -gt "$MAX_REREVIEWS" ]; then
-        echo "re-review exhausted after $MAX_REREVIEWS cycles; retry later" >&2
-        rm -f "$out"
-        exit 1
-      fi
-      mv "$out" "$plan_file"   # daemon emitted refreshed plan
-      memex plan show < "$plan_file"
-      # AskUserQuestion: accept new diffs or abort. On abort: exit 1.
-      ;;
-    4)
-      mv "$out" "$plan_file"   # daemon emitted plan with committed/error fields
-      # Read $plan_file via Read tool, count `committed: true` and `error`
-      # entries, surface a partial-commit summary to chat.
-      # AskUserQuestion: retry or abort. On abort: exit 1.
-      ;;
-    *)
-      rm -f "$out"
-      exit 1
-      ;;
-  esac
-done
+memex plan apply < /tmp/memex-plan-<docid>.json > /tmp/memex-apply-<docid>.json
+rc=$?
+echo "RC=$rc"
+case $rc in
+  0)
+    cat /tmp/memex-apply-<docid>.json   # "committed N wiki pages"
+    rm -f /tmp/memex-plan-<docid>.json /tmp/memex-apply-<docid>.json
+    ;;
+  3|4)
+    mv /tmp/memex-apply-<docid>.json /tmp/memex-plan-<docid>.json
+    # Daemon emitted refreshed plan (rc=3) or partial-commit plan (rc=4).
+    # Agent inspects via plan show / Read and decides next step.
+    ;;
+  *)
+    rm -f /tmp/memex-apply-<docid>.json
+    ;;
+esac
+```
+
+**Agent decision per `rc`:**
+
+| `rc` | Meaning | Next action |
+|------|---------|-------------|
+| 0 | Full commit | Stop the loop. Run `memex lint`. |
+| 3 | Plan needs re-review (some target hash mismatched) | Increment `rereview_count`. If > `MAX_REREVIEWS` (5), emit `re-review exhausted after 5 cycles; retry later` to stderr and exit 1. Otherwise: render the refreshed plan with `memex plan show < /tmp/memex-plan-<docid>.json`, surface new diffs, `AskUserQuestion` to accept-and-retry or abort. On abort: `rm -f` and exit 1. |
+| 4 | Partial commit (some proposals failed) | Read `/tmp/memex-plan-<docid>.json` via the **Read** tool. Count proposals with `committed: true` and proposals with `error` populated. Surface a partial-commit summary to chat. `AskUserQuestion` to retry or abort. On retry: re-run apply. On abort: `rm -f` and exit 1. |
+| anything else | Hard error | Paste daemon stderr to chat, `rm -f`, exit 1. |
+
+The agent tracks `rereview_count` itself across iterations (in its own
+reasoning), since shell variables don't persist across Bash calls.
+
+### Step 5 — Lint
+
+After a successful `rc=0` apply, run `memex lint` once to check for dangling
+links and missing cross-references introduced by the new pages.
+
+```bash
 memex lint
 ```
 
@@ -151,9 +182,11 @@ place, or policy. The slug names the *subject*, not an event or date.
 - **Do not** `cat` source content into chat. The bytes go from converter →
   `memex source add` stdin → daemon raw store, and never enter your context.
 - **Do not** parse the plan JSON yourself. Use `memex plan show` for rendering
-  and the **Edit tool** for mutations.
-- **Do not** keep `memex source plan` output in chat as a JSON blob — pipe it
-  to a temp file (`mktemp`) and only paste what `plan show` surfaces.
+  and the **Edit tool** for slug / dropped mutations.
+- **Do not** use `mktemp` for the plan file. Each Bash call is its own
+  subshell, so a `mktemp`-derived path can't be carried across calls without
+  re-deriving it. The deterministic `/tmp/memex-plan-<docid>.json` path is
+  recoverable from the docid, which the agent already has.
 - **Do not** edit the proposal `body` field. Body editing is unsupported (the
   daemon doesn't validate); if you need to change content, edit the wiki page
   directly via `memex write` after the apply lands.
@@ -162,8 +195,8 @@ place, or policy. The slug names the *subject*, not an event or date.
 
 - Source content goes converter → daemon → worker model; never enters chat.
 - Plan rendering is `memex plan show` output (table + diff blocks), not raw JSON.
-- Plan mutations use the **Edit tool** against the temp file (diff-only),
-  not `jq` re-emission of the whole plan.
+- Plan mutations use the **Edit tool** against `/tmp/memex-plan-<docid>.json`
+  (diff-only), not `jq` re-emission of the whole plan.
 
 ## Cross-references
 
