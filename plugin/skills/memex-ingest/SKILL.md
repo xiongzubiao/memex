@@ -94,24 +94,53 @@ Render the plan once for the user:
 memex plan show < /tmp/memex-plan-<docid>.json
 ```
 
-Paste the output to chat, then end your message with this exact
-prompt line:
+Paste the output to chat. Then collect the user's review using
+**one** of the three paths below. Pick by proposal count and your
+agent's available tools.
+
+**Path A — Structured questions (preferred when available, ≤20 proposals):**
+
+If your agent has a chip-style question tool (e.g., Claude Code's
+`AskUserQuestion`), use it:
+
+- **1–5 proposals:** ask per-proposal with options `accept` /
+  `rename slug` / `drop`. When the user picks `rename slug`, the
+  new slug comes back via the `Other` free-text channel.
+- **6–20 proposals:** ask only about proposals you flag as suspect
+  (slug contains a date like `2026-04`, a version qualifier like
+  `v3`, an episode word like `milestone`/`session`, or duplicates
+  an obvious wiki subject). Other proposals auto-accept.
+
+**Path B — Chat directives (fallback for any agent, ≤20 proposals):**
+
+If your agent has no structured question tool, end your chat message
+with this exact prompt line:
 
 > Reply `apply` to commit as-is, or send specific edits like
 > `drop <slug>; rename <slug> to <new-slug>` before approving.
 
-Wait for the user's reply. Parse it as a list of directives separated
-by semicolons:
+Wait for the user's reply. Parse it as `;`-separated directives:
 
-- `apply` (alone) → proceed straight to Step 4 (apply).
-- `cancel` / `abort` (alone) → `rm -f /tmp/memex-plan-<docid>.json` and exit.
-- `drop <slug>` → set `dropped: true` on the proposal whose `slug`
-  matches `<slug>`.
-- `rename <old-slug> to <new-slug>` → set `slug: "<new-slug>"` on the
-  proposal whose current `slug` is `<old-slug>`.
-- Multiple directives separated by `;` apply in order.
+- `apply` → proceed to Step 4
+- `cancel` / `abort` → `rm -f /tmp/memex-plan-<docid>.json` and exit
+- `drop <slug>` → set `dropped: true` on that proposal
+- `rename <old-slug> to <new-slug>` → set `slug: "<new-slug>"`
 
-Apply each directive via your agent's file-edit tool against
+**Path C — Editor handoff (always for >20 proposals, or any title edit):**
+
+For **>20 proposals**: skip both inline paths (the `AskUserQuestion`
+schema caps at 4 questions per call and a directive list of that
+size is unwieldy). Tell the user the plan is at
+`/tmp/memex-plan-<docid>.json`, ask them to open it in their editor,
+edit `slug` / `title` / `dropped` fields, then reply with `apply`.
+
+**Title edits** always go through the editor handoff regardless of
+proposal count — the directive language and `AskUserQuestion`
+options don't cover title edits.
+
+---
+
+Apply each rename/drop via your agent's file-edit tool against
 `/tmp/memex-plan-<docid>.json` — single-field swap on the affected
 proposal, diff-only. Never re-emit the whole plan via `jq` or any
 rewrite path.
@@ -119,17 +148,6 @@ rewrite path.
 After applying edits, re-run `memex plan show < /tmp/memex-plan-<docid>.json`
 and prompt again — the user may want a second pass. Loop until the
 user replies `apply` or `cancel`.
-
-For **>20 proposals**, skip the inline edit prompt and use editor
-handoff: tell the user the plan is at `/tmp/memex-plan-<docid>.json`,
-ask them to open it in their editor, edit `slug` / `title` / `dropped`
-fields, then reply with `apply`. Wait for confirmation.
-
-Title edits go through the editor handoff regardless of proposal count.
-
-This chat-based mechanism is **agent-agnostic** — it doesn't depend on
-Claude-specific tools like `AskUserQuestion`. Any agent that can paste
-text to chat and read the user's reply can run the skill.
 
 ### Step 4 — Apply, with bounded re-review loop
 
@@ -164,7 +182,7 @@ esac
 | `rc` | Meaning | Next action |
 |------|---------|-------------|
 | 0 | Full commit | Stop the loop. Run `memex lint`. |
-| 3 | Plan needs re-review (some target hash mismatched) | Increment `rereview_count`. If > `MAX_REREVIEWS` (5), emit `re-review exhausted after 5 cycles; retry later` to stderr and exit 1. Otherwise: render the refreshed plan with `memex plan show < /tmp/memex-plan-<docid>.json`, surface new diffs, ask the user `apply` / cancel / specific edits via the same chat prompt as Step 3. On cancel: `rm -f` and exit 1. |
+| 3 | Plan needs re-review (some target hash mismatched) | Increment `rereview_count`. If > `MAX_REREVIEWS` (5), emit `re-review exhausted after 5 cycles; retry later` to stderr and exit 1. Otherwise: render the refreshed plan with `memex plan show < /tmp/memex-plan-<docid>.json`, surface new diffs, and re-collect the user's review via the same Path A / B / C choice as Step 3. On cancel: `rm -f` and exit 1. |
 | 4 | Partial commit (some proposals failed) | Read `/tmp/memex-plan-<docid>.json` via the agent's file-read tool. Count proposals with `committed: true` and proposals with `error` populated. Surface a partial-commit summary to chat. Ask the user `retry` or `cancel`. On retry: re-run apply. On cancel: `rm -f` and exit 1. |
 | anything else | Hard error | Paste daemon stderr to chat, `rm -f`, exit 1. |
 
