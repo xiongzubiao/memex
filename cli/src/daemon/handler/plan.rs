@@ -3,6 +3,7 @@
 use crate::daemon::error::DaemonError;
 use crate::daemon::handler::{
     HandlerState, acquire_content_hash_lock, error_events, get_or_open_memex, read_file_capped,
+    run_worker_job,
 };
 use crate::daemon::plan::{Plan, PlanSource, Proposal};
 use crate::daemon::protocol::Event;
@@ -68,31 +69,19 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
         ];
     }
 
-    // For each proposal, check if its slug exists in the wiki. If so,
-    // run MERGE-dry-run; otherwise it's a new page.
+    // Split pages by overlap with existing wiki state. New-page proposals
+    // are added directly; overlap proposals get batched into a single
+    // MERGE-dry-run round-trip (matches `extract_pages_from_content`'s
+    // wiki-merge phase at ingest.rs:707).
     let wiki_dir = memex.wiki_dir();
     let mut proposals: Vec<Proposal> = Vec::new();
+    let mut overlap_inputs: Vec<(usize, crate::daemon::queue::ExtractedPage, String)> = Vec::new();
     for (idx, page) in pages.into_iter().enumerate() {
         let target_path = memex_core::wiki::wiki_path_for_slug(&wiki_dir, &page.slug);
         if !target_path.exists() {
-            proposals.push(Proposal {
-                index: idx,
-                slug: page.slug.clone(),
-                title: page.title,
-                tags: page.tags,
-                body: page.body,
-                merge_target_slug: None,
-                merge_target_hash: None,
-                merge_diff: None,
-                dropped: false,
-                committed: false,
-                original_slug: page.slug,
-                error: None,
-            });
+            proposals.push(Proposal::new_for_page(idx, page));
             continue;
         }
-
-        // Existing wiki page → MERGE-dry-run.
         let existing_full = match tokio::fs::read_to_string(&target_path).await {
             Ok(s) => s,
             Err(e) => {
@@ -106,63 +95,67 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
             Ok((_, body)) => body.to_string(),
             Err(_) => existing_full.clone(),
         };
+        overlap_inputs.push((idx, page, existing_body));
+    }
 
-        let merge_pair = crate::daemon::queue::MergePair {
-            slug: page.slug.clone(),
-            proposed: page.body.clone(),
-            existing: existing_body.clone(),
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let job = crate::daemon::queue::BackendJob::Merge(crate::daemon::queue::MergeJob {
-            pages: vec![merge_pair],
-            reply: tx,
-        });
-        if state.jobs.submit(job).await.is_err() {
-            return error_events(DaemonError::Internal("merge queue closed".into()));
-        }
-        match rx.await {
-            Ok(Ok(reply)) => {
-                if let Some(merged) = reply.merged_pages.into_iter().next() {
-                    let merged_body = merged.body;
-                    let merge_diff = compute_unified_diff(&existing_body, &merged_body);
-                    let target_hash = memex_core::storage::content_hash(existing_body.as_bytes());
-                    proposals.push(Proposal {
-                        index: idx,
-                        slug: page.slug.clone(),
-                        title: merged.title,
-                        tags: merged.tags,
-                        body: merged_body,
-                        merge_target_slug: Some(page.slug.clone()),
-                        merge_target_hash: Some(target_hash),
-                        merge_diff: Some(merge_diff),
-                        dropped: false,
-                        committed: false,
-                        original_slug: page.slug,
-                        error: None,
-                    });
-                } else {
-                    proposals.push(merge_failure_proposal(
-                        idx,
-                        &page,
-                        "merge returned no pages",
-                    ));
+    if !overlap_inputs.is_empty() {
+        let merge_pairs: Vec<crate::daemon::queue::MergePair> = overlap_inputs
+            .iter()
+            .map(|(_, page, existing)| crate::daemon::queue::MergePair {
+                slug: page.slug.clone(),
+                proposed: page.body.clone(),
+                existing: existing.clone(),
+            })
+            .collect();
+        let merge_result = run_worker_job(state, |reply| {
+            crate::daemon::queue::BackendJob::Merge(crate::daemon::queue::MergeJob {
+                pages: merge_pairs,
+                reply,
+            })
+        })
+        .await;
+        match merge_result {
+            Ok(reply) => {
+                let mut merged_by_slug: std::collections::HashMap<
+                    String,
+                    crate::daemon::queue::ExtractedPage,
+                > = reply
+                    .merged_pages
+                    .into_iter()
+                    .map(|p| (p.slug.clone(), p))
+                    .collect();
+                for (idx, page, existing_body) in overlap_inputs {
+                    match merged_by_slug.remove(&page.slug) {
+                        Some(merged) => {
+                            let target_hash =
+                                memex_core::storage::content_hash(existing_body.as_bytes());
+                            let merge_diff = compute_unified_diff(&existing_body, &merged.body);
+                            let mut p = Proposal::new_for_page(idx, page);
+                            p.title = merged.title;
+                            p.tags = merged.tags;
+                            p.body = merged.body;
+                            p.merge_target_slug = Some(p.slug.clone());
+                            p.merge_target_hash = Some(target_hash);
+                            p.merge_diff = Some(merge_diff);
+                            proposals.push(p);
+                        }
+                        None => proposals.push(merge_failure_proposal(
+                            idx,
+                            page,
+                            "merge omitted slug",
+                        )),
+                    }
                 }
             }
-            Ok(Err(e)) => {
-                proposals.push(merge_failure_proposal(
-                    idx,
-                    &page,
-                    &format!("merge worker: {e:?}"),
-                ));
-            }
-            Err(_) => {
-                proposals.push(merge_failure_proposal(
-                    idx,
-                    &page,
-                    "merge worker dropped reply",
-                ));
+            Err(e) => {
+                let reason = e.message();
+                for (idx, page, _) in overlap_inputs {
+                    proposals.push(merge_failure_proposal(idx, page, &reason));
+                }
             }
         }
+        // Overlap proposals were appended out of order — restore by index.
+        proposals.sort_by_key(|p| p.index);
     }
 
     // The lock guarded the LLM phase (EXTRACT + MERGE-dry-run) only;
@@ -189,26 +182,16 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
 
 fn merge_failure_proposal(
     idx: usize,
-    page: &crate::daemon::queue::ExtractedPage,
+    page: crate::daemon::queue::ExtractedPage,
     reason: &str,
 ) -> Proposal {
     // hash/diff nullified so a future apply can't take the matched-hash
     // commit path with un-merged content; slug stays populated as a
     // breadcrumb for the user; body is the un-merged EXTRACT output.
-    Proposal {
-        index: idx,
-        slug: page.slug.clone(),
-        title: page.title.clone(),
-        tags: page.tags.clone(),
-        body: page.body.clone(),
-        merge_target_slug: Some(page.slug.clone()),
-        merge_target_hash: None,
-        merge_diff: None,
-        dropped: false,
-        committed: false,
-        original_slug: page.slug.clone(),
-        error: Some(format!("merge-dry-run failed: {reason}")),
-    }
+    let mut p = Proposal::new_for_page(idx, page);
+    p.merge_target_slug = Some(p.slug.clone());
+    p.error = Some(format!("merge-dry-run failed: {reason}"));
+    p
 }
 
 /// Compute a unified diff between two bodies. Pure local op; no LLM.
@@ -249,56 +232,47 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
     }
 
     let wiki_dir = memex.wiki_dir();
-    // Take ownership of proposals so we can mutate per-proposal state.
     let mut plan = plan;
     let mut committed_slugs: Vec<String> = Vec::new();
     let mut any_failed = false;
     let mut any_rereview = false;
-
+    // Phase 1: under each per-slug lock, decide commit/skip/needs-rereview.
+    // Stale proposals just record the existing body + hash; the actual
+    // re-MERGE batches into one round-trip in phase 2.
+    let mut rereview_inputs: Vec<(usize, String, String)> = Vec::new();
     for i in 0..plan.proposals.len() {
         if plan.proposals[i].dropped || plan.proposals[i].committed {
             continue;
         }
         let target = plan.proposals[i].slug.clone();
-
-        // Acquire per-slug writer lock.
         let _slug_guard =
             crate::daemon::handler::acquire_slug_locks(&state.writer, vec![target.clone()]).await;
 
         let target_path = memex_core::wiki::wiki_path_for_slug(&wiki_dir, &target);
-        let exists = target_path.exists();
-        let saved_hash = plan.proposals[i].merge_target_hash.clone();
-        let saved_target_slug = plan.proposals[i].merge_target_slug.clone();
-
-        if !exists {
-            // New page — clear any stale merge fields.
+        if !target_path.exists() {
             plan.proposals[i].merge_target_slug = None;
             plan.proposals[i].merge_target_hash = None;
             plan.proposals[i].merge_diff = None;
-            // Commit.
             let proposal_clone = plan.proposals[i].clone();
             match apply_proposal_to_wiki(&proposal_clone, &plan.source.id, state).await {
                 Ok(()) => {
                     plan.proposals[i].committed = true;
                     plan.proposals[i].error = None;
-                    committed_slugs.push(target.clone());
+                    committed_slugs.push(target);
                 }
                 Err(e) => {
                     plan.proposals[i].error = Some(e.message());
                     any_failed = true;
                 }
             }
-            drop(_slug_guard);
             continue;
         }
 
-        // Slug exists — staleness check under lock.
         let existing_full = match tokio::fs::read_to_string(&target_path).await {
             Ok(s) => s,
             Err(e) => {
                 plan.proposals[i].error = Some(format!("read existing: {e}"));
                 any_failed = true;
-                drop(_slug_guard);
                 continue;
             }
         };
@@ -308,69 +282,84 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
         };
         let existing_hash = memex_core::storage::content_hash(existing_body.as_bytes());
 
-        let hash_matches = saved_hash.as_deref() == Some(existing_hash.as_str());
-        let slug_matches = saved_target_slug.as_deref() == Some(target.as_str());
+        let hash_matches = plan.proposals[i].merge_target_hash.as_deref()
+            == Some(existing_hash.as_str());
+        let slug_matches = plan.proposals[i].merge_target_slug.as_deref() == Some(target.as_str());
 
         if hash_matches && slug_matches {
-            // Commit the plan body as-is.
             let proposal_clone = plan.proposals[i].clone();
             match apply_proposal_to_wiki(&proposal_clone, &plan.source.id, state).await {
                 Ok(()) => {
                     plan.proposals[i].committed = true;
                     plan.proposals[i].error = None;
-                    committed_slugs.push(target.clone());
+                    committed_slugs.push(target);
                 }
                 Err(e) => {
                     plan.proposals[i].error = Some(e.message());
                     any_failed = true;
                 }
             }
-            drop(_slug_guard);
             continue;
         }
 
-        // Otherwise: stale or new overlap. Drop the slug lock before LLM call.
-        drop(_slug_guard);
+        // Stale: record for the batched re-MERGE in phase 2 (no LLM call
+        // under the slug lock — drop happens at scope end).
+        rereview_inputs.push((i, existing_body, existing_hash));
+    }
 
-        // Re-MERGE.
-        let merge_pair = crate::daemon::queue::MergePair {
-            slug: target.clone(),
-            proposed: plan.proposals[i].body.clone(),
-            existing: existing_body.clone(),
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let job = crate::daemon::queue::BackendJob::Merge(crate::daemon::queue::MergeJob {
-            pages: vec![merge_pair],
-            reply: tx,
-        });
-        if state.jobs.submit(job).await.is_err() {
-            plan.proposals[i].error = Some("merge queue closed".into());
-            any_failed = true;
-            continue;
-        }
-        match rx.await {
-            Ok(Ok(reply)) => {
-                if let Some(merged) = reply.merged_pages.into_iter().next() {
-                    plan.proposals[i].title = merged.title;
-                    plan.proposals[i].tags = merged.tags;
-                    plan.proposals[i].body = merged.body.clone();
-                    plan.proposals[i].merge_diff =
-                        Some(compute_unified_diff(&existing_body, &merged.body));
-                    plan.proposals[i].merge_target_slug = Some(target.clone());
-                    plan.proposals[i].merge_target_hash = Some(existing_hash.clone());
-                    any_rereview = true;
-                } else {
-                    plan.proposals[i].error = Some("merge returned no pages".into());
-                    any_failed = true;
+    // Phase 2: one batched MERGE-dry-run for all stale proposals.
+    if !rereview_inputs.is_empty() {
+        let merge_pairs: Vec<crate::daemon::queue::MergePair> = rereview_inputs
+            .iter()
+            .map(|(i, existing, _)| crate::daemon::queue::MergePair {
+                slug: plan.proposals[*i].slug.clone(),
+                proposed: plan.proposals[*i].body.clone(),
+                existing: existing.clone(),
+            })
+            .collect();
+        let merge_result = run_worker_job(state, |reply| {
+            crate::daemon::queue::BackendJob::Merge(crate::daemon::queue::MergeJob {
+                pages: merge_pairs,
+                reply,
+            })
+        })
+        .await;
+        match merge_result {
+            Ok(reply) => {
+                let mut merged_by_slug: std::collections::HashMap<
+                    String,
+                    crate::daemon::queue::ExtractedPage,
+                > = reply
+                    .merged_pages
+                    .into_iter()
+                    .map(|p| (p.slug.clone(), p))
+                    .collect();
+                for (i, existing_body, existing_hash) in rereview_inputs {
+                    let target = plan.proposals[i].slug.clone();
+                    match merged_by_slug.remove(&target) {
+                        Some(merged) => {
+                            plan.proposals[i].title = merged.title;
+                            plan.proposals[i].tags = merged.tags;
+                            plan.proposals[i].merge_diff =
+                                Some(compute_unified_diff(&existing_body, &merged.body));
+                            plan.proposals[i].body = merged.body;
+                            plan.proposals[i].merge_target_slug = Some(target);
+                            plan.proposals[i].merge_target_hash = Some(existing_hash);
+                            any_rereview = true;
+                        }
+                        None => {
+                            plan.proposals[i].error = Some("merge omitted slug".into());
+                            any_failed = true;
+                        }
+                    }
                 }
             }
-            Ok(Err(e)) => {
-                plan.proposals[i].error = Some(format!("merge worker: {e:?}"));
-                any_failed = true;
-            }
-            Err(_) => {
-                plan.proposals[i].error = Some("merge worker dropped reply".into());
-                any_failed = true;
+            Err(e) => {
+                let reason = e.message();
+                for (i, _, _) in rereview_inputs {
+                    plan.proposals[i].error = Some(reason.clone());
+                    any_failed = true;
+                }
             }
         }
     }

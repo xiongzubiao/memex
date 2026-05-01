@@ -23,13 +23,16 @@ pub fn format_plan(plan: &Plan) -> String {
     out.push_str("# | slug | title | tags | status\n");
     out.push_str("--+------+-------+------+-------\n");
     for p in &plan.proposals {
-        let status = match (&p.merge_target_slug, &p.error, p.dropped, p.committed) {
+        let mut status = match (&p.merge_target_slug, &p.error, p.dropped, p.committed) {
             (_, _, true, _) => "DROPPED".to_string(),
             (_, _, _, true) => "COMMITTED".to_string(),
             (_, Some(e), _, _) => format!("[ERROR] {e}"),
             (Some(t), None, _, _) => format!("merge → {t}"),
             (None, None, _, _) => "new".to_string(),
         };
+        if p.slug != p.original_slug {
+            status.push_str(&format!(" (edited from {})", p.original_slug));
+        }
         let tags = if p.tags.is_empty() {
             String::new()
         } else {
@@ -136,5 +139,17 @@ mod tests {
         let s = format_plan(&p);
         assert!(s.contains("DROPPED"));
         assert!(s.contains("COMMITTED"));
+    }
+
+    #[test]
+    fn format_plan_marks_user_edited_slug() {
+        let mut p = sample_plan();
+        p.proposals[1].slug = "gpu-checkpoint-renamed".into();
+        // original_slug stays "gpu-checkpoint" → status gets the edited tag.
+        let s = format_plan(&p);
+        assert!(
+            s.contains("(edited from gpu-checkpoint)"),
+            "expected edited indicator, got: {s}"
+        );
     }
 }

@@ -40,6 +40,28 @@ pub struct Proposal {
     pub error: Option<String>,
 }
 
+impl Proposal {
+    /// Construct a "new page" proposal from a freshly-extracted page.
+    /// Merge cases (success or failure) layer field overrides on top.
+    pub fn new_for_page(index: usize, page: crate::daemon::queue::ExtractedPage) -> Self {
+        let slug = page.slug;
+        Self {
+            index,
+            slug: slug.clone(),
+            title: page.title,
+            tags: page.tags,
+            body: page.body,
+            merge_target_slug: None,
+            merge_target_hash: None,
+            merge_diff: None,
+            dropped: false,
+            committed: false,
+            original_slug: slug,
+            error: None,
+        }
+    }
+}
+
 impl Plan {
     /// Structural validation. Catches user-tampered plans without trying
     /// to detect every form of tampering — apply enforces the shape that
