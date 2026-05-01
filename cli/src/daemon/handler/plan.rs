@@ -33,10 +33,46 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
     // Acquire the per-content-hash lock for the EXTRACT/MERGE phase.
     let _hash_guard = acquire_content_hash_lock(&state.writer, &content_hash).await;
 
-    // (Tasks 7-8: EXTRACT + MERGE-dry-run)
-    let _ = (memex, source_doc, content_hash);
+    // Read source content from raw store and strip frontmatter.
+    let raw_path = memex.root().join(&source_doc.path);
+    let raw_body = match std::fs::read_to_string(&raw_path) {
+        Ok(b) => b,
+        Err(e) => {
+            return error_events(DaemonError::Internal(format!("read source: {e}")));
+        }
+    };
+    let (fm, body) = match memex_core::raw::parse_raw_frontmatter(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            return error_events(DaemonError::Internal(format!("raw frontmatter: {e}")));
+        }
+    };
+    let source_path = fm.source.clone().unwrap_or_default();
+
+    let pages = match crate::daemon::handler::ingest::extract_pages_from_content(
+        body,
+        &source_path,
+        state,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => return error_events(e),
+    };
+
+    if pages.is_empty() {
+        return vec![
+            Event::EmptyExtract {
+                reason: "no extractable subjects".into(),
+            },
+            Event::Done { status: 0 },
+        ];
+    }
+
+    // (Task 8: MERGE-dry-run for wiki overlaps + emit PlanContent)
+    let _ = (pages, source_path, content_hash);
     error_events(DaemonError::Internal(
-        "source_plan: EXTRACT/MERGE not yet implemented".into(),
+        "source_plan: MERGE-dry-run not yet implemented".into(),
     ))
 }
 
