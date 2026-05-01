@@ -85,11 +85,13 @@ pub(super) async fn handle_write(
     }
 
     // Strip any incoming frontmatter; synthesize fresh frontmatter.
+    // Use split_frontmatter (delimiter-only) instead of parse_frontmatter
+    // (which strict-deserializes PageFrontmatter and fails on missing
+    // created_at/updated_at, causing the leading --- block to leak through).
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let body = match memex_core::validate::parse_frontmatter(&content) {
-        Ok((_, b)) => b.to_string(),
-        Err(_) => content.clone(),
-    };
+    let body = memex_core::storage::split_frontmatter(&content)
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_else(|| content.clone());
 
     // Auto cross-link forward: scan body for mentions of existing
     // titles; replace first un-linked occurrence with `[[stem]]`.
