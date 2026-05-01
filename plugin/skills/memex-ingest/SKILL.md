@@ -198,8 +198,6 @@ place, or policy. The slug names the *subject*, not an event or date.
 - Plan mutations use the **Edit tool** against `/tmp/memex-plan-<docid>.json`
   (diff-only), not `jq` re-emission of the whole plan.
 
-## Cross-references
+## Related
 
-- Spec: `docs/specs/2026-04-30-memex-ingest-skill-redesign.md`
-- Implementation plan: `docs/superpowers/plans/2026-04-30-memex-ingest-skill-redesign.md`
-- Related skill: `memex-query` (for retrieval after ingestion)
+- `memex-query` — for retrieval after ingestion.
