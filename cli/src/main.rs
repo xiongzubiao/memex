@@ -196,6 +196,11 @@ enum SourceAction {
         #[arg(long)]
         force: bool,
     },
+    /// Run EXTRACT + MERGE-dry-run for a stored source. Streams plan JSON.
+    Plan {
+        /// docid prefix (from `memex source list`)
+        docid: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -584,6 +589,44 @@ fn run_source_add(
     }
     println!("{docid}");
     Ok(())
+}
+
+fn run_source_plan(docid: &str) -> anyhow::Result<()> {
+    let root = memex_cli::memex_root();
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
+        let stream = memex_cli::daemon::client::connect_or_spawn(
+            &paths.socket,
+            &paths.lock,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await?;
+        let events = memex_cli::daemon::client::request(
+            stream,
+            &memex_cli::daemon::protocol::Request::SourcePlan {
+                source_id: docid.to_string(),
+            },
+        )
+        .await?;
+        for ev in &events {
+            match ev {
+                memex_cli::daemon::protocol::Event::PlanContent { json } => {
+                    println!("{json}");
+                    return Ok::<(), anyhow::Error>(());
+                }
+                memex_cli::daemon::protocol::Event::EmptyExtract { .. } => {
+                    // Per spec §1.1: empty stdout, exit 0.
+                    return Ok(());
+                }
+                memex_cli::daemon::protocol::Event::Error { message, .. } => {
+                    anyhow::bail!("{message}");
+                }
+                _ => {}
+            }
+        }
+        anyhow::bail!("daemon did not return PlanContent or EmptyExtract")
+    })
 }
 
 fn run_plan_show(json_only: bool) -> anyhow::Result<()> {
@@ -1349,6 +1392,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             SourceAction::List { collections, json } => run_source_list(&collections, json),
             SourceAction::Show { reference } => run_source_show(&reference),
             SourceAction::Delete { reference, force } => run_source_delete(&reference, force),
+            SourceAction::Plan { docid } => run_source_plan(&docid),
         },
         Commands::Plan { action } => match action {
             PlanAction::Show { json } => run_plan_show(json),
