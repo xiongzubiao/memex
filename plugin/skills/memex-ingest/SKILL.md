@@ -94,14 +94,22 @@ Render the plan once for the user:
 memex plan show < /tmp/memex-plan-<docid>.json
 ```
 
-Paste the output to chat. Then collect the user's review using
-**one** of the three paths below. Pick by proposal count and your
-agent's available tools.
+Paste the output to chat. Then collect the user's review.
 
-**Path A — Structured questions (preferred when available, ≤20 proposals):**
+**Decision rule (no judgment, no reframing):**
 
-If your agent has a chip-style question tool (e.g., Claude Code's
-`AskUserQuestion`), use it:
+1. If proposal count > 20 OR any title needs editing → **Path C** (editor handoff).
+2. Else if your agent has a structured question tool (e.g., Claude
+   Code's `AskUserQuestion`) → **Path A**. Use it even if the slugs
+   look clean. Don't downgrade to chat just because the plan looks
+   easy — the user still gets to confirm per-proposal.
+3. Else → **Path B** (chat directives).
+
+You may not pick Path B when AskUserQuestion is available. The chat
+fallback exists for agents like Codex / Gemini-CLI that don't have
+chip-style tools, not as a shortcut for "this looks simple."
+
+**Path A — Structured questions (≤20 proposals, AskUserQuestion available):**
 
 - **1–5 proposals:** ask per-proposal with options `accept` /
   `rename slug` / `drop`. When the user picks `rename slug`, the
@@ -111,10 +119,9 @@ If your agent has a chip-style question tool (e.g., Claude Code's
   `v3`, an episode word like `milestone`/`session`, or duplicates
   an obvious wiki subject). Other proposals auto-accept.
 
-**Path B — Chat directives (fallback for any agent, ≤20 proposals):**
+**Path B — Chat directives (only when AskUserQuestion is unavailable, ≤20 proposals):**
 
-If your agent has no structured question tool, end your chat message
-with this exact prompt line:
+End your chat message with this exact prompt line:
 
 > Reply `apply` to commit as-is, or send specific edits like
 > `drop <slug>; rename <slug> to <new-slug>` before approving.
