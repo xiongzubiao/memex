@@ -168,8 +168,8 @@ place, or policy. The slug names the *subject*, not an event or date.
 - Prefer fewer, larger pages. New details land as H2 sections on the subject's
   existing page. Split only when a sub-topic is substantial and self-contained
   enough to stand on its own across future sessions.
-- Subject slugs, not episode slugs: `caroline` not `caroline-2026-04-meeting`,
-  `mmai` not `mmai-design-milestone-3`.
+- Subject slugs, not episode slugs: `kubernetes` not `kubernetes-2026-04-meeting`,
+  `auth-tokens` not `auth-tokens-redesign-v3`.
 - The daemon's EXTRACT prompt enforces these rules; the skill does not need to
   reimplement them.
 
