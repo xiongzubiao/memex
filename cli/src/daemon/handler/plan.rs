@@ -16,19 +16,16 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
         Err(e) => return error_events(e),
     };
 
-    // Resolve docid prefix to a raw source row.
-    let docs = match memex.search().resolve_ref_documents(&source_id) {
-        Ok(d) => d,
-        Err(e) => return error_events(DaemonError::Storage(e.to_string())),
-    };
-    let source_doc = match docs.into_iter().find(|d| d.doc_type == "raw") {
-        Some(d) => d,
-        None => {
-            return error_events(DaemonError::BadRequest(format!(
-                "source not found: '{source_id}'. Run `memex source list` to find docids."
-            )));
-        }
-    };
+    let source_doc =
+        match crate::daemon::handler::source::resolve_source_ref(memex.search(), &source_id) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return error_events(DaemonError::BadRequest(format!(
+                    "source not found: '{source_id}'. Run `memex source list` to find docids."
+                )));
+            }
+            Err(e) => return error_events(DaemonError::Storage(e.to_string())),
+        };
 
     let content_hash = source_doc.hash.clone();
 
@@ -220,15 +217,15 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
         Ok(m) => m,
         Err(e) => return error_events(e),
     };
-    let docs = match memex.search().resolve_ref_documents(&plan.source.id) {
-        Ok(d) => d,
+    match crate::daemon::handler::source::resolve_source_ref(memex.search(), &plan.source.id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_events(DaemonError::BadRequest(format!(
+                "source missing: '{}'",
+                plan.source.id
+            )));
+        }
         Err(e) => return error_events(DaemonError::Storage(e.to_string())),
-    };
-    if !docs.iter().any(|d| d.doc_type == "raw") {
-        return error_events(DaemonError::BadRequest(format!(
-            "source missing: '{}'",
-            plan.source.id
-        )));
     }
 
     let wiki_dir = memex.wiki_dir();
@@ -236,9 +233,8 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
     let mut committed_slugs: Vec<String> = Vec::new();
     let mut any_failed = false;
     let mut any_rereview = false;
-    // Phase 1: under each per-slug lock, decide commit/skip/needs-rereview.
-    // Stale proposals just record the existing body + hash; the actual
-    // re-MERGE batches into one round-trip in phase 2.
+    // Phase 1: under each per-slug lock, decide commit / skip / needs-rereview.
+    // Stale ones go to phase 2 for one batched re-MERGE.
     let mut rereview_inputs: Vec<(usize, String, String)> = Vec::new();
     for i in 0..plan.proposals.len() {
         if plan.proposals[i].dropped || plan.proposals[i].committed {
@@ -254,7 +250,9 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
             plan.proposals[i].merge_target_hash = None;
             plan.proposals[i].merge_diff = None;
             let proposal_clone = plan.proposals[i].clone();
-            match apply_proposal_to_wiki(&proposal_clone, &plan.source.id, state).await {
+            match apply_proposal_to_wiki(&proposal_clone, &plan.source.id, PriorPage::New, state)
+                .await
+            {
                 Ok(()) => {
                     plan.proposals[i].committed = true;
                     plan.proposals[i].error = None;
@@ -276,10 +274,15 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
                 continue;
             }
         };
-        let existing_body = match memex_core::validate::parse_frontmatter(&existing_full) {
-            Ok((_, body)) => body.to_string(),
-            Err(_) => existing_full.clone(),
-        };
+        // Parse once; reuse for hash compare AND (on match) for the
+        // commit's prior values. Err-fallback uses full content as body
+        // and now()/[] for prior — same shape as `source plan` so hashes
+        // align in the malformed-frontmatter corner case.
+        let (parsed_fm, existing_body) =
+            match memex_core::validate::parse_frontmatter(&existing_full) {
+                Ok((fm, body)) => (Some(fm), body),
+                Err(_) => (None, existing_full.clone()),
+            };
         let existing_hash = memex_core::storage::content_hash(existing_body.as_bytes());
 
         let hash_matches = plan.proposals[i].merge_target_hash.as_deref()
@@ -288,7 +291,14 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
 
         if hash_matches && slug_matches {
             let proposal_clone = plan.proposals[i].clone();
-            match apply_proposal_to_wiki(&proposal_clone, &plan.source.id, state).await {
+            let prior = match parsed_fm {
+                Some(fm) => PriorPage::Existing {
+                    created_at: fm.created_at,
+                    sources: fm.sources,
+                },
+                None => PriorPage::New,
+            };
+            match apply_proposal_to_wiki(&proposal_clone, &plan.source.id, prior, state).await {
                 Ok(()) => {
                     plan.proposals[i].committed = true;
                     plan.proposals[i].error = None;
@@ -302,8 +312,7 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
             continue;
         }
 
-        // Stale: record for the batched re-MERGE in phase 2 (no LLM call
-        // under the slug lock — drop happens at scope end).
+        // Stale → batched re-MERGE in phase 2 (after the slug lock drops).
         rereview_inputs.push((i, existing_body, existing_hash));
     }
 
@@ -370,29 +379,40 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
             Ok(s) => s,
             Err(e) => return error_events(DaemonError::Internal(format!("serialize: {e}"))),
         };
-        return vec![Event::PlanContent { json }, Event::Done { status: 3 }];
+        return vec![Event::PlanContent { json }, Event::Done { status: crate::daemon::plan::APPLY_NEEDS_REREVIEW }];
     }
     if any_failed {
         let json = match serde_json::to_string(&plan) {
             Ok(s) => s,
             Err(e) => return error_events(DaemonError::Internal(format!("serialize: {e}"))),
         };
-        return vec![Event::PlanContent { json }, Event::Done { status: 4 }];
+        return vec![Event::PlanContent { json }, Event::Done { status: crate::daemon::plan::APPLY_PARTIAL_FAILURE }];
     }
     vec![
         Event::PlanApplied {
             committed: committed_slugs,
         },
-        Event::Done { status: 0 },
+        Event::Done { status: crate::daemon::plan::APPLY_OK },
     ]
 }
 
-/// Write a proposal to the wiki using the merge-aware path. New pages
-/// get fresh frontmatter; merges preserve `created_at` and accumulate
-/// `sources:`. Caller holds the per-slug write lock around this call.
+/// Caller's pre-loaded knowledge about the wiki page that's about to be
+/// written. `New` triggers parent-dir creation and a fresh
+/// `created_at`/`sources` list; `Existing` reuses the caller's already-parsed
+/// values to avoid a second read+parse.
+pub(super) enum PriorPage {
+    New,
+    Existing {
+        created_at: chrono::DateTime<chrono::Utc>,
+        sources: Vec<String>,
+    },
+}
+
+/// Write a proposal to the wiki. Caller holds the per-slug write lock.
 pub(super) async fn apply_proposal_to_wiki(
     proposal: &Proposal,
     source_docid: &str,
+    prior: PriorPage,
     state: &HandlerState,
 ) -> Result<(), DaemonError> {
     let memex = get_or_open_memex(state.writer.memex_handle(), state.writer.bound_root())?;
@@ -401,36 +421,28 @@ pub(super) async fn apply_proposal_to_wiki(
     let now_dt = chrono::Utc::now();
     let new_ref = format!("#{source_docid}");
 
-    let (created_at, sources) = if wiki_path.exists() {
-        // Reuse the canonical parser. If parsing fails (malformed page
-        // on disk), fall back to fresh values rather than aborting.
-        let existing = tokio::fs::read_to_string(&wiki_path)
-            .await
-            .map_err(|e| DaemonError::Internal(format!("read existing wiki: {e}")))?;
-        match memex_core::validate::parse_frontmatter(&existing) {
-            Ok((fm, _)) => {
-                let mut sources = fm.sources;
-                if !sources.contains(&new_ref) {
-                    sources.push(new_ref);
-                }
-                (fm.created_at, sources)
+    let (created_at, sources) = match prior {
+        PriorPage::New => {
+            if let Some(parent) = wiki_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| DaemonError::Internal(format!("create wiki dir: {e}")))?;
             }
-            Err(_) => (now_dt, vec![new_ref]),
+            (now_dt, vec![new_ref])
         }
-    } else {
-        if let Some(parent) = wiki_path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| DaemonError::Internal(format!("create wiki dir: {e}")))?;
+        PriorPage::Existing {
+            created_at,
+            mut sources,
+        } => {
+            if !sources.contains(&new_ref) {
+                sources.push(new_ref);
+            }
+            (created_at, sources)
         }
-        (now_dt, vec![new_ref])
     };
 
-    // Title comes from the LLM (or a user-edited plan); collapse newlines
-    // to spaces so the YAML stays a single-line scalar — matches the
-    // sanitization in `build_wiki_records`. serde_yaml escapes any
-    // remaining special chars, so YAML injection via title/tags isn't
-    // possible regardless of source content.
+    // Collapse newlines so YAML stays a single-line scalar; serde_yaml
+    // escapes the rest.
     let safe_title = proposal.title.replace(['\n', '\r'], " ");
     let yaml = serde_yaml::to_string(&memex_core::types::PageFrontmatterRef {
         title: &safe_title,
@@ -548,7 +560,7 @@ mod tests {
             original_slug: "new-page".into(),
             error: None,
         };
-        super::apply_proposal_to_wiki(&proposal, "src-test", &state)
+        super::apply_proposal_to_wiki(&proposal, "src-test", super::PriorPage::New, &state)
             .await
             .unwrap();
         let body = std::fs::read_to_string(root.join("wiki/new-page.md")).unwrap();
@@ -580,7 +592,11 @@ mod tests {
             original_slug: "mmai".into(),
             error: None,
         };
-        super::apply_proposal_to_wiki(&proposal, "src-new", &state)
+        let prior = super::PriorPage::Existing {
+            created_at: "2024-01-01T00:00:00Z".parse().unwrap(),
+            sources: vec!["#src-old".into()],
+        };
+        super::apply_proposal_to_wiki(&proposal, "src-new", prior, &state)
             .await
             .unwrap();
         let body = std::fs::read_to_string(root.join("wiki/mmai.md")).unwrap();
@@ -620,7 +636,7 @@ mod tests {
             original_slug: "no-injection".into(),
             error: None,
         };
-        super::apply_proposal_to_wiki(&proposal, "src-x", &state)
+        super::apply_proposal_to_wiki(&proposal, "src-x", super::PriorPage::New, &state)
             .await
             .unwrap();
         let body = std::fs::read_to_string(root.join("wiki/no-injection.md")).unwrap();
@@ -665,7 +681,7 @@ mod tests {
             original_slug: "tag-test".into(),
             error: None,
         };
-        super::apply_proposal_to_wiki(&proposal, "src-x", &state)
+        super::apply_proposal_to_wiki(&proposal, "src-x", super::PriorPage::New, &state)
             .await
             .unwrap();
         let body = std::fs::read_to_string(root.join("wiki/tag-test.md")).unwrap();

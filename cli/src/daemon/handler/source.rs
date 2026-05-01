@@ -168,7 +168,7 @@ pub(super) async fn handle_source_delete(
 /// Resolve a source ref (docid prefix) to a source document row.
 /// Returns Ok(None) if not found, Err on lookup error.
 /// Note: "path:<src>" syntax is no longer supported (removed in foundation rewrite).
-fn resolve_source_ref(
+pub(in crate::daemon::handler) fn resolve_source_ref(
     search: &memex_core::search::Bm25Search,
     ref_: &str,
 ) -> Result<Option<memex_core::types::Document>, memex_core::error::MemexError> {

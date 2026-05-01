@@ -644,13 +644,14 @@ fn run_plan_apply() -> anyhow::Result<()> {
             _ => {}
         }
     }
+    use memex_cli::daemon::plan::{APPLY_NEEDS_REREVIEW, APPLY_OK, APPLY_PARTIAL_FAILURE};
     match status {
-        0 => {
+        APPLY_OK => {
             let n = applied.map(|v| v.len()).unwrap_or(0);
             println!("committed {n} wiki pages");
             Ok(())
         }
-        3 | 4 => {
+        APPLY_NEEDS_REREVIEW | APPLY_PARTIAL_FAILURE => {
             if let Some(json) = content {
                 println!("{json}");
             }

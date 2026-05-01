@@ -4,6 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// `plan apply` exit codes. Wire contract with the SKILL.md Step 4 table.
+pub const APPLY_OK: i32 = 0;
+pub const APPLY_NEEDS_REREVIEW: i32 = 3;
+pub const APPLY_PARTIAL_FAILURE: i32 = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Plan {
     pub version: u32,
