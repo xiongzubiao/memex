@@ -82,9 +82,6 @@ Substitute `<docid>` with the literal value from Step 1.
 
 - **Empty file (size = 0) and rc=0**: EXTRACT yielded no extractable subjects.
   Tell the user, `rm -f /tmp/memex-plan-<docid>.json`, and stop.
-- **Invalid JSON** (run `jq -e . /tmp/memex-plan-<docid>.json`): the daemon
-  connection dropped mid-stream. Abort with the message that the user should
-  retry. Then `rm -f /tmp/memex-plan-<docid>.json`.
 - **Non-zero rc**: paste daemon stderr to chat and abort.
 
 ### Step 3 — Render and review
