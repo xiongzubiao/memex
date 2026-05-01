@@ -399,11 +399,33 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
 /// get fresh frontmatter; merges preserve `created_at` and accumulate
 /// `sources:`. Caller holds the per-slug write lock around this call
 /// (see spec §1.3 step 4).
+///
+/// Title and tags are LLM-controlled (MERGE output) or user-controlled
+/// (plan JSON edits), so each is checked for control characters before
+/// interpolation into YAML — same guard `handle_write` applies for the
+/// direct-write path. Without it, an embedded newline lets the proposal
+/// inject arbitrary YAML keys into the frontmatter; the resulting wiki
+/// page is unparseable on reconcile and silently disappears from search.
 pub(super) async fn apply_proposal_to_wiki(
     proposal: &Proposal,
     source_docid: &str,
     state: &HandlerState,
 ) -> Result<(), DaemonError> {
+    if proposal.title.chars().any(|c| c.is_control()) {
+        return Err(DaemonError::BadRequest(format!(
+            "proposal {}: title contains control characters",
+            proposal.index
+        )));
+    }
+    for (tidx, tag) in proposal.tags.iter().enumerate() {
+        if tag.chars().any(|c| c.is_control()) {
+            return Err(DaemonError::BadRequest(format!(
+                "proposal {}: tag[{}] contains control characters",
+                proposal.index, tidx
+            )));
+        }
+    }
+
     let memex = get_or_open_memex(state.writer.memex_handle(), state.writer.bound_root())?;
     let wiki_path = memex_core::wiki::wiki_path_for_slug(&memex.wiki_dir(), &proposal.slug);
 
@@ -416,22 +438,27 @@ pub(super) async fn apply_proposal_to_wiki(
     };
 
     let (created_at, sources) = if wiki_path.exists() {
-        // Merge case: parse existing frontmatter for created_at +
-        // sources accumulation.
+        // Merge case: reuse the canonical frontmatter parser instead of
+        // hand-rolling YAML — `validate::parse_frontmatter` returns a
+        // structured `PageFrontmatter` with typed `created_at` and
+        // `sources` fields. If parsing fails (malformed page on disk),
+        // fall back to fresh values rather than aborting the write.
         let existing = std::fs::read_to_string(&wiki_path)
             .map_err(|e| DaemonError::Internal(format!("read existing wiki: {e}")))?;
-        let fm_str = existing
-            .strip_prefix("---\n")
-            .and_then(|s| s.split_once("\n---\n"))
-            .map(|(fm, _)| fm)
-            .unwrap_or("");
-        let created_at = parse_created_at(fm_str).unwrap_or_else(|| now.clone());
-        let mut sources = parse_sources_array(fm_str);
-        let new_ref = format!("#{source_docid}");
-        if !sources.contains(&new_ref) {
-            sources.push(new_ref);
+        match memex_core::validate::parse_frontmatter(&existing) {
+            Ok((fm, _)) => {
+                let created_at = fm
+                    .created_at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let mut sources = fm.sources;
+                let new_ref = format!("#{source_docid}");
+                if !sources.contains(&new_ref) {
+                    sources.push(new_ref);
+                }
+                (created_at, sources)
+            }
+            Err(_) => (now.clone(), vec![format!("#{source_docid}")]),
         }
-        (created_at, sources)
     } else {
         if let Some(parent) = wiki_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -467,55 +494,6 @@ pub(super) async fn apply_proposal_to_wiki(
             .map_err(|e| DaemonError::Internal(format!("index_wiki_file: {e}")))?;
     }
     Ok(())
-}
-
-/// Extract `created_at: <RFC3339>` from a YAML frontmatter slice.
-/// Lenient — returns None if missing/malformed.
-fn parse_created_at(fm: &str) -> Option<String> {
-    for line in fm.lines() {
-        let line = line.trim_start();
-        if let Some(rest) = line.strip_prefix("created_at:") {
-            return Some(rest.trim().trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
-/// Extract the `sources:` YAML array as a Vec<String>. Tolerant of
-/// inline ([]) and block (\n  - "x") forms.
-fn parse_sources_array(fm: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut in_sources = false;
-    for line in fm.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("sources:") {
-            let rest = rest.trim();
-            if rest == "[]" {
-                return Vec::new();
-            }
-            if rest.starts_with('[') && rest.ends_with(']') {
-                let inner = &rest[1..rest.len() - 1];
-                for token in inner.split(',') {
-                    let s = token.trim().trim_matches('"');
-                    if !s.is_empty() {
-                        out.push(s.to_string());
-                    }
-                }
-                return out;
-            }
-            in_sources = true;
-            continue;
-        }
-        if in_sources {
-            if let Some(rest) = trimmed.strip_prefix("- ") {
-                let s = rest.trim().trim_matches('"');
-                out.push(s.to_string());
-            } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                break;
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -650,6 +628,72 @@ mod tests {
         assert!(body.contains("\"#src-old\""), "old source dropped: {body}");
         assert!(body.contains("\"#src-new\""), "new source missing: {body}");
         assert!(body.contains("merged body"));
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_rejects_title_with_control_chars() {
+        // LLM Output Trust Boundary: a newline in the title would inject
+        // YAML keys into the frontmatter. Reject before writing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let _ = memex_core::Memex::open(root.clone()).unwrap();
+        let state = test_state(root.clone());
+        let proposal = Proposal {
+            index: 0,
+            slug: "evil".into(),
+            title: "Hello\nsources:\n  - \"#fake\"\nbogus: ".into(),
+            tags: vec![],
+            body: "body".into(),
+            merge_target_slug: None,
+            merge_target_hash: None,
+            merge_diff: None,
+            dropped: false,
+            committed: false,
+            original_slug: "evil".into(),
+            error: None,
+        };
+        let err = super::apply_proposal_to_wiki(&proposal, "src-x", &state)
+            .await
+            .unwrap_err();
+        let msg = err.message();
+        assert!(msg.contains("title"), "got: {msg}");
+        assert!(msg.contains("control"), "got: {msg}");
+        // No file should have been written.
+        assert!(
+            !root.join("wiki/evil.md").exists(),
+            "wiki page must not be written when title is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_proposal_rejects_tag_with_control_chars() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let _ = memex_core::Memex::open(root.clone()).unwrap();
+        let state = test_state(root.clone());
+        let proposal = Proposal {
+            index: 0,
+            slug: "evil-tag".into(),
+            title: "OK".into(),
+            tags: vec!["clean".into(), "evil\nbogus: x".into()],
+            body: "body".into(),
+            merge_target_slug: None,
+            merge_target_hash: None,
+            merge_diff: None,
+            dropped: false,
+            committed: false,
+            original_slug: "evil-tag".into(),
+            error: None,
+        };
+        let err = super::apply_proposal_to_wiki(&proposal, "src-x", &state)
+            .await
+            .unwrap_err();
+        let msg = err.message();
+        assert!(msg.contains("tag[1]"), "got: {msg}");
+        assert!(
+            !root.join("wiki/evil-tag.md").exists(),
+            "wiki page must not be written when tag is rejected"
+        );
     }
 
     #[tokio::test]
