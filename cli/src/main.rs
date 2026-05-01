@@ -648,7 +648,69 @@ fn run_plan_show(json_only: bool) -> anyhow::Result<()> {
 }
 
 fn run_plan_apply() -> anyhow::Result<()> {
-    anyhow::bail!("plan apply: not yet implemented (Task 15)");
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    if buf.trim().is_empty() {
+        anyhow::bail!("empty stdin: pipe a plan JSON");
+    }
+    let root = memex_cli::memex_root();
+    let rt = tokio::runtime::Runtime::new()?;
+    let exit_code: i32 = rt.block_on(async move {
+        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
+        let stream = memex_cli::daemon::client::connect_or_spawn(
+            &paths.socket,
+            &paths.lock,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await?;
+        let events = memex_cli::daemon::client::request(
+            stream,
+            &memex_cli::daemon::protocol::Request::PlanApply { plan_json: buf },
+        )
+        .await?;
+        // Find the terminal event and the Done status.
+        let mut content: Option<String> = None;
+        let mut applied: Option<Vec<String>> = None;
+        let mut error: Option<String> = None;
+        let mut status: i32 = 1;
+        for ev in events {
+            match ev {
+                memex_cli::daemon::protocol::Event::PlanContent { json } => content = Some(json),
+                memex_cli::daemon::protocol::Event::PlanApplied { committed } => {
+                    applied = Some(committed)
+                }
+                memex_cli::daemon::protocol::Event::Error { message, .. } => {
+                    error = Some(message)
+                }
+                memex_cli::daemon::protocol::Event::Done { status: s } => status = s,
+                _ => {}
+            }
+        }
+        match status {
+            0 => {
+                let n = applied.map(|v| v.len()).unwrap_or(0);
+                println!("committed {n} wiki pages");
+                Ok::<i32, anyhow::Error>(0)
+            }
+            3 | 4 => {
+                if let Some(json) = content {
+                    println!("{json}");
+                }
+                Ok(status)
+            }
+            _ => {
+                if let Some(msg) = error {
+                    anyhow::bail!("{msg}");
+                }
+                anyhow::bail!("plan apply failed with status {status}");
+            }
+        }
+    })?;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
 }
 
 /// Write a wiki page via the daemon. Sends Request::Write.
