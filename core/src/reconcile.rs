@@ -179,7 +179,7 @@ fn walk_dir(
         if doc_type == "wiki" && path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let rel = memex.relativize(path).to_path_buf();
+        let rel = path.strip_prefix(memex.root()).unwrap_or(path).to_path_buf();
         if rel
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -416,7 +416,7 @@ mod tests {
         };
         std::fs::write(&raw_path, assemble_raw_file(&original_fm, body)).unwrap();
         crate::index_raw::index_raw_file(&memex, &raw_path, None).unwrap();
-        let raw_rel = memex.relativize(&raw_path)
+        let raw_rel = raw_path.strip_prefix(memex.root()).unwrap_or(&raw_path)
             .to_string_lossy()
             .to_string();
         let pre_hash = memex

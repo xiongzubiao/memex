@@ -1207,7 +1207,7 @@ mod tests {
         };
         std::fs::write(&raw_path, assemble_raw_file(&fm, body)).unwrap();
         crate::index_raw::index_raw_file(&memex, &raw_path, None).unwrap();
-        let rel = memex.relativize(&raw_path)
+        let rel = raw_path.strip_prefix(memex.root()).unwrap_or(&raw_path)
             .to_string_lossy()
             .to_string();
 
@@ -1302,7 +1302,7 @@ mod tests {
         )
         .unwrap();
         crate::index_raw::index_raw_file(&memex, &canonical_path, None).unwrap();
-        let canonical_rel = memex.relativize(&canonical_path)
+        let canonical_rel = canonical_path.strip_prefix(memex.root()).unwrap_or(&canonical_path)
             .to_string_lossy()
             .to_string();
 
@@ -1327,7 +1327,7 @@ mod tests {
         // hash (the hash before the manual edit). commit_doc recomputes
         // hash from body, so use raw SQL to capture the production state
         // where the row's hash column is stale relative to disk content.
-        let stale_rel_for_insert = memex.relativize(&stale_path)
+        let stale_rel_for_insert = stale_path.strip_prefix(memex.root()).unwrap_or(&stale_path)
             .to_string_lossy()
             .to_string();
         let old_body_hash = "feedface".to_string() + &"de".repeat(28);
@@ -1347,7 +1347,7 @@ mod tests {
             })
             .unwrap();
 
-        let stale_rel = memex.relativize(&stale_path)
+        let stale_rel = stale_path.strip_prefix(memex.root()).unwrap_or(&stale_path)
             .to_string_lossy()
             .to_string();
         let issue = LintIssue {

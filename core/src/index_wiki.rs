@@ -39,7 +39,7 @@ pub fn index_wiki_file(
     path: &Path,
     model: Option<&mut dyn Embedder>,
 ) -> Result<IndexOutcome> {
-    let rel = memex.relativize(path);
+    let rel = path.strip_prefix(memex.root()).unwrap_or(path);
     let rel_str = crate::storage::rel_path_string(rel);
 
     // Stat first so reconcile can skip unchanged files without reading them.
