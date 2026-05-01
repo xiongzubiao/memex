@@ -96,6 +96,16 @@ pub enum Request {
     /// remains the single writer; concurrent ingests/writes serialize
     /// against the same lock the daemon uses for everything else.
     LintFix {},
+    /// Run EXTRACT (chunked if needed) + MERGE-dry-run for any overlapping
+    /// slugs. Streams the resulting plan as JSON via PlanContent / EmptyExtract.
+    SourcePlan {
+        source_id: String,
+    },
+    /// Validate a plan and commit each non-dropped proposal as a wiki page
+    /// write, with re-MERGE for any user-edited slugs that now overlap.
+    PlanApply {
+        plan_json: String,
+    },
 }
 
 fn default_top_k() -> usize {
@@ -214,6 +224,29 @@ pub enum Event {
     /// Reply to `Request::Search`. `slug` is `None` when nothing matches.
     SearchResult {
         slug: Option<String>,
+    },
+
+    // --- Plan pipeline ---
+    /// Plan JSON content for `source plan` (success) or `plan apply`
+    /// (exit 3 / exit 4). The CLI writes this to stdout.
+    PlanContent {
+        json: String,
+    },
+    /// `source plan`: EXTRACT yielded zero pages. CLI emits empty stdout
+    /// with exit 0; the skill surfaces a user-facing message.
+    EmptyExtract {
+        reason: String,
+    },
+    /// Advisory progress event during `plan apply`. Consumed-and-dropped
+    /// by the CLI; programmatic consumers can read it from the protocol stream.
+    PlanApplyProgress {
+        slug: String,
+        status: String,
+    },
+    /// `plan apply` full-success terminal: the slugs that were committed
+    /// in this run. CLI maps to stdout = `committed N wiki pages\n`.
+    PlanApplied {
+        committed: Vec<String>,
     },
 }
 
@@ -510,5 +543,56 @@ mod tests {
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""type":"expansion""#));
         assert!(s.contains(r#""lex":"deployment""#));
+    }
+
+    #[test]
+    fn source_plan_request_deserializes() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"source_plan","source_id":"src-abc"}"#,
+        )
+        .unwrap();
+        match r {
+            Request::SourcePlan { source_id } => assert_eq!(source_id, "src-abc"),
+            _ => panic!("expected SourcePlan"),
+        }
+    }
+
+    #[test]
+    fn plan_apply_request_deserializes() {
+        let r: Request = serde_json::from_str(
+            r#"{"op":"plan_apply","plan_json":"{}"}"#,
+        )
+        .unwrap();
+        match r {
+            Request::PlanApply { plan_json } => assert_eq!(plan_json, "{}"),
+            _ => panic!("expected PlanApply"),
+        }
+    }
+
+    #[test]
+    fn plan_content_event_serializes() {
+        let e = Event::PlanContent { json: "{}".into() };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""type":"plan_content""#));
+        assert!(s.contains(r#""json":"{}""#));
+    }
+
+    #[test]
+    fn empty_extract_event_serializes() {
+        let e = Event::EmptyExtract { reason: "no-subjects".into() };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""type":"empty_extract""#));
+        assert!(s.contains(r#""reason":"no-subjects""#));
+    }
+
+    #[test]
+    fn plan_applied_event_serializes_with_committed_list() {
+        let e = Event::PlanApplied {
+            committed: vec!["mmai".into(), "gpu-checkpoint".into()],
+        };
+        let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains(r#""type":"plan_applied""#));
+        assert!(s.contains(r#""mmai""#));
+        assert!(s.contains(r#""gpu-checkpoint""#));
     }
 }

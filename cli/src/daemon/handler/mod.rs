@@ -270,6 +270,13 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
         Request::Search { title } => search::handle_search(title, state).await,
 
         Request::LintFix {} => lint_fix::handle_lint_fix(state).await,
+
+        Request::SourcePlan { source_id: _ } => {
+            error_events(DaemonError::Internal("source_plan: not yet implemented".into()))
+        }
+        Request::PlanApply { plan_json: _ } => {
+            error_events(DaemonError::Internal("plan_apply: not yet implemented".into()))
+        }
     }
 }
 
