@@ -46,7 +46,10 @@ impl Plan {
     /// the rest of the logic depends on.
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 1 {
-            return Err(format!("unsupported version: {} (expected 1)", self.version));
+            return Err(format!(
+                "unsupported version: {} (expected 1)",
+                self.version
+            ));
         }
         if !is_hex64(&self.source.content_hash) {
             return Err(format!(
@@ -113,12 +116,15 @@ impl Plan {
 }
 
 fn is_hex64(s: &str) -> bool {
-    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    s.len() == 64
+        && s.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
 fn is_kebab_case_slug(s: &str) -> bool {
     !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && !s.starts_with('-')
         && !s.ends_with('-')
         && !s.contains("--")
@@ -166,7 +172,10 @@ mod tests {
         let back: Proposal = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
         assert!(json.contains(r#""merge_target_slug":"mmai""#));
-        assert!(!json.contains(r#""error":"#), "error: None must be skipped via skip_serializing_if");
+        assert!(
+            !json.contains(r#""error":"#),
+            "error: None must be skipped via skip_serializing_if"
+        );
     }
 
     #[test]

@@ -50,16 +50,13 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
     };
     let source_path = fm.source.clone().unwrap_or_default();
 
-    let pages = match crate::daemon::handler::ingest::extract_pages_from_content(
-        body,
-        &source_path,
-        state,
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => return error_events(e),
-    };
+    let pages =
+        match crate::daemon::handler::ingest::extract_pages_from_content(body, &source_path, state)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return error_events(e),
+        };
 
     if pages.is_empty() {
         return vec![
@@ -143,7 +140,11 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
                         error: None,
                     });
                 } else {
-                    proposals.push(merge_failure_proposal(idx, &page, "merge returned no pages"));
+                    proposals.push(merge_failure_proposal(
+                        idx,
+                        &page,
+                        "merge returned no pages",
+                    ));
                 }
             }
             Ok(Err(e)) => {
@@ -174,18 +175,14 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
             content_hash: content_hash.clone(),
             size_bytes: body.len() as u64,
         },
-        created_at: chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         proposals,
     };
     let json = match serde_json::to_string(&plan) {
         Ok(s) => s,
         Err(e) => return error_events(DaemonError::Internal(format!("plan serialize: {e}"))),
     };
-    vec![
-        Event::PlanContent { json },
-        Event::Done { status: 0 },
-    ]
+    vec![Event::PlanContent { json }, Event::Done { status: 0 }]
 }
 
 fn merge_failure_proposal(
@@ -215,9 +212,7 @@ fn merge_failure_proposal(
 pub(super) fn compute_unified_diff(old: &str, new: &str) -> String {
     use similar::TextDiff;
     let diff = TextDiff::from_lines(old, new);
-    diff.unified_diff()
-        .header("existing", "merged")
-        .to_string()
+    diff.unified_diff().header("existing", "merged").to_string()
 }
 
 /// Handle `Request::PlanApply`. Validates the plan, then per non-dropped
@@ -245,7 +240,8 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
     };
     if !docs.iter().any(|d| d.doc_type == "raw") {
         return error_events(DaemonError::BadRequest(format!(
-            "source missing: '{}'", plan.source.id
+            "source missing: '{}'",
+            plan.source.id
         )));
     }
 
@@ -582,7 +578,11 @@ mod tests {
         } else {
             format!(
                 "\n  - {}",
-                sources.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join("\n  - ")
+                sources
+                    .iter()
+                    .map(|s| format!("\"{s}\""))
+                    .collect::<Vec<_>>()
+                    .join("\n  - ")
             )
         };
         let frontmatter = format!(
@@ -671,5 +671,33 @@ mod tests {
         let state = test_state(root);
         let events = handle_plan_apply("not json".into(), &state).await;
         assert!(matches!(&events[0], Event::Error { code, .. } if code == "bad_request"));
+    }
+
+    #[tokio::test]
+    async fn plan_apply_rejects_missing_source() {
+        // Plan validates structurally but references a docid not in the
+        // raw store → bad_request "source missing".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let _ = memex_core::Memex::open(root.clone()).unwrap();
+        let state = test_state(root);
+        let plan = Plan {
+            version: 1,
+            source: PlanSource {
+                id: "src-doesnotexist".into(),
+                identifier: "x".into(),
+                content_hash: "a".repeat(64),
+                size_bytes: 0,
+            },
+            created_at: "2026-04-30T00:00:00Z".into(),
+            proposals: vec![],
+        };
+        let json = serde_json::to_string(&plan).unwrap();
+        let events = handle_plan_apply(json, &state).await;
+        let last = events.last().unwrap();
+        assert!(
+            matches!(last, Event::Done { status: 1 }),
+            "expected Done{{1}}, got: {events:?}"
+        );
     }
 }
