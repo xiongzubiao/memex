@@ -19,6 +19,7 @@ use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 mod delete;
 mod ingest;
 mod lint_fix;
+mod plan;
 mod query;
 mod search;
 mod source;
@@ -71,6 +72,11 @@ pub struct WriterSession {
     /// the map (brief); the inner `TokioMutex` is held across the
     /// long-running MERGE LLM call via `.await`.
     pub slug_locks: Arc<StdMutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    /// Per-content-hash advisory locks. Held by `source plan` for the
+    /// duration of EXTRACT + MERGE-dry-run only; does NOT serialize
+    /// against `plan apply` (no shared state). Same map shape as
+    /// `slug_locks` so cleanup heuristics match.
+    pub content_hash_locks: Arc<StdMutex<HashMap<String, Arc<TokioMutex<()>>>>>,
 }
 
 impl WriterSession {
@@ -138,6 +144,25 @@ pub(super) async fn acquire_slug_locks(
         guards.push(lock.lock_owned().await);
     }
     guards
+}
+
+/// Acquire the per-content-hash lock. Held during EXTRACT/MERGE-dry-run
+/// for `source plan`; prevents two simultaneous LLM call chains on the
+/// same source content. Released before stdout streaming.
+pub(super) async fn acquire_content_hash_lock(
+    writer: &WriterSession,
+    content_hash: &str,
+) -> OwnedMutexGuard<()> {
+    let lock: Arc<TokioMutex<()>> = {
+        let mut map = writer
+            .content_hash_locks
+            .lock()
+            .expect("content_hash_locks map poisoned");
+        map.entry(content_hash.to_string())
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
 }
 
 /// Look up the shared Memex handle for `root`, opening on first use.
@@ -270,6 +295,10 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
         Request::Search { title } => search::handle_search(title, state).await,
 
         Request::LintFix {} => lint_fix::handle_lint_fix(state).await,
+
+        Request::SourcePlan { source_id } => plan::handle_source_plan(source_id, state).await,
+
+        Request::PlanApply { plan_json } => plan::handle_plan_apply(plan_json, state).await,
     }
 }
 
@@ -381,6 +410,7 @@ mod tests {
         let writer_session = WriterSession {
             reader: reader_session,
             slug_locks: Arc::new(StdMutex::new(HashMap::new())),
+            content_hash_locks: Arc::new(StdMutex::new(HashMap::new())),
         };
         HandlerState {
             pid: 1234,
@@ -413,6 +443,7 @@ mod tests {
         let writer_session = WriterSession {
             reader: reader_session,
             slug_locks: Arc::new(StdMutex::new(HashMap::new())),
+            content_hash_locks: Arc::new(StdMutex::new(HashMap::new())),
         };
         let state = HandlerState {
             pid: 0,
@@ -561,5 +592,24 @@ mod tests {
         let content = "see token sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA in body";
         let r = validate_and_redact_inbound_content(content, 10_000).unwrap();
         assert!(!r.contains("sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {r}");
+    }
+
+    #[tokio::test]
+    async fn content_hash_lock_serializes_concurrent_acquisitions() {
+        let state = test_state();
+        let hash = "deadbeef".to_string();
+        let g1 = acquire_content_hash_lock(&state.writer, &hash).await;
+        let writer = state.writer.clone();
+        let hash2 = hash.clone();
+        let racer = tokio::spawn(async move {
+            let _g2 = acquire_content_hash_lock(&writer, &hash2).await;
+            "second"
+        });
+        // Racer must NOT complete while g1 is held.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!racer.is_finished(), "racer acquired while first lock held");
+        drop(g1);
+        let v = racer.await.unwrap();
+        assert_eq!(v, "second");
     }
 }

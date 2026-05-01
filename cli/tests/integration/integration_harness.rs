@@ -142,6 +142,7 @@ impl IntegrationHarness {
         let writer_session = memex_cli::daemon::handler::WriterSession {
             reader: reader_session,
             slug_locks: Arc::new(StdMutex::new(HashMap::new())),
+            content_hash_locks: Arc::new(StdMutex::new(HashMap::new())),
         };
         let state = Arc::new(HandlerState {
             pid: std::process::id(),
@@ -209,6 +210,7 @@ impl IntegrationHarness {
         let writer_session = memex_cli::daemon::handler::WriterSession {
             reader: reader_session,
             slug_locks: Arc::new(StdMutex::new(HashMap::new())),
+            content_hash_locks: Arc::new(StdMutex::new(HashMap::new())),
         };
         let state = Arc::new(HandlerState {
             pid: std::process::id(),

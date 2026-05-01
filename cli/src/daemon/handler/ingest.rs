@@ -220,10 +220,6 @@ pub(super) async fn handle_ingest_document(
     collections: Vec<String>,
     state: &HandlerState,
 ) -> Vec<Event> {
-    use crate::daemon::queue::{
-        BackendJob, ChunkPosition, ExtractSegment, IngestJob, MergeJob, MergePair,
-    };
-
     let cfg = state.config.ingest.clone();
 
     // ─── Validation ───────────────────────────────────────────────────
@@ -290,142 +286,14 @@ pub(super) async fn handle_ingest_document(
         },
     ];
 
-    // ─── Chunk ────────────────────────────────────────────────────────
-    let chunks = match memex_core::chunk::chunk_markdown(
-        &redacted,
-        cfg.chunk_target_tokens,
-        cfg.chunk_hard_cap_tokens,
-        cfg.max_chunks,
-    ) {
-        Ok(c) => c,
+    // ─── Chunked EXTRACT + cross-chunk MERGE consolidation ───────────
+    let merged_pages = match extract_pages_from_content(&redacted, &source_path, state).await {
+        Ok(p) => p,
         Err(e) => {
-            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
-            return error_events(DaemonError::BadRequest(e.to_string()));
+            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.message()));
+            return error_events(e);
         }
     };
-    let total_chunks = chunks.len();
-    tracing::info!(job_id = %job_id, total_chunks, "dispatching document chunks");
-
-    // ─── Dispatch chunks concurrently ─────────────────────────────────
-    let mut receivers = Vec::with_capacity(total_chunks);
-    for (idx, chunk) in chunks.into_iter().enumerate() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let job = BackendJob::Ingest(IngestJob {
-            segments: vec![ExtractSegment {
-                index: None,
-                role: None,
-                timestamp: None,
-                text: chunk,
-            }],
-            source: source_path.clone(),
-            chunk: Some(ChunkPosition {
-                index: idx,
-                total: total_chunks,
-            }),
-            reply: tx,
-        });
-        if state.jobs.submit(job).await.is_err() {
-            let _ = search.update_ingest_job_status(&job_id, "failed", Some("worker queue closed"));
-            return error_events(DaemonError::Internal("worker queue closed".into()));
-        }
-        receivers.push(rx);
-    }
-
-    // ─── Gather chunk results ─────────────────────────────────────────
-    let mut all_pages: Vec<crate::daemon::queue::ExtractedPage> = Vec::new();
-    for rx in receivers {
-        match rx.await {
-            Ok(Ok(reply)) => all_pages.extend(reply.pages),
-            Ok(Err(e)) => {
-                let de: DaemonError = e.into();
-                let _ = search.update_ingest_job_status(&job_id, "failed", Some(&de.message()));
-                return error_events(de);
-            }
-            Err(_) => {
-                let _ = search.update_ingest_job_status(
-                    &job_id,
-                    "failed",
-                    Some("worker dropped reply"),
-                );
-                return error_events(DaemonError::Internal("worker dropped reply".into()));
-            }
-        }
-    }
-
-    // ─── Cross-chunk fragment-merge: same slug from multiple chunks ──
-    let mut by_slug: std::collections::BTreeMap<
-        String,
-        Vec<crate::daemon::queue::ExtractedPage>,
-    > = std::collections::BTreeMap::new();
-    for p in all_pages {
-        if p.slug.is_empty() || p.title.is_empty() || p.body.is_empty() {
-            continue;
-        }
-        let slug = crate::slugify(&p.slug);
-        if slug.is_empty() {
-            continue;
-        }
-        by_slug.entry(slug).or_default().push(p);
-    }
-
-    let mut merged_pages: Vec<crate::daemon::queue::ExtractedPage> = Vec::new();
-    for (slug, fragments) in by_slug {
-        if fragments.len() == 1 {
-            let mut p = fragments.into_iter().next().unwrap();
-            p.slug = slug;
-            merged_pages.push(p);
-            continue;
-        }
-        // ≥ 2 fragments — chain MergeJobs sequentially.
-        let title = fragments[0].title.clone();
-        let tags: Vec<String> = fragments
-            .iter()
-            .flat_map(|p| p.tags.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let mut accum_body = fragments[0].body.clone();
-        for next in fragments.into_iter().skip(1) {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let job = BackendJob::Merge(MergeJob {
-                pages: vec![MergePair {
-                    slug: slug.clone(),
-                    proposed: next.body.clone(),
-                    existing: accum_body.clone(),
-                }],
-                reply: tx,
-            });
-            if state.jobs.submit(job).await.is_err() {
-                let _ =
-                    search.update_ingest_job_status(&job_id, "failed", Some("merge queue closed"));
-                return error_events(DaemonError::Internal("merge queue closed".into()));
-            }
-            match rx.await {
-                Ok(Ok(reply)) => {
-                    if let Some(merged) = reply.merged_pages.into_iter().next() {
-                        accum_body = merged.body;
-                    }
-                }
-                Ok(Err(e)) => {
-                    // Cross-chunk merge failed; keep accum_body and append divider.
-                    tracing::warn!(?e, slug = %slug, "fragment-merge worker error; concatenating with divider");
-                    accum_body.push_str("\n\n---\n\n");
-                    accum_body.push_str(&next.body);
-                }
-                Err(_) => {
-                    tracing::warn!(slug = %slug, "fragment-merge dropped reply; concatenating with divider");
-                    accum_body.push_str("\n\n---\n\n");
-                    accum_body.push_str(&next.body);
-                }
-            }
-        }
-        merged_pages.push(crate::daemon::queue::ExtractedPage {
-            slug,
-            title,
-            tags,
-            body: memex_core::transcript::truncate(&accum_body, 20_000),
-        });
-    }
 
     if merged_pages.is_empty() {
         let _ = search.update_ingest_job_status(&job_id, "completed", None);
@@ -695,6 +563,128 @@ async fn store_extracted_pages(
         source_docid,
         wiki_pages: batch_result.wiki_hashes.into_iter().map(|(s, _)| s).collect(),
     })
+}
+
+/// Extract pages from already-stored source content. Runs chunked
+/// EXTRACT and cross-chunk MERGE consolidation. Returns the FINAL list
+/// of proposals (one per slug). Caller is responsible for any post-
+/// processing (e.g., MERGE-dry-run for wiki overlap).
+///
+/// Used by both transcript/document ingest and the source_plan handler.
+pub(super) async fn extract_pages_from_content(
+    content: &str,
+    source_path: &str,
+    state: &HandlerState,
+) -> Result<Vec<crate::daemon::queue::ExtractedPage>, DaemonError> {
+    use crate::daemon::queue::{
+        BackendJob, ChunkPosition, ExtractSegment, IngestJob, MergeJob, MergePair,
+    };
+
+    let cfg = state.config.ingest.clone();
+    let chunks = match memex_core::chunk::chunk_markdown(
+        content,
+        cfg.chunk_target_tokens,
+        cfg.chunk_hard_cap_tokens,
+        cfg.max_chunks,
+    ) {
+        Ok(c) => c,
+        Err(e) => return Err(DaemonError::BadRequest(e.to_string())),
+    };
+    let total_chunks = chunks.len();
+    let mut receivers = Vec::with_capacity(total_chunks);
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let job = BackendJob::Ingest(IngestJob {
+            segments: vec![ExtractSegment {
+                index: None,
+                role: None,
+                timestamp: None,
+                text: chunk,
+            }],
+            source: source_path.to_string(),
+            chunk: Some(ChunkPosition {
+                index: idx,
+                total: total_chunks,
+            }),
+            reply: tx,
+        });
+        if state.jobs.submit(job).await.is_err() {
+            return Err(DaemonError::Internal("worker queue closed".into()));
+        }
+        receivers.push(rx);
+    }
+
+    let mut all_pages = Vec::new();
+    for rx in receivers {
+        match rx.await {
+            Ok(Ok(reply)) => all_pages.extend(reply.pages),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(DaemonError::Internal("worker dropped reply".into())),
+        }
+    }
+
+    // Cross-chunk fragment-merge: same slug from multiple chunks.
+    let mut by_slug: std::collections::BTreeMap<String, Vec<crate::daemon::queue::ExtractedPage>> =
+        std::collections::BTreeMap::new();
+    for p in all_pages {
+        if p.slug.is_empty() || p.title.is_empty() || p.body.is_empty() {
+            continue;
+        }
+        let slug = crate::slugify(&p.slug);
+        if slug.is_empty() {
+            continue;
+        }
+        by_slug.entry(slug).or_default().push(p);
+    }
+    let mut merged: Vec<crate::daemon::queue::ExtractedPage> = Vec::new();
+    for (slug, fragments) in by_slug {
+        if fragments.len() == 1 {
+            let mut p = fragments.into_iter().next().unwrap();
+            p.slug = slug;
+            merged.push(p);
+            continue;
+        }
+        let title = fragments[0].title.clone();
+        let tags: Vec<String> = fragments
+            .iter()
+            .flat_map(|p| p.tags.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut accum_body = fragments[0].body.clone();
+        for next in fragments.into_iter().skip(1) {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let job = BackendJob::Merge(MergeJob {
+                pages: vec![MergePair {
+                    slug: slug.clone(),
+                    proposed: next.body.clone(),
+                    existing: accum_body.clone(),
+                }],
+                reply: tx,
+            });
+            if state.jobs.submit(job).await.is_err() {
+                return Err(DaemonError::Internal("merge queue closed".into()));
+            }
+            match rx.await {
+                Ok(Ok(reply)) => {
+                    if let Some(m) = reply.merged_pages.into_iter().next() {
+                        accum_body = m.body;
+                    }
+                }
+                _ => {
+                    accum_body.push_str("\n\n---\n\n");
+                    accum_body.push_str(&next.body);
+                }
+            }
+        }
+        merged.push(crate::daemon::queue::ExtractedPage {
+            slug,
+            title,
+            tags,
+            body: memex_core::transcript::truncate(&accum_body, 20_000),
+        });
+    }
+    Ok(merged)
 }
 
 /// Phase 5: dispatch the wiki-side MERGE LLM job for every dedup-matched

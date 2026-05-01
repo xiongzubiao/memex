@@ -175,6 +175,7 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
     let writer_session = crate::daemon::handler::WriterSession {
         reader: reader_session,
         slug_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        content_hash_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     let state = Arc::new(HandlerState {
         pid,

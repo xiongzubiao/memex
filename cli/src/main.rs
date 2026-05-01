@@ -78,6 +78,11 @@ enum Commands {
         #[arg(long)]
         fix: bool,
     },
+    /// Plan-pipeline subcommands (see also: `source plan` and `plan apply`).
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
     /// Manage the memex daemon (query-path persistence)
     Daemon {
         #[command(subcommand)]
@@ -191,6 +196,24 @@ enum SourceAction {
         #[arg(long)]
         force: bool,
     },
+    /// Run EXTRACT + MERGE-dry-run for a stored source. Streams plan JSON.
+    Plan {
+        /// docid prefix (from `memex source list`)
+        docid: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Render plan JSON (stdin) as a human-readable table + diffs (stdout).
+    Show {
+        /// Pass plan JSON through unchanged for scripts.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply a plan: write each non-dropped proposal as a wiki page.
+    /// Reads plan JSON from stdin; emits refreshed plan or summary.
+    Apply,
 }
 
 /// CLI title→slug lookup. Routes through the daemon (auto-spawning
@@ -200,41 +223,50 @@ enum SourceAction {
 /// daemon-side handler short-circuits BM25-strong matches, so the
 /// typical case (user typed the existing title) is sub-100ms once
 /// the daemon is warm.
-fn run_search(title: &str) -> anyhow::Result<()> {
+/// Send one request to the running daemon (auto-spawning it if needed)
+/// and return the full event stream. Standardizes the
+/// rt + connect_or_spawn + request boilerplate that every daemon-mediated
+/// CLI subcommand otherwise duplicates.
+fn send_to_daemon(
+    request: memex_cli::daemon::protocol::Request,
+    spawn_timeout_secs: u64,
+) -> anyhow::Result<Vec<memex_cli::daemon::protocol::Event>> {
     let root = memex_cli::memex_root();
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
+    rt.block_on(async move {
         let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
         let stream = memex_cli::daemon::client::connect_or_spawn(
             &paths.socket,
             &paths.lock,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(spawn_timeout_secs),
         )
         .await?;
-        let events = memex_cli::daemon::client::request(
-            stream,
-            &memex_cli::daemon::protocol::Request::Search {
-                title: title.to_string(),
-            },
-        )
-        .await?;
-        for ev in &events {
-            match ev {
-                memex_cli::daemon::protocol::Event::SearchResult { slug: Some(s) } => {
-                    println!("{s}");
-                }
-                memex_cli::daemon::protocol::Event::SearchResult { slug: None } => {
-                    // No match — print nothing, exit 0. Matches the prior
-                    // direct-path behavior the agent skill docs document.
-                }
-                memex_cli::daemon::protocol::Event::Error { code, message, .. } => {
-                    anyhow::bail!("search error ({code}): {message}");
-                }
-                _ => {}
+        memex_cli::daemon::client::request(stream, &request).await
+    })
+}
+
+fn run_search(title: &str) -> anyhow::Result<()> {
+    let events = send_to_daemon(
+        memex_cli::daemon::protocol::Request::Search {
+            title: title.to_string(),
+        },
+        15,
+    )?;
+    for ev in &events {
+        match ev {
+            memex_cli::daemon::protocol::Event::SearchResult { slug: Some(s) } => {
+                println!("{s}");
             }
+            memex_cli::daemon::protocol::Event::SearchResult { slug: None } => {
+                // No match — print nothing, exit 0. Matches the prior
+                // direct-path behavior the agent skill docs document.
+            }
+            memex_cli::daemon::protocol::Event::Error { code, message, .. } => {
+                anyhow::bail!("search error ({code}): {message}");
+            }
+            _ => {}
         }
-        Ok::<_, anyhow::Error>(())
-    })?;
+    }
     Ok(())
 }
 
@@ -370,60 +402,47 @@ fn open_editor_for_page(name: &str) -> anyhow::Result<String> {
 /// (`Request::SourceDelete`). Reports any wiki pages that now have
 /// dangling source references.
 fn run_source_delete(reference: &str, force: bool) -> anyhow::Result<()> {
-    let root = memex_cli::memex_root();
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
-        let stream = memex_cli::daemon::client::connect_or_spawn(
-            &paths.socket,
-            &paths.lock,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await?;
-        let events = memex_cli::daemon::client::request(
-            stream,
-            &memex_cli::daemon::protocol::Request::SourceDelete {
-                ref_: reference.to_string(),
-                force,
-            },
-        )
-        .await?;
-        let mut exit_code = 0;
-        for ev in &events {
-            match ev {
-                memex_cli::daemon::protocol::Event::SourceDeleted {
-                    docid,
-                    source_path,
-                    dangling_wiki_pages,
-                } => {
-                    println!("deleted: {docid} ({source_path})");
-                    if !dangling_wiki_pages.is_empty() {
-                        println!(
-                            "warning: {} wiki page(s) still reference this source path in their `sources:` frontmatter: {}",
-                            dangling_wiki_pages.len(),
-                            dangling_wiki_pages.join(", ")
-                        );
-                        println!(
-                            "  edit each page to drop the entry, or attach a replacement source via `memex write --source <docid>`."
-                        );
-                    }
+    let events = send_to_daemon(
+        memex_cli::daemon::protocol::Request::SourceDelete {
+            ref_: reference.to_string(),
+            force,
+        },
+        5,
+    )?;
+    let mut exit_code = 0;
+    for ev in &events {
+        match ev {
+            memex_cli::daemon::protocol::Event::SourceDeleted {
+                docid,
+                source_path,
+                dangling_wiki_pages,
+            } => {
+                println!("deleted: {docid} ({source_path})");
+                if !dangling_wiki_pages.is_empty() {
+                    println!(
+                        "warning: {} wiki page(s) still reference this source path in their `sources:` frontmatter: {}",
+                        dangling_wiki_pages.len(),
+                        dangling_wiki_pages.join(", ")
+                    );
+                    println!(
+                        "  edit each page to drop the entry, or attach a replacement source via `memex write --source <docid>`."
+                    );
                 }
-                memex_cli::daemon::protocol::Event::Error {
-                    code,
-                    message,
-                    status,
-                } => {
-                    eprintln!("delete error ({code}): {message}");
-                    exit_code = *status;
-                }
-                _ => {}
             }
+            memex_cli::daemon::protocol::Event::Error {
+                code,
+                message,
+                status,
+            } => {
+                eprintln!("delete error ({code}): {message}");
+                exit_code = *status;
+            }
+            _ => {}
         }
-        if exit_code != 0 {
-            std::process::exit(exit_code);
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
+    }
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
     Ok(())
 }
 
@@ -525,41 +544,28 @@ fn run_source_add(
         anyhow::bail!("empty source content on stdin");
     }
     let content_size = content.len();
-    let root = memex_cli::memex_root();
     // Pass collections through verbatim. The daemon's `normalize_collections`
     // adds "default" for new sources; for re-adds we want the empty list
     // to signal "leave existing collections alone" (handle_source_add gates
     // its set_document_collections_by_path call on `!collections.is_empty()`).
-    let collections = collections.to_vec();
-
-    let rt = tokio::runtime::Runtime::new()?;
-    let docid = rt.block_on(async move {
-        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
-        let stream = memex_cli::daemon::client::connect_or_spawn(
-            &paths.socket,
-            &paths.lock,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await?;
-        let events = memex_cli::daemon::client::request(
-            stream,
-            &memex_cli::daemon::protocol::Request::SourceAdd {
-                source_path: source_path.to_string(),
-                content,
-                collections,
-            },
-        )
-        .await?;
-        for ev in &events {
-            if let memex_cli::daemon::protocol::Event::SourceAdded { docid } = ev {
-                return Ok::<String, anyhow::Error>(docid.clone());
-            }
-            if let memex_cli::daemon::protocol::Event::Error { code, message, .. } = ev {
-                anyhow::bail!("source add error ({code}): {message}");
-            }
+    let events = send_to_daemon(
+        memex_cli::daemon::protocol::Request::SourceAdd {
+            source_path: source_path.to_string(),
+            content,
+            collections: collections.to_vec(),
+        },
+        5,
+    )?;
+    let mut docid = None;
+    for ev in &events {
+        if let memex_cli::daemon::protocol::Event::SourceAdded { docid: d } = ev {
+            docid = Some(d.clone());
         }
-        anyhow::bail!("daemon did not return SourceAdded event")
-    })?;
+        if let memex_cli::daemon::protocol::Event::Error { code, message, .. } = ev {
+            anyhow::bail!("source add error ({code}): {message}");
+        }
+    }
+    let docid = docid.ok_or_else(|| anyhow::anyhow!("daemon did not return SourceAdded event"))?;
     if verbose {
         eprintln!("Stored: {source_path} ({content_size} bytes) → {docid}");
         eprintln!("Use: memex write <slug> --source {docid}");
@@ -568,8 +574,100 @@ fn run_source_add(
     Ok(())
 }
 
+fn run_source_plan(docid: &str) -> anyhow::Result<()> {
+    let events = send_to_daemon(
+        memex_cli::daemon::protocol::Request::SourcePlan {
+            source_id: docid.to_string(),
+        },
+        5,
+    )?;
+    for ev in &events {
+        match ev {
+            memex_cli::daemon::protocol::Event::PlanContent { json } => {
+                println!("{json}");
+                return Ok(());
+            }
+            memex_cli::daemon::protocol::Event::EmptyExtract { .. } => {
+                // No extractable subjects → empty stdout, exit 0;
+                // skill surfaces a user-facing message itself.
+                return Ok(());
+            }
+            memex_cli::daemon::protocol::Event::Error { message, .. } => {
+                anyhow::bail!("{message}");
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("daemon did not return PlanContent or EmptyExtract")
+}
+
+fn run_plan_show(json_only: bool) -> anyhow::Result<()> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    if buf.trim().is_empty() {
+        anyhow::bail!("empty stdin: pipe a plan JSON file");
+    }
+    let plan: memex_cli::daemon::plan::Plan = serde_json::from_str(&buf)
+        .map_err(|e| anyhow::anyhow!("plan JSON parse: {e}"))?;
+    if json_only {
+        // Pass-through: re-emit (validates parseability).
+        println!("{}", serde_json::to_string(&plan)?);
+        return Ok(());
+    }
+    print!("{}", memex_cli::plan_show::format_plan(&plan));
+    Ok(())
+}
+
+fn run_plan_apply() -> anyhow::Result<()> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    if buf.trim().is_empty() {
+        anyhow::bail!("empty stdin: pipe a plan JSON");
+    }
+    let events = send_to_daemon(
+        memex_cli::daemon::protocol::Request::PlanApply { plan_json: buf },
+        5,
+    )?;
+    // Find the terminal event and the Done status.
+    let mut content: Option<String> = None;
+    let mut applied: Option<Vec<String>> = None;
+    let mut error: Option<String> = None;
+    let mut status: i32 = 1;
+    for ev in events {
+        match ev {
+            memex_cli::daemon::protocol::Event::PlanContent { json } => content = Some(json),
+            memex_cli::daemon::protocol::Event::PlanApplied { committed } => applied = Some(committed),
+            memex_cli::daemon::protocol::Event::Error { message, .. } => error = Some(message),
+            memex_cli::daemon::protocol::Event::Done { status: s } => status = s,
+            _ => {}
+        }
+    }
+    use memex_cli::daemon::plan::{APPLY_NEEDS_REREVIEW, APPLY_OK, APPLY_PARTIAL_FAILURE};
+    match status {
+        APPLY_OK => {
+            let n = applied.map(|v| v.len()).unwrap_or(0);
+            println!("committed {n} wiki pages");
+            Ok(())
+        }
+        APPLY_NEEDS_REREVIEW | APPLY_PARTIAL_FAILURE => {
+            if let Some(json) = content {
+                println!("{json}");
+            }
+            std::process::exit(status);
+        }
+        _ => {
+            if let Some(msg) = error {
+                anyhow::bail!("{msg}");
+            }
+            anyhow::bail!("plan apply failed with status {status}");
+        }
+    }
+}
+
 /// Write a wiki page via the daemon. Sends Request::Write.
-fn run_write_via_daemon(
+fn run_write(
     name: &str,
     force: bool,
     quiet: bool,
@@ -588,43 +686,29 @@ fn run_write_via_daemon(
         anyhow::bail!("empty content");
     }
 
-    let root = memex_cli::memex_root();
-
-    // Extract tags from frontmatter if present
-    let tags = memex_core::search::parse_page_for_indexing(&content)
-        .map(|(_, _, tags_str, _, _)| {
-            tags_str
-                .split(',')
-                .map(|t| t.trim().to_string())
+    // Generic-YAML walk; parse_page_for_indexing requires created_at/updated_at.
+    let tags = memex_core::storage::split_frontmatter(&content)
+        .and_then(|(yaml, _)| serde_yaml::from_str::<serde_yaml::Value>(yaml).ok())
+        .and_then(|v| v.get("tags").cloned())
+        .and_then(|v| v.as_sequence().cloned())
+        .map(|seq| {
+            seq.into_iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
-    let rt = tokio::runtime::Runtime::new()?;
-    let result: anyhow::Result<Vec<memex_cli::daemon::protocol::Event>> = rt.block_on(async {
-        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
-        let stream = memex_cli::daemon::client::connect_or_spawn(
-            &paths.socket,
-            &paths.lock,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await?;
-        let events = memex_cli::daemon::client::request(
-            stream,
-            &memex_cli::daemon::protocol::Request::Write {
-                title: name.to_string(),
-                content,
-                tags,
-                source: source.map(str::to_string),
-                force,
-            },
-        )
-        .await?;
-        Ok(events)
-    });
-
-    let events = result?;
+    let events = send_to_daemon(
+        memex_cli::daemon::protocol::Request::Write {
+            title: name.to_string(),
+            content,
+            tags,
+            source: source.map(str::to_string),
+            force,
+        },
+        5,
+    )?;
     let mut errored = false;
     for ev in &events {
         match ev {
@@ -708,47 +792,35 @@ fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
     drop(reader);
 
     // Phase 2: delegate to daemon (holds the writer lock, runs FTS backlink scan).
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
-        let stream = memex_cli::daemon::client::connect_or_spawn(
-            &paths.socket,
-            &paths.lock,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await?;
-        let events = memex_cli::daemon::client::request(
-            stream,
-            &memex_cli::daemon::protocol::Request::Delete {
-                slug: slug.clone(),
-                force,
-            },
-        )
-        .await?;
-        let mut exit_code = 0;
-        for ev in &events {
-            match ev {
-                memex_cli::daemon::protocol::Event::Deleted { slug: deleted_slug } => {
-                    println!("deleted: {deleted_slug}");
-                }
-                memex_cli::daemon::protocol::Event::Error { code, message, status } => {
-                    eprintln!("delete error ({code}): {message}");
-                    exit_code = *status;
-                }
-                _ => {}
+    let events = send_to_daemon(
+        memex_cli::daemon::protocol::Request::Delete {
+            slug: slug.clone(),
+            force,
+        },
+        5,
+    )?;
+    let mut exit_code = 0;
+    for ev in &events {
+        match ev {
+            memex_cli::daemon::protocol::Event::Deleted { slug: deleted_slug } => {
+                println!("deleted: {deleted_slug}");
             }
+            memex_cli::daemon::protocol::Event::Error { code, message, status } => {
+                eprintln!("delete error ({code}): {message}");
+                exit_code = *status;
+            }
+            _ => {}
         }
-        if exit_code != 0 {
-            std::process::exit(exit_code);
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
+    }
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
     Ok(())
 }
 
 fn run_lint(fix: bool) -> anyhow::Result<()> {
     if fix {
-        return run_lint_fix_via_daemon();
+        return run_lint_fix();
     }
 
     let root = memex_cli::memex_root();
@@ -793,66 +865,49 @@ fn run_lint(fix: bool) -> anyhow::Result<()> {
 
 /// `memex lint --fix` — daemon-routed mutation. The daemon owns all
 /// writes, including stale-index reindex and embedding-model re-embed.
-fn run_lint_fix_via_daemon() -> anyhow::Result<()> {
-    let root = memex_cli::memex_root();
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let paths = memex_cli::daemon::server::DaemonPaths::default_under(&root);
-        let stream = memex_cli::daemon::client::connect_or_spawn(
-            &paths.socket,
-            &paths.lock,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(15),
-        )
-        .await?;
-        let events = memex_cli::daemon::client::request(
-            stream,
-            &memex_cli::daemon::protocol::Request::LintFix {},
-        )
-        .await?;
-
-        let mut applied = 0u32;
-        let mut stale = 0u32;
-        let mut errored = 0u32;
-        for ev in &events {
-            use memex_cli::daemon::protocol::Event;
-            match ev {
-                Event::LintFixed { page, kind } => {
-                    match kind.as_str() {
-                        "stale_index" => println!("fixed: {page} (reindexed from disk)"),
-                        "outdated_embedding" => println!("re-embedded: {page}"),
-                        "raw_hash_mismatch" => println!("renamed-and-re-embedded: {page}"),
-                        "untracked_file" => println!("indexed: {page} (added DB row from disk)"),
-                        "missing_file" => println!("removed: {page} (DB row for missing file)"),
-                        other => println!("fixed: {page} ({other})"),
-                    }
-                    applied += 1;
+fn run_lint_fix() -> anyhow::Result<()> {
+    let events = send_to_daemon(memex_cli::daemon::protocol::Request::LintFix {}, 15)?;
+    let mut applied = 0u32;
+    let mut stale = 0u32;
+    let mut errored = 0u32;
+    for ev in &events {
+        use memex_cli::daemon::protocol::Event;
+        match ev {
+            Event::LintFixed { page, kind } => {
+                match kind.as_str() {
+                    "stale_index" => println!("fixed: {page} (reindexed from disk)"),
+                    "outdated_embedding" => println!("re-embedded: {page}"),
+                    "raw_hash_mismatch" => println!("renamed-and-re-embedded: {page}"),
+                    "untracked_file" => println!("indexed: {page} (added DB row from disk)"),
+                    "missing_file" => println!("removed: {page} (DB row for missing file)"),
+                    other => println!("fixed: {page} ({other})"),
                 }
-                Event::LintAlreadyFixed { page } => {
-                    println!("already-fixed: {page}");
-                    stale += 1;
-                }
-                Event::LintRemaining { page, kind, target } => match kind.as_str() {
-                    "dangling_link" => println!("dangling: {page} -> [[{target}]]"),
-                    "missing_link" => println!("missing-link: {page} -> [[{target}]]"),
-                    "untracked_file" => println!("untracked: {target} (no DB row)"),
-                    "missing_file" => println!("missing-file: {page} (DB row, no file)"),
-                    other => println!("{other}: {page}"),
-                },
-                Event::Error { code, message, .. } => {
-                    eprintln!("lint --fix error ({code}): {message}");
-                    errored += 1;
-                }
-                _ => {}
+                applied += 1;
             }
+            Event::LintAlreadyFixed { page } => {
+                println!("already-fixed: {page}");
+                stale += 1;
+            }
+            Event::LintRemaining { page, kind, target } => match kind.as_str() {
+                "dangling_link" => println!("dangling: {page} -> [[{target}]]"),
+                "missing_link" => println!("missing-link: {page} -> [[{target}]]"),
+                "untracked_file" => println!("untracked: {target} (no DB row)"),
+                "missing_file" => println!("missing-file: {page} (DB row, no file)"),
+                other => println!("{other}: {page}"),
+            },
+            Event::Error { code, message, .. } => {
+                eprintln!("lint --fix error ({code}): {message}");
+                errored += 1;
+            }
+            _ => {}
         }
-        if applied + stale > 0 {
-            println!("lint-fix-summary: applied={applied} stale={stale}");
-        }
-        if errored > 0 {
-            anyhow::bail!("lint --fix encountered {errored} error(s)");
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
+    }
+    if applied + stale > 0 {
+        println!("lint-fix-summary: applied={applied} stale={stale}");
+    }
+    if errored > 0 {
+        anyhow::bail!("lint --fix encountered {errored} error(s)");
+    }
     Ok(())
 }
 
@@ -951,7 +1006,7 @@ fn core_agent_to_protocol(
     }
 }
 
-fn run_ingest_client(
+fn run_ingest(
     agent: Option<&Agent>,
     path: Option<&std::path::Path>,
     source: Option<&str>,
@@ -1039,42 +1094,30 @@ fn run_ingest_client(
         ),
     };
 
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let paths =
-            memex_cli::daemon::server::DaemonPaths::default_under(&memex_cli::memex_root());
-        let stream = memex_cli::daemon::client::connect_or_spawn(
-            &paths.socket,
-            &paths.lock,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-        )
-        .await?;
-        let events = memex_cli::daemon::client::request(stream, &request).await?;
-        let mut exit_code = 0;
-        for ev in &events {
-            match ev {
-                memex_cli::daemon::protocol::Event::Error {
-                    code,
-                    message,
-                    status,
-                } => {
-                    eprintln!("ingest error ({code}): {message}");
-                    exit_code = *status;
-                }
-                memex_cli::daemon::protocol::Event::Stored { wiki_pages, .. } => {
-                    println!("stored: {} pages", wiki_pages.len());
-                }
-                memex_cli::daemon::protocol::Event::Done { status } if *status != 0 => {
-                    exit_code = *status;
-                }
-                _ => {}
+    let events = send_to_daemon(request, 5)?;
+    let mut exit_code = 0;
+    for ev in &events {
+        match ev {
+            memex_cli::daemon::protocol::Event::Error {
+                code,
+                message,
+                status,
+            } => {
+                eprintln!("ingest error ({code}): {message}");
+                exit_code = *status;
             }
+            memex_cli::daemon::protocol::Event::Stored { wiki_pages, .. } => {
+                println!("stored: {} pages", wiki_pages.len());
+            }
+            memex_cli::daemon::protocol::Event::Done { status } if *status != 0 => {
+                exit_code = *status;
+            }
+            _ => {}
         }
-        if exit_code != 0 {
-            std::process::exit(exit_code);
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
+    }
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
     Ok(())
 }
 
@@ -1253,7 +1296,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             force,
             quiet,
             source,
-        } => run_write_via_daemon(&name, force, quiet, source.as_deref()),
+        } => run_write(&name, force, quiet, source.as_deref()),
         Commands::Delete { page_ref, force } => run_delete(&page_ref, force),
         Commands::Lint { fix } => {
             if fix {
@@ -1288,7 +1331,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             path,
             source,
             collections,
-        } => run_ingest_client(
+        } => run_ingest(
             agent.as_ref(),
             path.as_deref(),
             source.as_deref(),
@@ -1309,6 +1352,11 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             SourceAction::List { collections, json } => run_source_list(&collections, json),
             SourceAction::Show { reference } => run_source_show(&reference),
             SourceAction::Delete { reference, force } => run_source_delete(&reference, force),
+            SourceAction::Plan { docid } => run_source_plan(&docid),
+        },
+        Commands::Plan { action } => match action {
+            PlanAction::Show { json } => run_plan_show(json),
+            PlanAction::Apply => run_plan_apply(),
         },
     }
 }

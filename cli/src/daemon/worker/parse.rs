@@ -135,6 +135,13 @@ pub fn parse_ingest(text: &str) -> Result<IngestReply, ParseFailure> {
     {
         return Ok(IngestReply { pages });
     }
+    // Empty `{"pages":[]}` — unambiguous "no extractable subjects" from the
+    // worker. Earlier WrappedPages attempts gate on `!pages.is_empty()` so
+    // they fall through here. Treat as a successful empty extract; callers
+    // map to EmptyExtract upstream.
+    if serde_json::from_str::<WrappedPages>(cleaned).is_ok() {
+        return Ok(IngestReply { pages: vec![] });
+    }
     let json_err = serde_json::from_str::<Vec<ExtractedPage>>(cleaned)
         .err()
         .map(|e| e.to_string())
@@ -461,6 +468,22 @@ mod tests {
             .unwrap();
         assert_eq!(r.pages.len(), 1);
         assert_eq!(r.pages[0].slug, "s");
+    }
+
+    #[test]
+    fn parse_ingest_accepts_empty_wrapped_pages_as_empty_extract() {
+        // Worker emits `{"pages":[]}` for sources with no extractable subjects.
+        // Must succeed with empty pages — not surface as a parse failure —
+        // so the source plan handler can map it to EmptyExtract.
+        let r = parse_ingest(r#"{"pages":[]}"#).unwrap();
+        assert!(r.pages.is_empty());
+    }
+
+    #[test]
+    fn parse_ingest_accepts_empty_wrapped_pages_in_code_fence() {
+        // Worker frequently wraps the empty result in a markdown fence.
+        let r = parse_ingest("```json\n{\"pages\":[]}\n```").unwrap();
+        assert!(r.pages.is_empty());
     }
 
     #[test]

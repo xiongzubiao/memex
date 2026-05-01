@@ -13,6 +13,7 @@ pub mod lock;
 pub mod logging;
 pub mod memex_handle;
 pub mod pidfile;
+pub mod plan;
 pub mod protocol;
 pub mod queue;
 pub mod retrieval;

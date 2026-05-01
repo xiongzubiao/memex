@@ -138,17 +138,9 @@ fn walk_dir(
     seen: &mut HashSet<String>,
     report: &mut ReconcileReport,
 ) -> Result<Vec<std::path::PathBuf>> {
-    let canonical_root = match std::fs::canonicalize(root) {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(MemexError::FileOpFailed {
-                path: root.to_path_buf(),
-                operation: "canonicalize root",
-                source: e,
-            });
-        }
-    };
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
     // Wiki has a flat namespace: <wiki_dir>/<slug>.md (depth 1).
     // Raw is content-addressed in 2 levels: <raw_dir>/<hh>/<rest> (depth 2).
     // Cap the walk so files dropped into subdirectories aren't silently
@@ -157,7 +149,7 @@ fn walk_dir(
     // forever as `missing-file:` in lint).
     let max_depth = if doc_type == "raw" { 2 } else { 1 };
     let mut out = Vec::new();
-    for entry in WalkDir::new(&canonical_root)
+    for entry in WalkDir::new(root)
         .follow_links(false)
         .max_depth(max_depth)
     {
@@ -179,10 +171,7 @@ fn walk_dir(
         if doc_type == "wiki" && path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let rel = match path.strip_prefix(memex.root()) {
-            Ok(p) => p.to_path_buf(),
-            Err(_) => path.to_path_buf(),
-        };
+        let rel = path.strip_prefix(memex.root()).unwrap_or(path).to_path_buf();
         if rel
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -419,9 +408,7 @@ mod tests {
         };
         std::fs::write(&raw_path, assemble_raw_file(&original_fm, body)).unwrap();
         crate::index_raw::index_raw_file(&memex, &raw_path, None).unwrap();
-        let raw_rel = raw_path
-            .strip_prefix(memex.root())
-            .unwrap()
+        let raw_rel = raw_path.strip_prefix(memex.root()).unwrap_or(&raw_path)
             .to_string_lossy()
             .to_string();
         let pre_hash = memex

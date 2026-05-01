@@ -100,18 +100,7 @@ impl Memex {
     /// error when the user's configured timeout is unusable.
     pub fn open(root: PathBuf) -> error::Result<Self> {
         let config = Config::load(&root)?;
-        let wiki_dir = config.wiki_dir(&root);
-        let raw_dir = config.raw_dir(&root);
-        fs::create_dir_all(&wiki_dir).map_err(|e| error::MemexError::FileOpFailed {
-            path: wiki_dir.clone(),
-            operation: "create wiki dir",
-            source: e,
-        })?;
-        fs::create_dir_all(&raw_dir).map_err(|e| error::MemexError::FileOpFailed {
-            path: raw_dir.clone(),
-            operation: "create raw dir",
-            source: e,
-        })?;
+        let (root, wiki_dir) = prepare_root(root, &config)?;
         let search = Bm25Search::open(&root.join(INDEX_DB_NAME))?;
 
         // Migration hint: if DB is empty but wiki/ has .md files, suggest rebuild.
@@ -143,18 +132,7 @@ impl Memex {
     }
 
     fn open_writer_with_config(root: PathBuf, config: Config) -> error::Result<Self> {
-        let wiki_dir = config.wiki_dir(&root);
-        let raw_dir = config.raw_dir(&root);
-        fs::create_dir_all(&wiki_dir).map_err(|e| error::MemexError::FileOpFailed {
-            path: wiki_dir.clone(),
-            operation: "create wiki dir",
-            source: e,
-        })?;
-        fs::create_dir_all(&raw_dir).map_err(|e| error::MemexError::FileOpFailed {
-            path: raw_dir.clone(),
-            operation: "create raw dir",
-            source: e,
-        })?;
+        let (root, wiki_dir) = prepare_root(root, &config)?;
 
         let lock_path = root.join(".lock");
         let lock_file =
@@ -185,6 +163,7 @@ impl Memex {
         })
     }
 
+    /// Canonical root (symlinks resolved at construction).
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -304,6 +283,29 @@ impl Memex {
     }
 }
 
+/// Create wiki/raw subdirs, then canonicalize the root once. Returns the
+/// canonical root and the (re-derived) wiki_dir under it. Resolving symlinks
+/// here lets all downstream paths (WalkDir, strip_prefix, lint scans) compare
+/// against a single canonical form — without it, macOS `/var → /private/var`
+/// makes `strip_prefix(memex.root())` silently fall back to absolute paths.
+fn prepare_root(root: PathBuf, config: &Config) -> error::Result<(PathBuf, PathBuf)> {
+    let wiki_dir = config.wiki_dir(&root);
+    let raw_dir = config.raw_dir(&root);
+    fs::create_dir_all(&wiki_dir).map_err(|e| error::MemexError::FileOpFailed {
+        path: wiki_dir.clone(),
+        operation: "create wiki dir",
+        source: e,
+    })?;
+    fs::create_dir_all(&raw_dir).map_err(|e| error::MemexError::FileOpFailed {
+        path: raw_dir,
+        operation: "create raw dir",
+        source: e,
+    })?;
+    let root = fs::canonicalize(&root).unwrap_or(root);
+    let wiki_dir = config.wiki_dir(&root);
+    Ok((root, wiki_dir))
+}
+
 /// True if `dir` contains any *.md file (non-recursive; wiki/ is flat).
 fn any_md_file(dir: &Path) -> bool {
     fs::read_dir(dir)
@@ -327,7 +329,9 @@ mod tests {
         let memex = Memex::open(root.clone()).unwrap();
         assert!(root.join("wiki").is_dir());
         assert!(root.join(INDEX_DB_NAME).exists());
-        assert_eq!(memex.root(), root);
+        // memex.root() is canonicalized; compare against canonical form
+        // since macOS resolves /var → /private/var on TempDir paths.
+        assert_eq!(memex.root(), fs::canonicalize(&root).unwrap());
     }
 
     #[test]
@@ -336,7 +340,7 @@ mod tests {
         let root = dir.path().join("memex");
         Memex::open(root.clone()).unwrap();
         let memex = Memex::open(root.clone()).unwrap();
-        assert_eq!(memex.root(), root);
+        assert_eq!(memex.root(), fs::canonicalize(&root).unwrap());
     }
 
     #[test]
@@ -453,8 +457,9 @@ mod tests {
         let memex = Memex::open(root.clone()).unwrap();
         assert!(memex.wiki_dir().is_dir());
         assert!(memex.raw_dir().is_dir());
-        assert_eq!(memex.wiki_dir(), root.join("wiki"));
-        assert_eq!(memex.raw_dir(), root.join("raw"));
+        let canonical = fs::canonicalize(&root).unwrap();
+        assert_eq!(memex.wiki_dir(), canonical.join("wiki"));
+        assert_eq!(memex.raw_dir(), canonical.join("raw"));
         assert!(root.join("index.db").exists());
     }
 

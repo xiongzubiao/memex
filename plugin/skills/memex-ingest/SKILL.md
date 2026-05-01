@@ -3,9 +3,10 @@ name: memex-ingest
 description: |
   Use when the user provides a URL, file, document, or text to add to their wiki,
   or says "ingest this", "add to wiki", "read this and create pages", or shares
-  material for knowledge capture. The skill keeps the user in the loop: propose
-  page list, get approval, write. For non-interactive ingest (hooks, scripts),
-  use `memex ingest --source <id>` directly instead.
+  material for knowledge capture. Routes through the daemon's EXTRACT/MERGE
+  pipeline; the user reviews proposed pages before any wiki write happens.
+  For non-interactive ingest (hooks, scripts), use `memex ingest --source <id>`
+  directly instead.
 ---
 
 # memex-ingest — interactive source ingestion
@@ -19,6 +20,191 @@ files), use `memex backfill <agent>` instead.
 `/memex-ingest https://example.com/article`,
 `/memex-ingest ~/Downloads/spec.pdf`.
 
+## How it works
+
+The skill is a thin orchestrator around four CLI subcommands:
+
+1. `memex source add <path-or-url>` — store the source content in the raw store; daemon returns a docid.
+2. `memex source plan <docid>` — daemon runs EXTRACT (chunked) + MERGE-dry-run for any overlapping wiki slugs; emits plan JSON to stdout.
+3. `memex plan show < plan.json` — local renderer; produces a human-readable table + diff blocks.
+4. `memex plan apply < plan.json` — daemon validates and writes each non-dropped proposal as a wiki page.
+
+The skill stores the plan at a deterministic path derived from the docid:
+`/tmp/memex-plan-<docid>.json`. The docid is content-addressed (sha256-derived),
+so this path is unique per source content and stable across the multi-step flow.
+The daemon stays stateless on plan content — it only ever sees the JSON via
+stdin/stdout.
+
+## How an agent should execute this
+
+This skill runs as a sequence of **discrete tool calls**, not as a single shell
+script. Each Bash tool call is its own subshell — shell variables (`$docid`,
+`$plan_file`) do **not** persist between calls. To carry state, the agent
+captures the docid from the first call's stdout and **interpolates the literal
+docid value** into every subsequent command (using `/tmp/memex-plan-<docid>.json`
+where `<docid>` is the actual value, e.g., `/tmp/memex-plan-75908e2.json`).
+
+Between Bash calls, the agent surfaces output to chat for the user to
+review, and uses its file-editing tool (whatever is available — Edit
+in Claude Code, equivalent in other agents) to mutate the plan JSON
+file in-place by single-field swaps. These are agent runtime tools,
+not shell commands.
+
+## Flow
+
+### Step 1 — Acquire content and store the source (one Bash call)
+
+For URLs, pipe `markitdown` directly into `source add`. For local files, pipe
+the file directly. **Do NOT `cat` the content into chat** — the bytes must go
+straight from the converter (or file) into `memex source add`'s stdin.
+
+```bash
+# URL case:
+docid=$(markitdown "$url" | memex source add "$url")
+
+# Local file case:
+docid=$(memex source add "$path" < "$path")
+
+echo "DOCID=$docid"
+```
+
+The agent captures the docid from `DOCID=` and uses the literal value (e.g.
+`75908e2`) in every subsequent step.
+
+If `memex source add` exits non-zero, paste its stderr to chat and abort.
+
+### Step 2 — Generate the plan (one Bash call, deterministic path)
+
+```bash
+memex source plan <docid> > /tmp/memex-plan-<docid>.json
+echo "rc=$? size=$(wc -c < /tmp/memex-plan-<docid>.json)"
+```
+
+Substitute `<docid>` with the literal value from Step 1.
+
+- **Empty file (size = 0) and rc=0**: EXTRACT yielded no extractable subjects.
+  Tell the user, `rm -f /tmp/memex-plan-<docid>.json`, and stop.
+- **Non-zero rc**: paste daemon stderr to chat and abort.
+
+### Step 3 — Render and review
+
+Render the plan once for the user:
+
+```bash
+memex plan show < /tmp/memex-plan-<docid>.json
+```
+
+Paste the output to chat. Then collect the user's review.
+
+**Decision rule (no judgment, no reframing):**
+
+1. If proposal count > 20 OR any title needs editing → **Path C** (editor handoff).
+2. Else if your agent has a structured question tool (e.g., Claude
+   Code's `AskUserQuestion`) → **Path A**. Use it even if the slugs
+   look clean. Don't downgrade to chat just because the plan looks
+   easy — the user still gets to confirm per-proposal.
+3. Else → **Path B** (chat directives).
+
+You may not pick Path B when AskUserQuestion is available. The chat
+fallback exists for agents like Codex / Gemini-CLI that don't have
+chip-style tools, not as a shortcut for "this looks simple."
+
+**Path A — Structured questions (≤20 proposals, AskUserQuestion available):**
+
+- **1–5 proposals:** ask per-proposal with options `accept` /
+  `rename slug` / `drop`. When the user picks `rename slug`, the
+  new slug comes back via the `Other` free-text channel.
+- **6–20 proposals:** ask only about proposals you flag as suspect
+  (slug contains a date like `2026-04`, a version qualifier like
+  `v3`, an episode word like `milestone`/`session`, or duplicates
+  an obvious wiki subject). Other proposals auto-accept.
+
+**Path B — Chat directives (only when AskUserQuestion is unavailable, ≤20 proposals):**
+
+End your chat message with this exact prompt line:
+
+> Reply `apply` to commit as-is, or send specific edits like
+> `drop <slug>; rename <slug> to <new-slug>` before approving.
+
+Wait for the user's reply. Parse it as `;`-separated directives:
+
+- `apply` → proceed to Step 4
+- `cancel` / `abort` → `rm -f /tmp/memex-plan-<docid>.json` and exit
+- `drop <slug>` → set `dropped: true` on that proposal
+- `rename <old-slug> to <new-slug>` → set `slug: "<new-slug>"`
+
+**Path C — Editor handoff (always for >20 proposals, or any title edit):**
+
+For **>20 proposals**: skip both inline paths (the `AskUserQuestion`
+schema caps at 4 questions per call and a directive list of that
+size is unwieldy). Tell the user the plan is at
+`/tmp/memex-plan-<docid>.json`, ask them to open it in their editor,
+edit `slug` / `title` / `dropped` fields, then reply with `apply`.
+
+**Title edits** always go through the editor handoff regardless of
+proposal count — the directive language and `AskUserQuestion`
+options don't cover title edits.
+
+---
+
+Apply each rename/drop via your agent's file-edit tool against
+`/tmp/memex-plan-<docid>.json` — single-field swap on the affected
+proposal, diff-only. Never re-emit the whole plan via `jq` or any
+rewrite path.
+
+After applying edits, re-run `memex plan show < /tmp/memex-plan-<docid>.json`
+and prompt again — the user may want a second pass. Loop until the
+user replies `apply` or `cancel`.
+
+### Step 4 — Apply, with bounded re-review loop
+
+The agent runs Step 4 in a loop, capped at `MAX_REREVIEWS = 5`. Each iteration
+is one Bash call that runs `memex plan apply` and decides what to do based on
+the exit code.
+
+**One iteration:**
+
+```bash
+memex plan apply < /tmp/memex-plan-<docid>.json > /tmp/memex-apply-<docid>.json
+rc=$?
+echo "RC=$rc"
+case $rc in
+  0)
+    cat /tmp/memex-apply-<docid>.json   # "committed N wiki pages"
+    rm -f /tmp/memex-plan-<docid>.json /tmp/memex-apply-<docid>.json
+    ;;
+  3|4)
+    mv /tmp/memex-apply-<docid>.json /tmp/memex-plan-<docid>.json
+    # Daemon emitted refreshed plan (rc=3) or partial-commit plan (rc=4).
+    # Agent inspects via plan show / Read and decides next step.
+    ;;
+  *)
+    rm -f /tmp/memex-apply-<docid>.json
+    ;;
+esac
+```
+
+**Agent decision per `rc`:**
+
+| `rc` | Meaning | Next action |
+|------|---------|-------------|
+| 0 | Full commit | Stop the loop. Run `memex lint`. |
+| 3 | Plan needs re-review (some target hash mismatched) | Increment `rereview_count`. If > `MAX_REREVIEWS` (5), emit `re-review exhausted after 5 cycles; retry later` to stderr and exit 1. Otherwise: render the refreshed plan with `memex plan show < /tmp/memex-plan-<docid>.json`, surface new diffs, and re-collect the user's review via the same Path A / B / C choice as Step 3. On cancel: `rm -f` and exit 1. |
+| 4 | Partial commit (some proposals failed) | Read `/tmp/memex-plan-<docid>.json` via the agent's file-read tool. Count proposals with `committed: true` and proposals with `error` populated. Surface a partial-commit summary to chat. Ask the user `retry` or `cancel`. On retry: re-run apply. On cancel: `rm -f` and exit 1. |
+| anything else | Hard error | Paste daemon stderr to chat, `rm -f`, exit 1. |
+
+The agent tracks `rereview_count` itself across iterations (in its own
+reasoning), since shell variables don't persist across Bash calls.
+
+### Step 5 — Lint
+
+After a successful `rc=0` apply, run `memex lint` once to check for dangling
+links and missing cross-references introduced by the new pages.
+
+```bash
+memex lint
+```
+
 ## Page organization
 
 Wiki pages anchor to **stable subjects**: a person, project, concept, tool,
@@ -27,281 +213,33 @@ place, or policy. The slug names the *subject*, not an event or date.
 - Prefer fewer, larger pages. New details land as H2 sections on the subject's
   existing page. Split only when a sub-topic is substantial and self-contained
   enough to stand on its own across future sessions.
-- Subject slugs, not episode slugs: `caroline` not
-  `caroline-stained-glass-church`; `oauth-migration` not
-  `oauth-token-bug-tuesday`.
-- Preserve specific facts: dates, times, numbers, names, places, direct quotes.
-  These are the retrieval handles — losing them is a failure.
-- Cross-link `[[other-slug]]` only to pages you know exist (just written, or
-  confirmed via `memex search` / `memex read`). Prefer plain text over a
-  guessed slug.
+- Subject slugs, not episode slugs: `kubernetes` not `kubernetes-2026-04-meeting`,
+  `auth-tokens` not `auth-tokens-redesign-v3`.
+- The daemon's EXTRACT prompt enforces these rules; the skill does not need to
+  reimplement them.
 
-**Worked example.** A meeting-notes file covering an OAuth migration, Alice's
-promotion, and a new testing strategy decided at a 2026-03 offsite:
+## Common mistakes — DO NOT
 
-```
-bad:  team-offsite-2026-03, alice-promotion-2026-03,
-      oauth-migration-offsite-notes, testing-strategy-offsite
-good: oauth-migration  (+ H2 "Offsite 2026-03 planning")
-      alice            (+ H2 "Promoted to senior, 2026-03")
-      testing-strategy (+ H2 "2026-03 revision")
-```
+- **Do not** use `memex source add` + `memex write` directly. That bypasses
+  the daemon's EXTRACT/MERGE pipeline and produces title-derived slugs that
+  violate the worker prompt's subject-extraction rules. Always use the
+  `source plan` + `plan show` + `plan apply` triple.
+- **Do not** `cat` source content into chat. The bytes go from converter →
+  `memex source add` stdin → daemon raw store, and never enter your context.
+- **Do not** parse the plan JSON yourself. Use `memex plan show` for rendering
+  and your agent's file-edit tool for single-field slug / dropped mutations.
+- **Do not** use `mktemp` for the plan file. Each Bash call is its own
+  subshell, so a `mktemp`-derived path can't be carried across calls without
+  re-deriving it. The deterministic `/tmp/memex-plan-<docid>.json` path is
+  recoverable from the docid, which the agent already has.
+- **Do not** edit the proposal `body` field. Body editing is unsupported (the
+  daemon doesn't validate); if you need to change content, edit the wiki page
+  directly via `memex write` after the apply lands.
 
-The event becomes a date *inside* each subject page, not its own anchor.
+## Token efficiency
 
-## Step 1: acquire the content
-
-> **Required setup before first use:**
->
-> ```
-> uv tool install 'markitdown[all]'
-> ```
->
-> The `[all]` extras are load-bearing. Bare `markitdown` rejects PDFs,
-> DOCX, audio, etc. with `MissingDependencyException`. Install `uv` from
-> https://github.com/astral-sh/uv if you don't already have it — it
-> avoids PEP 668 issues on Debian/Ubuntu and is faster than pipx. For
-> `agent-browser`, install per its own docs. Memex itself does not
-> fetch or convert.
-
-Pick the tool based on what the source is:
-
-- **Local plain text** (`.md`, `.txt`, `.rst`, `.org`) — read with the `Read`
-  tool directly. No conversion needed.
-- **Local binary doc** (`.pdf`, `.docx`, `.pptx`, `.xlsx`, `.html`, audio) —
-  `markitdown <path>`. One tool covers all these formats.
-- **Static URL** (blog, docs, news, public README) — `markitdown <url>`.
-  Single HTTP request. Handles HTML, PDF, DOCX, audio, YouTube transcripts.
-- **JS-rendered URL** (SPA, dashboard, app shell) — `agent-browser` then
-  `markitdown -x html`. Static fetch returns a skeleton, need a real
-  browser to render.
-- **Authenticated / paywalled URL** — `agent-browser` after running
-  `/setup-browser-cookies`, then `markitdown -x html`.
-
-### Decision flow for URLs
-
-```
-1. content=$(markitdown "$arg")        # try static fetch first
-2. inspect $content
-3. is it the article body?              ──yes──> use it
-   ↓ no (skeleton, "Enable JavaScript", login wall, mostly chrome)
-4. fall back to agent-browser
-```
-
-**Verified agent-browser invocation** (these are the actual commands, run
-`agent-browser --help` to see the full surface):
-
-```
-agent-browser open "$arg"
-agent-browser wait 2000                              # let JS render
-content=$(agent-browser get html body | markitdown -x html)
-final_url=$(agent-browser get url)
-title=$(agent-browser get title)
-agent-browser close
-```
-
-If `agent-browser` isn't on PATH, tell the user the page appears JS-rendered
-and recommend installing it (or pasting rendered content manually).
-
-### Detect login redirects
-
-A successful render can still land on a login page. Inspect `final_url` and
-`title`:
-
-- URL changed to a known SSO host (`id.atlassian.com`, `accounts.google.com`,
-  `login.microsoftonline.com`, `github.com/login`, etc.) → login redirect.
-- Title or first lines of `content` contain "Log in", "Sign in", "Log in to
-  continue" → login wall.
-
-On a detected login wall, **stop and tell the user**:
-
-> "The page is behind authentication. Import your browser's session cookies
-> with `/setup-browser-cookies` (pick the relevant domain), then re-run
-> `/memex-ingest <url>`."
-
-Do not write a login-page-as-content into memex.
-
-### Always propagate converter failures
-
-Use `set -o pipefail`, or check exit codes explicitly. If both tools fail or
-the result is empty, stop and report what failed — do not proceed with empty
-content. (The daemon will reject empty stdin with a clear error anyway, but
-catching it here saves a round trip and gives a more pointed message.)
-
-## Step 2: store the source, get a docid
-
-Once `$content` and `$arg` (the source identifier) are set, store the source
-once:
-
-```
-src=$(printf '%s' "$content" | memex source add "$arg")
-echo "stored as docid $src"
-```
-
-`memex source add` is idempotent on content hash — re-running with the same
-content returns the same docid without duplicate storage. Add `--collection
-<name>` (repeatable) to scope the source to one or more collections.
-
-Verify with `memex source list` (or `memex source show "$src"`).
-
-## Step 3: propose pages, get approval
-
-Identify the stable subjects in `$content`. Draft a list:
-
-```
-- <slug-1> — one-line rationale for why this is a separate page
-- <slug-2> — ...
-```
-
-Present it to the user. Wait for approval or adjustments. The user might say
-"merge slug-1 and slug-2", or "skip slug-3, those facts go on the existing
-`alice` page". Apply their feedback before writing.
-
-## Step 4: write each approved page
-
-For each page, dedup against existing wiki content first:
-
-```
-# Does a page with this slug or close title already exist?
-memex search "<title>"
-```
-
-- **Slug printed** → an existing page covers this subject. Read it via
-  `memex read <slug>`, confirm with the user that the new content should be
-  merged, then write with `--force`:
-  ```
-  memex write "<title>" --force --source "$src" --quiet < <merged-body>
-  ```
-- **No output** → it's new. Write without `--force`:
-  ```
-  memex write "<title>" --source "$src" --quiet < <body>
-  ```
-
-The `--source "$src"` flag attaches the source's path identifier to the
-page's `sources:` frontmatter list, so `memex source delete` and link
-audits can find the reference.
-
-When merging, **preserve every specific fact from both sides**. Extend
-existing H2 sections or add new ones. The merged body is the union, not the
-intersection.
-
-After each write, read the command's output and react:
-
-- **`linked: a, b`** — informational; pages `a`, `b` got auto-linked into
-  the new body. No action required.
-- **`backlinked: x, y`** — informational; existing pages `x`, `y` were
-  rewritten with `[[<new-slug>]]`. No action required.
-- **`suggest-create: slug-1, slug-2`** — your body referenced
-  `[[slug-1]]` or `[[slug-2]]` but the daemon found no page with that
-  slug. For each:
-  - **Typo** (you meant a slug that exists, just spelled it wrong) →
-    re-write the page with the corrected reference: `memex write
-    "<title>" --force --source "$src" --quiet < <fixed-body>`.
-  - **Page should exist** (the source material covers it but you
-    missed splitting it out) → write the missing page: `memex write
-    "<title>" --source "$src" --quiet < <body>`.
-  - **Intentional placeholder** (you want to flag a gap for later) →
-    leave it; lint will continue to remind. Mention it to the user.
-
-## Step 5: verify and act on lint findings
-
-```
-memex lint
-```
-
-Each finding maps to an action:
-
-- **`stale-index: <slug>`** / **`outdated-embeddings: <slug>`** — daemon
-  reconcile and watcher heal these continuously; if you see them, run
-  `memex lint --fix` (daemon-routed, single writer).
-- **`untracked: <file>`** / **`missing-file: <slug>`** — out-of-band
-  filesystem state. Report to the user; don't auto-repair.
-- **`missing-link: <page> -> [[<slug>]]`** — `<page>`'s body mentions
-  `<slug>`'s title or stem-as-words but isn't bracketed. Decide: if the
-  mention is genuinely a navigation cue, re-write `<page>` with explicit
-  `[[<slug>]]`. If it's incidental prose (the mention happens to share
-  text with a page title but isn't really referring to that page), leave
-  it.
-- **`dangling: <page> -> [[<slug>]]`** — `<page>` references a slug that
-  doesn't exist. The target was deleted or renamed. Decide: remove the
-  reference, point it at the correct existing slug, or restore the
-  missing page if it was deleted in error.
-
-After running lint, summarize what you found and what you did to the user.
-
-## Frontmatter the wiki page should have
-
-```yaml
----
-title: Page Title Here
-summary: One-line summary (optional)
-tags: [tag1, tag2]
-created_at: 2026-04-21T00:00:00Z
-updated_at: 2026-04-21T00:00:00Z
-sources:
-  - https://example.com/article
----
-```
-
-Wiki links are kebab-case, matching the filename without `.md`:
-`[[oauth-migration]]`, not `[[OAuth Migration]]`.
-
-`memex write --source "$src"` injects the `sources:` entry automatically; you
-don't need to put it in the body you pipe in.
-
-## Title choice affects auto cross-linking
-
-`memex write` auto-cross-links body mentions of existing page titles, and
-backlinks existing pages that mention a new page's title. The eligibility
-rule is conservative: only **multi-token titles** auto-link. Single-token
-titles — short OR long — are always skipped because the case-insensitive
-match can't tell a navigation cue from generic English prose.
-
-- **Eligible**: multi-token titles (`oauth-migration`, `auth-tokens`,
-  `rest-patterns`, `performance-tuning`, `kubernetes-deployment`).
-- **Not eligible**: every single-token title — short ones like `api`,
-  `auth`, `bob`, `alice`, AND longer ones like `caching`, `kubernetes`,
-  `performance`, `database`, `testing`. The cutoff isn't about length;
-  it's about whether the title is distinctive enough to mean a
-  reference whenever it appears in prose.
-
-Implications when picking titles:
-
-- Prefer the descriptive phrase form whenever it exists:
-  `caching-strategies` over `caching`, `auth-tokens` over `auth`,
-  `kubernetes-deployment` over `kubernetes`. Multi-token titles
-  integrate into the graph automatically; single-token ones do not.
-- For unavoidable single-token titles (people's names, established
-  acronyms, genuinely-one-word concepts), the LLM types `[[stem]]`
-  explicitly when it means a reference. Auto won't fill it in.
-  Example body: `Alice met [[bob]] in [[italy]].` rather than
-  `Alice met Bob in Italy.`
-
-`memex write` reports what got auto-linked in its output:
-- `linked: a, b` — existing pages this body now references
-- `backlinked: x, y` — existing pages that now link to this page
-- `suggest-create: z` — `[[z]]` references in the body whose target
-  doesn't exist (typo or pending creation)
-
-## Common mistakes
-
-- **Episode-based slugs** (`alice-promotion-2026-03`) — use `alice` plus an H2
-  `## Promoted to senior, 2026-03` instead.
-- **A new page per anecdote** — extend the subject page.
-- **Dropping dates / names / numbers / quotes during merge.** These are the
-  retrieval handles. Treat them as load-bearing.
-- **Inventing `[[slug]]` targets** without verifying they exist. The
-  daemon will surface these as `suggest-create:` in write output and as
-  `dangling:` in lint output — react to them rather than ignore.
-- **Treating `suggest-create:` as background noise.** It's actionable
-  feedback: typo, missing page to create, or a flagged gap.
-- **Ignoring `missing-link:` from lint** when the mention really is
-  meant as a navigation reference. Single-token titles (`alice`,
-  `bob`, `caching`, `kubernetes`) never auto-link regardless of
-  length; the LLM is the only path to bracket them.
-- **Skipping the dedup check**, or `--force`-ing without asking.
-- **Piping content to `memex ingest --source`** instead of using the
-  `source add` + `write` flow above. That bypasses the propose/approve loop
-  this skill exists for.
-- **Writing a login-page render as if it were the article.** Detect the
-  redirect, stop, ask the user to import cookies.
+- Source content goes converter → daemon → worker model; never enters chat.
+- Plan rendering is `memex plan show` output (table + diff blocks), not raw JSON.
+- Plan mutations use your agent's file-edit tool against
+  `/tmp/memex-plan-<docid>.json` (single-field swap, diff-only), not
+  `jq` re-emission of the whole plan.

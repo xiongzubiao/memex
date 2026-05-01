@@ -1,2 +1,3 @@
 - Merge mode A and B in EXTRACT task
 - TaskKind::Rerank for --raw
+- Per-write journal for `plan apply` crash atomicity. Current `plan apply` (per `2026-04-30-memex-ingest-skill-redesign.md` §1.3 Crash-consistency limitation) has a microsecond-wide window where a daemon crash between a wiki write and the stdout flush leaves the wiki updated but the skill's plan file showing the proposal as uncommitted. Retry produces a double-merge. Fix: daemon writes "about to commit slug X with body Y" to a journal file before each wiki write; on daemon restart, journal entries are reconciled (committed if wiki matches journal target body, retried otherwise). Deferred until usage observes the failure mode.

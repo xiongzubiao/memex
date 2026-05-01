@@ -98,6 +98,7 @@ fn test_state(
     let writer_session = memex_cli::daemon::handler::WriterSession {
         reader: reader_session,
         slug_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        content_hash_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     HandlerState {
         pid: 1234,
