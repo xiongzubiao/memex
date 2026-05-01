@@ -249,11 +249,154 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
         )));
     }
 
-    // (Task 13: per-proposal commit logic)
-    let _ = (plan, memex);
-    error_events(DaemonError::Internal(
-        "plan_apply: per-proposal logic not yet implemented".into(),
-    ))
+    let wiki_dir = memex.wiki_dir();
+    // Take ownership of proposals so we can mutate per-proposal state.
+    let mut plan = plan;
+    let mut committed_slugs: Vec<String> = Vec::new();
+    let mut any_failed = false;
+    let mut any_rereview = false;
+
+    for i in 0..plan.proposals.len() {
+        if plan.proposals[i].dropped || plan.proposals[i].committed {
+            continue;
+        }
+        let target = plan.proposals[i].slug.clone();
+
+        // Acquire per-slug writer lock.
+        let _slug_guard =
+            crate::daemon::handler::acquire_slug_locks(&state.writer, vec![target.clone()]).await;
+
+        let target_path = memex_core::wiki::wiki_path_for_slug(&wiki_dir, &target);
+        let exists = target_path.exists();
+        let saved_hash = plan.proposals[i].merge_target_hash.clone();
+        let saved_target_slug = plan.proposals[i].merge_target_slug.clone();
+
+        if !exists {
+            // New page — clear any stale merge fields.
+            plan.proposals[i].merge_target_slug = None;
+            plan.proposals[i].merge_target_hash = None;
+            plan.proposals[i].merge_diff = None;
+            // Commit.
+            let proposal_clone = plan.proposals[i].clone();
+            match apply_proposal_to_wiki(&proposal_clone, &plan.source.id, state).await {
+                Ok(()) => {
+                    plan.proposals[i].committed = true;
+                    plan.proposals[i].error = None;
+                    committed_slugs.push(target.clone());
+                }
+                Err(e) => {
+                    plan.proposals[i].error = Some(e.message());
+                    any_failed = true;
+                }
+            }
+            drop(_slug_guard);
+            continue;
+        }
+
+        // Slug exists — staleness check under lock.
+        let existing_full = match std::fs::read_to_string(&target_path) {
+            Ok(s) => s,
+            Err(e) => {
+                plan.proposals[i].error = Some(format!("read existing: {e}"));
+                any_failed = true;
+                drop(_slug_guard);
+                continue;
+            }
+        };
+        let existing_body = match memex_core::validate::parse_frontmatter(&existing_full) {
+            Ok((_, body)) => body.to_string(),
+            Err(_) => existing_full.clone(),
+        };
+        let existing_hash = memex_core::storage::content_hash(existing_body.as_bytes());
+
+        let hash_matches = saved_hash.as_deref() == Some(existing_hash.as_str());
+        let slug_matches = saved_target_slug.as_deref() == Some(target.as_str());
+
+        if hash_matches && slug_matches {
+            // Commit the plan body as-is.
+            let proposal_clone = plan.proposals[i].clone();
+            match apply_proposal_to_wiki(&proposal_clone, &plan.source.id, state).await {
+                Ok(()) => {
+                    plan.proposals[i].committed = true;
+                    plan.proposals[i].error = None;
+                    committed_slugs.push(target.clone());
+                }
+                Err(e) => {
+                    plan.proposals[i].error = Some(e.message());
+                    any_failed = true;
+                }
+            }
+            drop(_slug_guard);
+            continue;
+        }
+
+        // Otherwise: stale or new overlap. Drop the slug lock before LLM call.
+        drop(_slug_guard);
+
+        // Re-MERGE.
+        let merge_pair = crate::daemon::queue::MergePair {
+            slug: target.clone(),
+            proposed: plan.proposals[i].body.clone(),
+            existing: existing_body.clone(),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let job = crate::daemon::queue::BackendJob::Merge(crate::daemon::queue::MergeJob {
+            pages: vec![merge_pair],
+            reply: tx,
+        });
+        if state.jobs.submit(job).await.is_err() {
+            plan.proposals[i].error = Some("merge queue closed".into());
+            any_failed = true;
+            continue;
+        }
+        match rx.await {
+            Ok(Ok(reply)) => {
+                if let Some(merged) = reply.merged_pages.into_iter().next() {
+                    plan.proposals[i].title = merged.title;
+                    plan.proposals[i].tags = merged.tags;
+                    plan.proposals[i].body = merged.body.clone();
+                    plan.proposals[i].merge_diff =
+                        Some(compute_unified_diff(&existing_body, &merged.body));
+                    plan.proposals[i].merge_target_slug = Some(target.clone());
+                    plan.proposals[i].merge_target_hash = Some(existing_hash.clone());
+                    any_rereview = true;
+                } else {
+                    plan.proposals[i].error = Some("merge returned no pages".into());
+                    any_failed = true;
+                }
+            }
+            Ok(Err(e)) => {
+                plan.proposals[i].error = Some(format!("merge worker: {e:?}"));
+                any_failed = true;
+            }
+            Err(_) => {
+                plan.proposals[i].error = Some("merge worker dropped reply".into());
+                any_failed = true;
+            }
+        }
+    }
+
+    // Decide outcome (re-review takes precedence over partial-failure).
+    if any_rereview {
+        let json = match serde_json::to_string(&plan) {
+            Ok(s) => s,
+            Err(e) => return error_events(DaemonError::Internal(format!("serialize: {e}"))),
+        };
+        return vec![Event::PlanContent { json }, Event::Done { status: 3 }];
+    }
+    if any_failed {
+        let json = match serde_json::to_string(&plan) {
+            Ok(s) => s,
+            Err(e) => return error_events(DaemonError::Internal(format!("serialize: {e}"))),
+        };
+        return vec![Event::PlanContent { json }, Event::Done { status: 4 }];
+    }
+    vec![
+        Event::PlanApplied {
+            committed: committed_slugs,
+        },
+        Event::Done { status: 0 },
+    ]
 }
 
 /// Write a proposal to the wiki using the merge-aware path. New pages
