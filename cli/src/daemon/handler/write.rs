@@ -44,10 +44,15 @@ pub(super) async fn handle_write(
     // core/src/storage.rs::atomic_write:
     //   .{slug}.md.{nonce}.tmp
     //   1 + slug + 3 + 1 + 8 + 4    (nonce = 8 hex chars)
-    // Reject if it would exceed NAME_MAX. Without this guard the user
-    // sees a confusing OS error pointing at the .tmp path.
+    // Reject if it would exceed the practical filename limit. Without
+    // this guard the user sees a confusing OS error pointing at the
+    // .tmp path. We use 255 as the conservative cross-platform limit:
+    // every modern filesystem (HFS+, APFS, ext4, NTFS, FAT32) allows
+    // at least 255 bytes per filename. libc::NAME_MAX is unavailable
+    // on Apple targets in libc 0.2, so we don't depend on it.
     const TEMP_OVERHEAD: usize = 1 + 3 + 1 + 8 + 4;
-    let max_slug_len = (libc::NAME_MAX as usize).saturating_sub(TEMP_OVERHEAD);
+    const NAME_MAX: usize = 255;
+    let max_slug_len = NAME_MAX.saturating_sub(TEMP_OVERHEAD);
     if slug.len() > max_slug_len {
         return error_events(DaemonError::BadRequest(format!(
             "slug exceeds {max_slug_len} bytes after normalization (got {} bytes); shorten the title",
