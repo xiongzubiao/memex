@@ -685,12 +685,17 @@ fn run_write(
         anyhow::bail!("empty content");
     }
 
-    // Extract tags from frontmatter if present
-    let tags = memex_core::search::parse_page_for_indexing(&content)
-        .map(|(_, _, tags_str, _, _)| {
-            tags_str
-                .split(',')
-                .map(|t| t.trim().to_string())
+    // Extract tags from frontmatter if present. Use the delimiter-only
+    // split (not parse_page_for_indexing, which strict-deserializes the
+    // full PageFrontmatter and fails when piped content lacks
+    // created_at/updated_at — silently dropping the user's tags).
+    let tags = memex_core::storage::split_frontmatter(&content)
+        .and_then(|(yaml, _)| serde_yaml::from_str::<serde_yaml::Value>(yaml).ok())
+        .and_then(|v| v.get("tags").cloned())
+        .and_then(|v| v.as_sequence().cloned())
+        .map(|seq| {
+            seq.into_iter()
+                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
         })
