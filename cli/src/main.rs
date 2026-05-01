@@ -616,7 +616,8 @@ fn run_source_plan(docid: &str) -> anyhow::Result<()> {
                     return Ok::<(), anyhow::Error>(());
                 }
                 memex_cli::daemon::protocol::Event::EmptyExtract { .. } => {
-                    // Per spec §1.1: empty stdout, exit 0.
+                    // No extractable subjects → empty stdout, exit 0;
+                    // skill surfaces a user-facing message itself.
                     return Ok(());
                 }
                 memex_cli::daemon::protocol::Event::Error { message, .. } => {

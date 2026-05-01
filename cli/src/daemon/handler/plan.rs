@@ -2,7 +2,7 @@
 
 use crate::daemon::error::DaemonError;
 use crate::daemon::handler::{
-    HandlerState, acquire_content_hash_lock, error_events, get_or_open_memex,
+    HandlerState, acquire_content_hash_lock, error_events, get_or_open_memex, read_file_capped,
 };
 use crate::daemon::plan::{Plan, PlanSource, Proposal};
 use crate::daemon::protocol::Event;
@@ -34,14 +34,15 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
     // Acquire the per-content-hash lock for the EXTRACT/MERGE phase.
     let _hash_guard = acquire_content_hash_lock(&state.writer, &content_hash).await;
 
-    // Read source content from raw store and strip frontmatter.
+    // Read source content from raw store and strip frontmatter. Async +
+    // size-capped: source files can be up to INGEST_MAX_BYTES (100 MB);
+    // a sync read would stall the tokio worker for the duration.
     let raw_path = memex.root().join(&source_doc.path);
-    let raw_body = match std::fs::read_to_string(&raw_path) {
-        Ok(b) => b,
-        Err(e) => {
-            return error_events(DaemonError::Internal(format!("read source: {e}")));
-        }
-    };
+    let raw_body =
+        match read_file_capped(&raw_path, crate::daemon::config::INGEST_MAX_BYTES as u64).await {
+            Ok(b) => b,
+            Err(e) => return error_events(e),
+        };
     let (fm, body) = match memex_core::raw::parse_raw_frontmatter(&raw_body) {
         Ok(p) => p,
         Err(e) => {
@@ -92,7 +93,7 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
         }
 
         // Existing wiki page → MERGE-dry-run.
-        let existing_full = match std::fs::read_to_string(&target_path) {
+        let existing_full = match tokio::fs::read_to_string(&target_path).await {
             Ok(s) => s,
             Err(e) => {
                 return error_events(DaemonError::Internal(format!(
@@ -164,7 +165,8 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
         }
     }
 
-    // Drop the lock before stdout streaming (per spec §1.1).
+    // The lock guarded the LLM phase (EXTRACT + MERGE-dry-run) only;
+    // streaming the plan back is read-only on shared state.
     drop(_hash_guard);
 
     let plan = Plan {
@@ -190,8 +192,9 @@ fn merge_failure_proposal(
     page: &crate::daemon::queue::ExtractedPage,
     reason: &str,
 ) -> Proposal {
-    // Per spec §4.5: error populated, hash/diff nullified, slug stays
-    // populated as informational, body stays as un-merged EXTRACT output.
+    // hash/diff nullified so a future apply can't take the matched-hash
+    // commit path with un-merged content; slug stays populated as a
+    // breadcrumb for the user; body is the un-merged EXTRACT output.
     Proposal {
         index: idx,
         slug: page.slug.clone(),
@@ -290,7 +293,7 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
         }
 
         // Slug exists — staleness check under lock.
-        let existing_full = match std::fs::read_to_string(&target_path) {
+        let existing_full = match tokio::fs::read_to_string(&target_path).await {
             Ok(s) => s,
             Err(e) => {
                 plan.proposals[i].error = Some(format!("read existing: {e}"));
@@ -397,67 +400,33 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
 
 /// Write a proposal to the wiki using the merge-aware path. New pages
 /// get fresh frontmatter; merges preserve `created_at` and accumulate
-/// `sources:`. Caller holds the per-slug write lock around this call
-/// (see spec §1.3 step 4).
-///
-/// Title and tags are LLM-controlled (MERGE output) or user-controlled
-/// (plan JSON edits), so each is checked for control characters before
-/// interpolation into YAML — same guard `handle_write` applies for the
-/// direct-write path. Without it, an embedded newline lets the proposal
-/// inject arbitrary YAML keys into the frontmatter; the resulting wiki
-/// page is unparseable on reconcile and silently disappears from search.
+/// `sources:`. Caller holds the per-slug write lock around this call.
 pub(super) async fn apply_proposal_to_wiki(
     proposal: &Proposal,
     source_docid: &str,
     state: &HandlerState,
 ) -> Result<(), DaemonError> {
-    if proposal.title.chars().any(|c| c.is_control()) {
-        return Err(DaemonError::BadRequest(format!(
-            "proposal {}: title contains control characters",
-            proposal.index
-        )));
-    }
-    for (tidx, tag) in proposal.tags.iter().enumerate() {
-        if tag.chars().any(|c| c.is_control()) {
-            return Err(DaemonError::BadRequest(format!(
-                "proposal {}: tag[{}] contains control characters",
-                proposal.index, tidx
-            )));
-        }
-    }
-
     let memex = get_or_open_memex(state.writer.memex_handle(), state.writer.bound_root())?;
     let wiki_path = memex_core::wiki::wiki_path_for_slug(&memex.wiki_dir(), &proposal.slug);
 
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-    let yaml_tags = if proposal.tags.is_empty() {
-        "[]".to_string()
-    } else {
-        format!("\n  - {}", proposal.tags.join("\n  - "))
-    };
+    let now_dt = chrono::Utc::now();
+    let new_ref = format!("#{source_docid}");
 
     let (created_at, sources) = if wiki_path.exists() {
-        // Merge case: reuse the canonical frontmatter parser instead of
-        // hand-rolling YAML — `validate::parse_frontmatter` returns a
-        // structured `PageFrontmatter` with typed `created_at` and
-        // `sources` fields. If parsing fails (malformed page on disk),
-        // fall back to fresh values rather than aborting the write.
-        let existing = std::fs::read_to_string(&wiki_path)
+        // Reuse the canonical parser. If parsing fails (malformed page
+        // on disk), fall back to fresh values rather than aborting.
+        let existing = tokio::fs::read_to_string(&wiki_path)
+            .await
             .map_err(|e| DaemonError::Internal(format!("read existing wiki: {e}")))?;
         match memex_core::validate::parse_frontmatter(&existing) {
             Ok((fm, _)) => {
-                let created_at = fm
-                    .created_at
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
                 let mut sources = fm.sources;
-                let new_ref = format!("#{source_docid}");
                 if !sources.contains(&new_ref) {
                     sources.push(new_ref);
                 }
-                (created_at, sources)
+                (fm.created_at, sources)
             }
-            Err(_) => (now.clone(), vec![format!("#{source_docid}")]),
+            Err(_) => (now_dt, vec![new_ref]),
         }
     } else {
         if let Some(parent) = wiki_path.parent() {
@@ -465,26 +434,26 @@ pub(super) async fn apply_proposal_to_wiki(
                 .await
                 .map_err(|e| DaemonError::Internal(format!("create wiki dir: {e}")))?;
         }
-        (now.clone(), vec![format!("#{source_docid}")])
+        (now_dt, vec![new_ref])
     };
 
-    let yaml_sources = if sources.is_empty() {
-        "[]".to_string()
-    } else {
-        format!(
-            "\n  - {}",
-            sources
-                .iter()
-                .map(|s| format!("\"{s}\""))
-                .collect::<Vec<_>>()
-                .join("\n  - ")
-        )
-    };
-    let frontmatter = format!(
-        "title: {}\ntags: {}\ncreated_at: {}\nupdated_at: {}\nsources: {}\n",
-        proposal.title, yaml_tags, created_at, now, yaml_sources
-    );
-    let file = format!("---\n{frontmatter}---\n\n{}", proposal.body);
+    // Title comes from the LLM (or a user-edited plan); collapse newlines
+    // to spaces so the YAML stays a single-line scalar — matches the
+    // sanitization in `build_wiki_records`. serde_yaml escapes any
+    // remaining special chars, so YAML injection via title/tags isn't
+    // possible regardless of source content.
+    let safe_title = proposal.title.replace(['\n', '\r'], " ");
+    let yaml = serde_yaml::to_string(&memex_core::types::PageFrontmatterRef {
+        title: &safe_title,
+        summary: None,
+        tags: &proposal.tags,
+        collections: &[],
+        created_at,
+        updated_at: now_dt,
+        sources: &sources,
+    })
+    .map_err(|e| DaemonError::Internal(format!("frontmatter serialize: {e}")))?;
+    let file = format!("---\n{yaml}---\n\n{}", proposal.body);
     crate::daemon::handler::async_atomic_write(wiki_path.clone(), file.into_bytes()).await?;
 
     // Index after write so chunks/embeddings stay consistent.
@@ -594,9 +563,11 @@ mod tests {
             .await
             .unwrap();
         let body = std::fs::read_to_string(root.join("wiki/new-page.md")).unwrap();
-        assert!(body.contains("title: New Page"));
-        assert!(body.contains("\"#src-test\""));
-        assert!(body.contains("fresh body"));
+        let (fm, parsed_body) = memex_core::validate::parse_frontmatter(&body).unwrap();
+        assert_eq!(fm.title, "New Page");
+        assert_eq!(fm.tags, vec!["t1".to_string()]);
+        assert_eq!(fm.sources, vec!["#src-test".to_string()]);
+        assert!(parsed_body.contains("fresh body"), "got: {parsed_body}");
     }
 
     #[tokio::test]
@@ -624,24 +595,32 @@ mod tests {
             .await
             .unwrap();
         let body = std::fs::read_to_string(root.join("wiki/mmai.md")).unwrap();
-        assert!(body.contains("created_at: 2024-01-01"), "got: {body}");
-        assert!(body.contains("\"#src-old\""), "old source dropped: {body}");
-        assert!(body.contains("\"#src-new\""), "new source missing: {body}");
-        assert!(body.contains("merged body"));
+        let (fm, parsed_body) = memex_core::validate::parse_frontmatter(&body).unwrap();
+        assert_eq!(
+            fm.created_at.format("%Y-%m-%d").to_string(),
+            "2024-01-01",
+            "created_at was not preserved"
+        );
+        assert_eq!(
+            fm.sources,
+            vec!["#src-old".to_string(), "#src-new".to_string()]
+        );
+        assert!(parsed_body.contains("merged body"));
     }
 
     #[tokio::test]
-    async fn apply_proposal_rejects_title_with_control_chars() {
-        // LLM Output Trust Boundary: a newline in the title would inject
-        // YAML keys into the frontmatter. Reject before writing.
+    async fn apply_proposal_sanitizes_newline_title_no_yaml_injection() {
+        // A title with a newline must NOT inject extra YAML keys: it's
+        // collapsed to a space (matching `build_wiki_records`) and then
+        // serialized through serde_yaml, which escapes anything else.
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let _ = memex_core::Memex::open(root.clone()).unwrap();
         let state = test_state(root.clone());
         let proposal = Proposal {
             index: 0,
-            slug: "evil".into(),
-            title: "Hello\nsources:\n  - \"#fake\"\nbogus: ".into(),
+            slug: "no-injection".into(),
+            title: "Hello\nsources:\n  - \"#fake\"\nbogus: x".into(),
             tags: vec![],
             body: "body".into(),
             merge_target_slug: None,
@@ -649,51 +628,62 @@ mod tests {
             merge_diff: None,
             dropped: false,
             committed: false,
-            original_slug: "evil".into(),
+            original_slug: "no-injection".into(),
             error: None,
         };
-        let err = super::apply_proposal_to_wiki(&proposal, "src-x", &state)
+        super::apply_proposal_to_wiki(&proposal, "src-x", &state)
             .await
-            .unwrap_err();
-        let msg = err.message();
-        assert!(msg.contains("title"), "got: {msg}");
-        assert!(msg.contains("control"), "got: {msg}");
-        // No file should have been written.
+            .unwrap();
+        let body = std::fs::read_to_string(root.join("wiki/no-injection.md")).unwrap();
+        let (fm, _) = memex_core::validate::parse_frontmatter(&body).unwrap();
+        // Sources must NOT include the injected ref — it's safely
+        // captured as part of the title's quoted scalar instead.
+        assert_eq!(fm.sources, vec!["#src-x".to_string()]);
         assert!(
-            !root.join("wiki/evil.md").exists(),
-            "wiki page must not be written when title is rejected"
+            !fm.title.contains('\n'),
+            "title still has newline: {:?}",
+            fm.title
+        );
+        // The malicious payload should be IN the title (escaped), proving
+        // the round-trip is structurally safe.
+        assert!(
+            fm.title.contains("#fake") && fm.title.contains("bogus"),
+            "title should contain the literal injection attempt: {:?}",
+            fm.title
         );
     }
 
     #[tokio::test]
-    async fn apply_proposal_rejects_tag_with_control_chars() {
+    async fn apply_proposal_serializes_tag_with_special_chars() {
+        // A tag with embedded YAML-special chars must serialize back to a
+        // single tag (escaped), not inject new fields.
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let _ = memex_core::Memex::open(root.clone()).unwrap();
         let state = test_state(root.clone());
+        let evil_tag = "evil\nbogus: x";
         let proposal = Proposal {
             index: 0,
-            slug: "evil-tag".into(),
+            slug: "tag-test".into(),
             title: "OK".into(),
-            tags: vec!["clean".into(), "evil\nbogus: x".into()],
+            tags: vec!["clean".into(), evil_tag.into()],
             body: "body".into(),
             merge_target_slug: None,
             merge_target_hash: None,
             merge_diff: None,
             dropped: false,
             committed: false,
-            original_slug: "evil-tag".into(),
+            original_slug: "tag-test".into(),
             error: None,
         };
-        let err = super::apply_proposal_to_wiki(&proposal, "src-x", &state)
+        super::apply_proposal_to_wiki(&proposal, "src-x", &state)
             .await
-            .unwrap_err();
-        let msg = err.message();
-        assert!(msg.contains("tag[1]"), "got: {msg}");
-        assert!(
-            !root.join("wiki/evil-tag.md").exists(),
-            "wiki page must not be written when tag is rejected"
-        );
+            .unwrap();
+        let body = std::fs::read_to_string(root.join("wiki/tag-test.md")).unwrap();
+        let (fm, _) = memex_core::validate::parse_frontmatter(&body).unwrap();
+        assert_eq!(fm.tags.len(), 2, "tags expanded from injection: {:?}", fm.tags);
+        assert_eq!(fm.tags[0], "clean");
+        assert_eq!(fm.tags[1], evil_tag);
     }
 
     #[tokio::test]

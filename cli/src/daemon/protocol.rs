@@ -237,12 +237,6 @@ pub enum Event {
     EmptyExtract {
         reason: String,
     },
-    /// Advisory progress event during `plan apply`. Consumed-and-dropped
-    /// by the CLI; programmatic consumers can read it from the protocol stream.
-    PlanApplyProgress {
-        slug: String,
-        status: String,
-    },
     /// `plan apply` full-success terminal: the slugs that were committed
     /// in this run. CLI maps to stdout = `committed N wiki pages\n`.
     PlanApplied {
