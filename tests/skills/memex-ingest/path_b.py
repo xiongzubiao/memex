@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Path B multi-turn: deny AskUserQuestion to force chat fallback,
-then watch for the directive prompt in agent output and inject a
-follow-up `apply` user message to drive the apply step.
+"""Path B driver: chat-directive review (cross-agent fallback).
+
+Multi-turn. The driver denies AskUserQuestion via `can_use_tool` so the
+agent must use Path B (paste plan show output to chat with the directive
+prompt). When the agent reaches that prompt, the driver injects the
+configured reply via an asyncio.Queue.
+
+Usage:
+    path_b.py <test_file> <reply>
+
+Reply forms:
+    apply                                          — commit as-is
+    drop <slug>; rename <slug> to <new>; apply     — directives + apply
+    cancel                                         — discard plan
 """
 import asyncio
-import os
 import sys
 
-sys.path.insert(0, "/tmp/skill-sdk-venv/lib/python3.14/site-packages")
-from claude_agent_sdk import ClaudeAgentOptions, query
-from claude_agent_sdk.types import HookMatcher, PermissionResultAllow, PermissionResultDeny
-
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PLUGIN_DIR = os.path.join(_REPO_ROOT, "plugin")
-NEW_BIN_DIR = os.path.join(_REPO_ROOT, "target", "release")
+from _common import build_options, prepend_bin_to_path
+from claude_agent_sdk import query
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 
 def make_can_use_tool():
@@ -33,16 +39,14 @@ def make_can_use_tool():
     return can_use_tool, counts
 
 
-async def dummy_hook(input_data, tool_use_id, context):
-    return {"continue_": True}
-
-
 async def main():
-    test_file = sys.argv[1]
-    user_reply = sys.argv[2] if len(sys.argv) > 2 else "apply"
+    if len(sys.argv) < 3:
+        print(f"Usage: {sys.argv[0]} <test_file> <reply>", file=sys.stderr)
+        sys.exit(2)
+    test_file, user_reply = sys.argv[1], sys.argv[2]
 
     can_use_tool, counts = make_can_use_tool()
-    os.environ["PATH"] = NEW_BIN_DIR + ":" + os.environ.get("PATH", "")
+    prepend_bin_to_path()
 
     user_queue: asyncio.Queue = asyncio.Queue()
     await user_queue.put({
@@ -65,25 +69,23 @@ async def main():
                 return
             yield msg
 
-    options = ClaudeAgentOptions(
-        can_use_tool=can_use_tool,
-        hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[dummy_hook])]},
-        allowed_tools=["Bash", "Edit", "Read", "Write", "Glob", "Grep", "Skill", "ToolSearch"],
-        plugins=[{"type": "local", "path": PLUGIN_DIR}],
-    )
+    options = build_options(can_use_tool=can_use_tool, allow_askuserquestion=False)
 
     final_text = None
-    print(f"Spawning SDK session (Path B multi-turn, reply={user_reply!r})", file=sys.stderr)
+    print(f"Spawning SDK session (Path B, reply={user_reply!r})", file=sys.stderr)
 
     async for message in query(prompt=prompt_stream(), options=options):
-        mt = type(message).__name__
-        if mt == "AssistantMessage":
+        if type(message).__name__ == "AssistantMessage":
             for c in getattr(message, "content", []):
                 if hasattr(c, "text") and c.text:
                     text = c.text
-                    # Detect the chat directive prompt; inject reply
-                    if not reply_sent and "Reply `apply`" in text and "drop" in text.lower():
-                        print(f"\n[INJECT] agent reached chat prompt → sending {user_reply!r}\n", file=sys.stderr)
+                    if (not reply_sent
+                            and "Reply `apply`" in text
+                            and "drop" in text.lower()):
+                        print(
+                            f"\n[INJECT] agent reached chat prompt → sending {user_reply!r}\n",
+                            file=sys.stderr,
+                        )
                         await user_queue.put({
                             "type": "user",
                             "message": {"role": "user", "content": user_reply},
