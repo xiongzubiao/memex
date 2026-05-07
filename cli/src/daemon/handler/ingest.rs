@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::daemon::error::DaemonError;
 use crate::daemon::handler::{
-    HandlerState, acquire_slug_locks, async_atomic_write, error_events, get_or_open_memex,
+    HandlerState, acquire_slug_lock, async_atomic_write, error_events, get_or_open_memex,
     read_file_capped, run_worker_job, validate_and_redact_inbound_content, validate_source_path,
 };
 use crate::daemon::handler::source::derive_source_title;
@@ -95,17 +95,13 @@ pub(super) async fn handle_ingest_transcript(
     let content_hash = memex_core::storage::content_hash(canonical_transcript.as_bytes());
     let job_id = format!("ingest-{}", &content_hash[..16]);
 
-    // Pre-LLM dedup: if any ingest-produced document with this hash
-    // already exists, skip the LLM call (mirrors handle_ingest_document).
-    match search.ingest_dedup_exists(&content_hash) {
-        Ok(true) => {
-            tracing::info!(hash=%content_hash, "transcript ingest deduped: content already stored");
-            return vec![Event::Done { status: 0 }];
-        }
-        Ok(false) => {}
-        Err(e) => {
-            return error_events(DaemonError::Internal(format!("dedup check: {e}")));
-        }
+    // Pre-LLM dedup: if the content-addressed raw file already exists,
+    // we've stored this content before — skip the LLM call. Partial
+    // states (raw on disk, wiki rows missing) recover via reconcile/lint
+    // rather than blocking retries forever.
+    if memex_core::raw::raw_path_for_hash(&memex.raw_dir(), &content_hash).exists() {
+        tracing::info!(hash=%content_hash, "transcript ingest deduped: raw file present");
+        return vec![Event::Done { status: 0 }];
     }
 
     // Persist the job before LLM dispatch so a crash doesn't lose it;
@@ -113,7 +109,7 @@ pub(super) async fn handle_ingest_transcript(
     // ingests of the same content.
     if let Err(e) = search.insert_ingest_job(
         &job_id,
-        memex_core::search::JobType::Transcript,
+        memex_core::ingest_jobs::JobType::Transcript,
         &transcript_path,
         Some(&agent),
         &content_hash,
@@ -170,24 +166,27 @@ pub(super) async fn handle_ingest_transcript(
         return events;
     }
 
-    let title = memex_core::transcript::truncate(&transcript.first_user_message, 80);
-    let summary = memex_core::index::extract_summary(&canonical_transcript, 120);
-
-    let session_id_opt: Option<&str> = if transcript.session_id.is_empty() {
-        None
+    let title = if transcript.session_id.is_empty() {
+        agent.clone()
     } else {
-        Some(&transcript.session_id)
+        format!("{} {}", agent, transcript.session_id)
     };
+    let fm = memex_core::raw::RawFrontmatter {
+        source: Some(transcript_path.clone()),
+        source_kind: Some("transcript".into()),
+        ingested_at: Some(
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+        converter: None,
+        title: Some(title.clone()),
+    };
+
     let stored_event = match store_extracted_pages(
         extracted.pages,
         &canonical_transcript,
-        &transcript_path,
-        &title,
-        &summary,
+        &fm,
         &effective_collections,
         &job_id,
-        Some(&agent),
-        session_id_opt,
         state,
     )
     .await
@@ -245,16 +244,10 @@ pub(super) async fn handle_ingest_document(
 
     let content_hash = memex_core::storage::content_hash(redacted.as_bytes());
 
-    // ─── Dedup: skip if this exact content is already stored ──────────
-    match search.ingest_dedup_exists(&content_hash) {
-        Ok(true) => {
-            tracing::info!(hash=%content_hash, "ingest deduped: source already present");
-            return vec![Event::Done { status: 0 }];
-        }
-        Ok(false) => {}
-        Err(e) => {
-            return error_events(DaemonError::Internal(format!("dedup check: {e}")));
-        }
+    // ─── Dedup: skip if the content-addressed raw file is already on disk ──
+    if memex_core::raw::raw_path_for_hash(&memex.raw_dir(), &content_hash).exists() {
+        tracing::info!(hash=%content_hash, "ingest deduped: raw file present");
+        return vec![Event::Done { status: 0 }];
     }
 
     // ─── Job ID + persist job row (pre-Extract) ────
@@ -266,7 +259,7 @@ pub(super) async fn handle_ingest_document(
     );
     if let Err(e) = search.insert_ingest_job(
         &job_id,
-        memex_core::search::JobType::Document,
+        memex_core::ingest_jobs::JobType::Document,
         &source_path,
         None,
         &content_hash,
@@ -303,17 +296,26 @@ pub(super) async fn handle_ingest_document(
 
     // ─── Hand off to shared post-Extract pipeline ─────────────────────
     let source_title = derive_source_title(&redacted, &source_path);
-    let source_summary = memex_core::index::extract_summary(&redacted, 120);
+    let kind = if memex_core::raw::is_url(&source_path) {
+        "url"
+    } else {
+        "path"
+    };
+    let fm = memex_core::raw::RawFrontmatter {
+        source: Some(source_path.clone()),
+        source_kind: Some(kind.into()),
+        ingested_at: Some(
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+        converter: None,
+        title: Some(source_title.clone()),
+    };
     let stored_event = match store_extracted_pages(
         merged_pages,
         &redacted,
-        &source_path,
-        &source_title,
-        &source_summary,
+        &fm,
         &effective_collections,
         &job_id,
-        None,
-        None,
         state,
     )
     .await
@@ -333,31 +335,29 @@ pub(super) async fn handle_ingest_document(
 /// wiki-side Merge → transactional store via `store_ingest_batch` → embed →
 /// filesystem writes. Used by both transcript and document ingest paths.
 ///
-/// Pre-conditions:
-/// - `source_text` is the cleaned/redacted source content. The helper
-///   passes it to `store_ingest_batch`, which uses `INSERT OR IGNORE` on
-///   content; it's safe to call even when the content row already exists
-///   (the document path inserts content earlier for hash-dedup; transcript
-///   does not).
-/// - `source_title` and `source_summary` are caller-derived strings.
+/// The caller hands in a fully-populated `RawFrontmatter` (source,
+/// source_kind, title, optional agent/session_id). This helper does not
+/// inspect those fields — it just serializes the frontmatter into the raw
+/// file and uses `fm.source` / `fm.title` for downstream wiki bookkeeping.
+///
+/// `source_text` is the cleaned/redacted body. It's content-hashed for the
+/// raw path and fed to `store_ingest_batch`, which `INSERT OR IGNORE`s on
+/// content (safe under retries).
 ///
 /// Returns `Ok(Event::Stored)` on success, or `Err(Vec<Event>)` containing
 /// error+done events on any failure. Caller is responsible for prepending
 /// per-source progress events (Parsing, Distilling) and for flushing the
 /// trailing `Done` after the returned `Stored` event.
-#[allow(clippy::too_many_arguments)]
 async fn store_extracted_pages(
     pages: Vec<crate::daemon::queue::ExtractedPage>,
     source_text: &str,
-    source_path: &str,
-    source_title: &str,
-    _source_summary: &str,
+    fm: &memex_core::raw::RawFrontmatter,
     collections: &[String],
     job_id: &str,
-    agent_label: Option<&str>,
-    session_id_opt: Option<&str>,
     state: &HandlerState,
 ) -> Result<Event, Vec<Event>> {
+    let source_path = fm.source.as_deref().unwrap_or("");
+    let source_title = fm.title.as_deref().unwrap_or("");
     let root_path = state.writer.bound_root().to_path_buf();
     let memex = match get_or_open_memex(state.writer.memex_handle(), &root_path) {
         Ok(m) => m,
@@ -421,94 +421,81 @@ async fn store_extracted_pages(
         "dedup search complete"
     );
 
-    // 3. Acquire per-slug write locks for the UNION of slugs that will
-    // be written: new_pages (proposed slugs) + merge_pairs (existing
-    // slugs that dedup mapped to). acquire_slug_locks sorts +
-    // deduplicates, so concurrent ingests targeting overlapping slugs
-    // serialize cleanly without deadlock.
-    let lock_slugs: Vec<String> = new_pages
+    // 3. Pre-compute the inputs each per-slug task needs:
+    //  - existing_titled = (slug, title) pairs already in the index;
+    //    used by forward_link target set.
+    //  - titled_pool     = auto_link_eligible-filtered union of
+    //    existing_titled ∪ this batch's (slug, title); pre-filtering
+    //    here means each per-slug task does no work besides iteration.
+    //    forward_link itself handles self-exclusion via its
+    //    `self_stem` argument.
+    //  - known_slugs     = on-disk wiki stems ∪ batch slugs; used by
+    //    scrub_wiki_links to drop `[[orphan]]` references the LLM may
+    //    have emitted for pages that got absorbed during MERGE or
+    //    hallucinated.
+    let now_dt = chrono::Utc::now();
+    let existing_titled = search.all_stems_and_titles().unwrap_or_default();
+    let titled_pool: Vec<(String, String)> = existing_titled
         .iter()
-        .map(|p| p.slug.clone())
-        .chain(merge_pairs.iter().map(|p| p.slug.clone()))
+        .cloned()
+        .chain(
+            new_pages
+                .iter()
+                .map(|p| (p.slug.clone(), p.title.clone())),
+        )
+        .filter(|(s, _)| memex_core::crosslink::auto_link_eligible(s))
         .collect();
-    let _slug_guards = acquire_slug_locks(&state.writer, lock_slugs).await;
+    let mut known_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in &new_pages {
+        known_slugs.insert(p.slug.clone());
+    }
+    for p in &merge_pairs {
+        known_slugs.insert(p.slug.clone());
+    }
+    // Existing wiki stems come from the same `all_stems_and_titles`
+    // query above — no need for a second `read_dir` pass over wiki_dir.
+    for (stem, _) in &existing_titled {
+        known_slugs.insert(stem.clone());
+    }
 
-    // 4. Re-read merge targets under the slug lock. Dedup ran
-    // unsynchronized, so its `existing` snapshot may be stale by the
-    // time we hold the lock. A concurrent ingest that just released the
-    // lock could have committed a newer body. Submitting the dedup-time
-    // snapshot to the merge worker would silently drop that ingest's
-    // contribution (last-write-wins). Re-reading under the lock ensures
-    // the merge sees the latest committed state.
-    let mut merge_pairs = merge_pairs;
-    for pair in &mut merge_pairs {
-        let path = wiki_dir.join(format!("{}.md", pair.slug));
-        if let Ok(latest) = tokio::fs::read_to_string(&path).await {
-            let body = memex_core::validate::parse_frontmatter(&latest)
-                .map(|(_fm, body)| body.to_string())
-                .unwrap_or(latest);
-            if body != pair.existing {
-                tracing::info!(
-                    slug = %pair.slug,
-                    "merge target changed since dedup; re-reading under lock"
-                );
-                pair.existing = body;
-            }
+    // 4. Per-slug fan-out: each slug is its own future that holds only
+    // its own slug's lock from re-read through DB commit + embed. A
+    // slow MERGE on one slug doesn't block another slug's commit, and
+    // a concurrent ingest touching only the OTHER slug runs in
+    // parallel. Futures share borrowed state (via SlugBatchCtx) and
+    // are awaited in this scope, so no spawn / 'static bound needed.
+    let ctx = SlugBatchCtx {
+        wiki_dir: &wiki_dir,
+        titled_pool: &titled_pool,
+        known_slugs: &known_slugs,
+        transcript_path: source_path,
+        collections,
+        now_dt,
+    };
+    let mut futs: Vec<_> = Vec::with_capacity(new_pages.len() + merge_pairs.len());
+    for page in new_pages.iter().cloned() {
+        futs.push(process_one_slug(state, &memex, SlugKind::New(page), &ctx));
+    }
+    for pair in merge_pairs.iter().cloned() {
+        futs.push(process_one_slug(state, &memex, SlugKind::Merge(pair), &ctx));
+    }
+    let mut committed_slugs: Vec<String> = Vec::new();
+    let results = futures::future::join_all(futs).await;
+    for result in results {
+        match result {
+            Ok(Some(slug)) => committed_slugs.push(slug),
+            Ok(None) => {} // merge skipped (LLM timeout or missing-slug); already logged
+            Err(events) => return Err(events),
         }
     }
 
-    // 5. Optional wiki-side merge.
-    let merged_pages = run_wiki_merge(state, &merge_pairs).await;
-
-    // 6. Build wiki records. Pull existing (stem, title) pairs so
-    // build_wiki_records can run forward_link against the union of
-    // existing pages + this batch — same eligibility filter as
-    // `memex write`.
-    let now_dt = chrono::Utc::now();
-    let now = now_dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let all_pages: Vec<_> = new_pages.iter().chain(merged_pages.iter()).collect();
-    let existing_titled = search.all_stems_and_titles().unwrap_or_default();
-    let wiki_pages = build_wiki_records(
-        &all_pages,
-        &wiki_dir,
-        &existing_titled,
-        source_path,
-        collections,
-        now_dt,
-    )
-    .await;
-
-    // 7. Filesystem-canonical write order: bodies on disk are the
-    // source of truth, so they land FIRST. If any write fails, abort
-    // before touching the DB — the alternative (commit row, then write
-    // file, then notice failure) leaves a documents row pointing at
-    // nothing readable, and lint can't reconstruct the body (the
-    // MissingFile fix is a no-op until reconcile-against-raw lands).
-    // The reverse order leaves orphan files on DB-commit failure,
-    // which lint's reindex-from-disk path DOES recover.
+    // 5. Coordinator step: write the raw file, commit the source row,
+    // embed it, run cross-page backlink maintenance for new slugs.
+    // Raw write happens AFTER all per-slug commits so the dedup
+    // invariant `raw on disk ⇒ wiki updates on disk` still holds.
     let source_hash = memex_core::storage::content_hash(source_text.as_bytes());
     let raw_path = memex_core::raw::raw_path_for_hash(&memex.raw_dir(), &source_hash);
-    // Transcript ingest emits source_kind=transcript; document/url
-    // ingest falls through to the URL/path heuristic.
-    let kind = if agent_label.is_some() {
-        "transcript"
-    } else if memex_core::raw::is_url(source_path) {
-        "url"
-    } else {
-        "path"
-    };
-    let fm = memex_core::raw::RawFrontmatter {
-        source: Some(source_path.to_string()),
-        source_kind: Some(kind.into()),
-        ingested_at: Some(now.clone()),
-        converter: None,
-        title: Some(source_title.to_string()),
-        agent: agent_label.map(|s| s.to_string()),
-        session_id: session_id_opt
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string()),
-    };
-    let raw_file = memex_core::raw::assemble_raw_file(&fm, source_text);
+    let raw_file = memex_core::raw::assemble_raw_file(fm, source_text);
     if !raw_path.exists() {
         if let Some(parent) = raw_path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
@@ -522,47 +509,270 @@ async fn store_extracted_pages(
             ))));
         }
     }
-
-    // 8. Wiki files. Same fail-fast contract: a write failure aborts
-    // before the DB commit, so the row never gets created with no
-    // backing file.
-    let wiki_failures = write_wiki_files(&wiki_dir, &wiki_pages).await;
-    if !wiki_failures.is_empty() {
-        let detail = wiki_failures
-            .iter()
-            .map(|(slug, err)| format!("{slug}: {err}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(error_events(DaemonError::Storage(format!(
-            "wiki file write failed for {} page(s): {detail}",
-            wiki_failures.len()
-        ))));
-    }
-
-    // 9-10 + cross-link: durable commit, embed every doc, maintain
-    // backlinks across the wiki — all under the same slug-lock window
-    // so concurrent ingests don't race the post-commit work.
-    let input = IngestBatchInput {
-        memex: &memex,
-        job_id,
-        raw_file: &raw_file,
-        raw_path: &raw_path,
+    let stored_source_hash = match search.store_raw_source(
+        &raw_file,
         source_path,
         source_title,
-        source_text,
-        source_hash: &source_hash,
-        wiki_pages: &wiki_pages,
-        new_pages: &new_pages,
         collections,
-        now: &now,
+        memex.root(),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ =
+                search.update_ingest_job_status(job_id, "failed", Some(&e.to_string()));
+            return Err(error_events(DaemonError::Internal(format!(
+                "raw source commit failed: {e}"
+            ))));
+        }
     };
-    let batch_result = commit_and_finalize_ingest(state, input).await?;
-    let source_docid = memex_core::docid::short(&batch_result.source_hash).to_string();
+    debug_assert_eq!(stored_source_hash, source_hash);
+
+    // Embed the raw source and run cross-page backlink maintenance
+    // under a single embed-model lock acquisition — both need the
+    // model and run sequentially, so two separate `.lock().await`
+    // calls would just thrash the lock with reconcile/watcher.
+    {
+        let mut guard = state.writer.embed_model().lock().await;
+        let mut embed_ctx = EmbedCtx {
+            search,
+            model: guard.as_mut(),
+            memex_root: memex.root(),
+        };
+        embed_and_mark(
+            &mut embed_ctx,
+            "raw",
+            &raw_path,
+            &stored_source_hash,
+            source_title,
+            source_text,
+        );
+        let eligible: Vec<(&str, &str)> = new_pages
+            .iter()
+            .filter(|p| memex_core::crosslink::auto_link_eligible(&p.slug))
+            .map(|p| (p.slug.as_str(), p.title.as_str()))
+            .collect();
+        if !eligible.is_empty()
+            && let Err(e) =
+                memex_core::crosslink::maintain_backlinks_batch(&memex, &eligible, embed_ctx.model)
+        {
+            tracing::warn!(?e, "maintain_backlinks_batch failed during ingest");
+        }
+    }
+
+    let source_docid = memex_core::docid::short(&stored_source_hash).to_string();
     Ok(Event::Stored {
         job_id: job_id.to_string(),
         source_docid,
-        wiki_pages: batch_result.wiki_hashes.into_iter().map(|(s, _)| s).collect(),
+        wiki_pages: committed_slugs,
     })
+}
+
+/// One slug's input to the fan-out. New = no existing wiki page (write
+/// proposed body as-is); Merge = existing+proposed pair (dispatch a
+/// single-slug MERGE LLM call before write).
+enum SlugKind {
+    New(crate::daemon::queue::ExtractedPage),
+    Merge(crate::daemon::queue::MergePair),
+}
+
+/// Per-batch state shared by every per-slug task in one ingest.
+/// Computed once before fan-out; passed by reference into each
+/// `process_one_slug` / `build_one_wiki_record` call. Bundles the
+/// six values that are otherwise positional parameters ripe for
+/// ordering bugs.
+struct SlugBatchCtx<'a> {
+    wiki_dir: &'a Path,
+    titled_pool: &'a [(String, String)],
+    known_slugs: &'a std::collections::HashSet<String>,
+    transcript_path: &'a str,
+    collections: &'a [String],
+    now_dt: chrono::DateTime<chrono::Utc>,
+}
+
+/// Process one slug end-to-end under that slug's write lock:
+/// (re-read existing for Merge) → optional single-slug MERGE LLM →
+/// build wiki record → write file → commit DB row → embed.
+///
+/// Returns `Ok(Some(slug))` on a committed update, `Ok(None)` if the
+/// MERGE step skipped this slug (LLM timeout or missing-slug reply —
+/// both already logged), or `Err(events)` on a propagating write/commit
+/// failure that should abort the whole ingest.
+async fn process_one_slug(
+    state: &HandlerState,
+    memex: &memex_core::Memex,
+    kind: SlugKind,
+    ctx: &SlugBatchCtx<'_>,
+) -> Result<Option<String>, Vec<Event>> {
+    let slug = match &kind {
+        SlugKind::New(p) => p.slug.clone(),
+        SlugKind::Merge(p) => p.slug.clone(),
+    };
+    let page_path = memex_core::wiki::wiki_path_for_slug(ctx.wiki_dir, &slug);
+    let _slug_guard = acquire_slug_lock(&state.writer, &slug).await;
+
+    // Re-read existing under lock (dedup snapshot may be stale by the
+    // time we hold the lock — a concurrent ingest may have committed a
+    // newer body in between). Cached for `build_one_wiki_record` so we
+    // don't read the same file twice.
+    let prior_content: Option<String> = tokio::fs::read_to_string(&page_path).await.ok();
+
+    let final_page: crate::daemon::queue::ExtractedPage = match kind {
+        SlugKind::New(p) => p,
+        SlugKind::Merge(mut pair) => {
+            if let Some(latest) = prior_content.as_deref() {
+                let body = memex_core::validate::parse_frontmatter(latest)
+                    .map(|(_fm, b)| b.to_string())
+                    .unwrap_or_else(|_| latest.to_string());
+                if body != pair.existing {
+                    tracing::info!(
+                        slug = %pair.slug,
+                        "merge target changed since dedup; re-reading under lock"
+                    );
+                    pair.existing = body;
+                }
+            }
+            match run_one_slug_merge(state, pair).await {
+                Ok(Some(page)) => page,
+                Ok(None) | Err(_) => return Ok(None),
+            }
+        }
+    };
+
+    let record = build_one_wiki_record(&final_page, prior_content.as_deref(), ctx);
+
+    if let Err(e) = async_atomic_write(page_path.clone(), record.content.as_bytes().to_vec()).await
+    {
+        return Err(error_events(DaemonError::Storage(format!(
+            "wiki file write failed for {slug}: {e}"
+        ))));
+    }
+
+    let body_hash = match memex
+        .search()
+        .store_wiki_page(&record, ctx.collections, memex.root())
+    {
+        Ok(h) => h,
+        Err(e) => {
+            return Err(error_events(DaemonError::Internal(format!(
+                "wiki page commit failed for {slug}: {e}"
+            ))));
+        }
+    };
+
+    let body_slice = memex_core::storage::split_frontmatter(&record.content)
+        .map(|(_fm, b)| b)
+        .unwrap_or(&record.content);
+    {
+        let mut guard = state.writer.embed_model().lock().await;
+        let mut embed_ctx = EmbedCtx {
+            search: memex.search(),
+            model: guard.as_mut(),
+            memex_root: memex.root(),
+        };
+        embed_and_mark(
+            &mut embed_ctx,
+            "wiki",
+            &page_path,
+            &body_hash,
+            &record.title,
+            body_slice,
+        );
+    }
+
+    Ok(Some(slug))
+}
+
+/// Dispatch a single-slug MERGE LLM job and unwrap the matching slug
+/// from the reply. `Ok(Some(page))` on success; `Ok(None)` on the two
+/// soft-skip cases (LLM job failed, or the reply omitted the slug);
+/// `Err(_)` is reserved for future hard-error variants. Callers reuse
+/// this from both ingest and plan paths.
+async fn run_one_slug_merge(
+    state: &HandlerState,
+    pair: crate::daemon::queue::MergePair,
+) -> Result<Option<crate::daemon::queue::ExtractedPage>, ()> {
+    use crate::daemon::queue::{BackendJob, MergeJob};
+    let target_slug = pair.slug.clone();
+    let pair_clone = pair.clone();
+    let merge_result = run_worker_job(state, move |reply| {
+        BackendJob::Merge(MergeJob {
+            pages: vec![pair_clone],
+            reply,
+        })
+    })
+    .await;
+    match merge_result {
+        Ok(reply) => match reply
+            .merged_pages
+            .into_iter()
+            .find(|p| p.slug == target_slug)
+        {
+            Some(merged) => Ok(Some(crate::daemon::queue::ExtractedPage {
+                slug: target_slug,
+                title: merged.title,
+                body: merged.body,
+            })),
+            None => {
+                tracing::warn!(
+                    slug = %target_slug,
+                    "merge output missing pair slug; skipping wiki update for this page"
+                );
+                Ok(None)
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                %e,
+                skipped_slug = %target_slug,
+                "merge job failed; skipping wiki update for this page"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Build a single wiki record (frontmatter + scrubbed/forward-linked
+/// body) for one extracted page. `prior_content` is the existing
+/// `wiki/<slug>.md` markdown if any (caller reads it once, under the
+/// slug lock, and shares it between the merge re-read and this call).
+fn build_one_wiki_record(
+    page: &crate::daemon::queue::ExtractedPage,
+    prior_content: Option<&str>,
+    ctx: &SlugBatchCtx<'_>,
+) -> memex_core::search::IngestWikiPage {
+    let scrubbed_body = memex_core::validate::scrub_wiki_links(&page.body, ctx.known_slugs);
+    // titled_pool was pre-filtered by `auto_link_eligible` upstream;
+    // forward_link skips self via its `self_stem` argument, so no
+    // per-slug clone is needed here.
+    let (linked_body, _) =
+        memex_core::crosslink::forward_link(&scrubbed_body, ctx.titled_pool, &page.slug);
+
+    let (created_at, sources) = prior_content
+        .and_then(|c| memex_core::validate::parse_frontmatter(c).ok())
+        .map(|(fm, _body)| {
+            let mut srcs = fm.sources;
+            if !srcs.iter().any(|s| s == ctx.transcript_path) {
+                srcs.push(ctx.transcript_path.to_string());
+            }
+            (fm.created_at, srcs)
+        })
+        .unwrap_or_else(|| (ctx.now_dt, vec![ctx.transcript_path.to_string()]));
+
+    let content = memex_core::wiki::compose_wiki_markdown(
+        &page.title,
+        &linked_body,
+        created_at,
+        &sources,
+        ctx.collections,
+        ctx.now_dt,
+    )
+    .expect("frontmatter always serializes");
+
+    memex_core::search::IngestWikiPage {
+        slug: page.slug.clone(),
+        title: page.title.clone(),
+        content,
+    }
 }
 
 /// Extract pages from already-stored source content. Runs chunked
@@ -645,12 +855,6 @@ pub(super) async fn extract_pages_from_content(
             continue;
         }
         let title = fragments[0].title.clone();
-        let tags: Vec<String> = fragments
-            .iter()
-            .flat_map(|p| p.tags.clone())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
         let mut accum_body = fragments[0].body.clone();
         for next in fragments.into_iter().skip(1) {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -680,276 +884,10 @@ pub(super) async fn extract_pages_from_content(
         merged.push(crate::daemon::queue::ExtractedPage {
             slug,
             title,
-            tags,
             body: memex_core::transcript::truncate(&accum_body, 20_000),
         });
     }
     Ok(merged)
-}
-
-/// Phase 5: dispatch the wiki-side MERGE LLM job for every dedup-matched
-/// slug. On success, zip the worker's reply back to the input pairs and
-/// emit one `ExtractedPage` per merged slug. On failure, log + skip the
-/// affected slugs: falling back to "write the proposed pages as new"
-/// would route through `store_ingest_batch`'s
-/// `ON CONFLICT(doc_type, path) DO UPDATE` and destructively overwrite
-/// the accumulated existing page with just this session's contribution.
-/// Skipping leaves the existing page intact for the next ingest to
-/// merge against.
-async fn run_wiki_merge(
-    state: &HandlerState,
-    merge_pairs: &[crate::daemon::queue::MergePair],
-) -> Vec<crate::daemon::queue::ExtractedPage> {
-    use crate::daemon::queue::{BackendJob, MergeJob};
-    if merge_pairs.is_empty() {
-        return Vec::new();
-    }
-    let merge_result = run_worker_job(state, |reply| {
-        BackendJob::Merge(MergeJob {
-            pages: merge_pairs.to_vec(),
-            reply,
-        })
-    })
-    .await;
-    match merge_result {
-        Ok(reply) => merge_pairs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, pair)| {
-                reply.merged_pages.get(i).map(|page| {
-                    crate::daemon::queue::ExtractedPage {
-                        slug: pair.slug.clone(),
-                        title: page.title.clone(),
-                        tags: page.tags.clone(),
-                        body: page.body.clone(),
-                    }
-                })
-            })
-            .collect(),
-        Err(e) => {
-            let skipped: Vec<&str> = merge_pairs.iter().map(|p| p.slug.as_str()).collect();
-            tracing::warn!(
-                %e,
-                skipped_slugs = ?skipped,
-                "merge job failed; skipping wiki update for these pages"
-            );
-            Vec::new()
-        }
-    }
-}
-
-/// Per-call inputs for `commit_and_finalize_ingest`. Bundled so the
-/// fn signature stays readable; `state: &HandlerState` covers the
-/// daemon-shared bits (search handle, embedder, writer session) and
-/// this struct holds the per-request data flowing through the pipeline.
-struct IngestBatchInput<'a> {
-    memex: &'a memex_core::Memex,
-    job_id: &'a str,
-    raw_file: &'a str,
-    raw_path: &'a Path,
-    source_path: &'a str,
-    source_title: &'a str,
-    source_text: &'a str,
-    source_hash: &'a str,
-    wiki_pages: &'a [memex_core::search::IngestWikiPage],
-    new_pages: &'a [crate::daemon::queue::ExtractedPage],
-    collections: &'a [String],
-    now: &'a str,
-}
-
-/// Phases 9 + 10 + auto cross-link: do the durable DB commit, then
-/// embed every committed doc, then sweep wiki for backlinks to the new
-/// pages. All three are bundled so the embedder lock is acquired once
-/// and the slug-lock window covers every post-commit mutation.
-///
-/// Failure semantics:
-/// - Phase 9 (DB commit) failure aborts the function and returns Err;
-///   wiki + raw files are durably on disk so lint's reindex path
-///   recovers.
-/// - Phase 10 (embed) failures are logged inside `embed_and_mark` and
-///   do not propagate — chunks are best-effort, lint will retry.
-/// - Cross-link failure is logged and ignored — backlinks are passive
-///   and reconcile will eventually catch missing ones.
-async fn commit_and_finalize_ingest(
-    state: &HandlerState,
-    input: IngestBatchInput<'_>,
-) -> Result<memex_core::search::IngestBatchResult, Vec<Event>> {
-    let search = input.memex.search();
-    let wiki_dir = input.memex.wiki_dir();
-
-    // Phase 9: transactional DB commit.
-    let batch_result = match search.store_ingest_batch(
-        input.raw_file,
-        input.source_path,
-        input.source_title,
-        input.wiki_pages,
-        input.collections,
-        input.now,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = search.update_ingest_job_status(
-                input.job_id,
-                "failed",
-                Some(&e.to_string()),
-            );
-            return Err(error_events(DaemonError::Internal(format!(
-                "storage failed: {e}"
-            ))));
-        }
-    };
-    debug_assert_eq!(
-        batch_result.source_hash, input.source_hash,
-        "source_hash recomputed in store_ingest_batch must match the one used to write the raw file"
-    );
-
-    // Phase 10: embed source + each wiki page under the shared model.
-    {
-        let mut guard = state.writer.embed_model().lock().await;
-        let mut embed_ctx = EmbedCtx {
-            search,
-            model: guard.as_mut(),
-            memex_root: input.memex.root(),
-        };
-        embed_and_mark(
-            &mut embed_ctx,
-            "raw",
-            input.raw_path,
-            &batch_result.source_hash,
-            input.source_title,
-            input.source_text,
-        );
-        for (page, (slug, page_hash)) in
-            input.wiki_pages.iter().zip(&batch_result.wiki_hashes)
-        {
-            debug_assert_eq!(&page.slug, slug);
-            let wiki_disk = wiki_dir.join(format!("{slug}.md"));
-            embed_and_mark(
-                &mut embed_ctx,
-                "wiki",
-                &wiki_disk,
-                page_hash,
-                &page.title,
-                &page.content,
-            );
-        }
-    }
-
-    // Auto cross-link backward: sweep wiki pages for un-linked mentions
-    // of every newly-created (not merged) eligible slug. Batched form
-    // walks the wiki dir once across all new pages.
-    {
-        let eligible: Vec<(&str, &str)> = input
-            .new_pages
-            .iter()
-            .filter(|p| memex_core::crosslink::auto_link_eligible(&p.slug))
-            .map(|p| (p.slug.as_str(), p.title.as_str()))
-            .collect();
-        if !eligible.is_empty() {
-            let mut guard = state.writer.embed_model().lock().await;
-            if let Err(e) = memex_core::crosslink::maintain_backlinks_batch(
-                input.memex,
-                &eligible,
-                guard.as_mut(),
-            ) {
-                tracing::warn!(?e, "maintain_backlinks_batch failed during ingest");
-            }
-        }
-    }
-
-    Ok(batch_result)
-}
-
-/// Turn a batch of merged/new extracted pages into insert-ready records:
-/// scrub dead wiki links, read each page's prior frontmatter (in parallel),
-/// preserve `created_at`, accumulate `sources`, and compose the full
-/// markdown with frontmatter.
-async fn build_wiki_records(
-    all_pages: &[&crate::daemon::queue::ExtractedPage],
-    wiki_dir: &Path,
-    existing_titled: &[(String, String)],
-    transcript_path: &str,
-    effective_collections: &[String],
-    now_dt: chrono::DateTime<chrono::Utc>,
-) -> Vec<memex_core::search::IngestWikiPage> {
-    // Known slugs = surviving pages in this batch + everything already on
-    // disk. Used to scrub `[[other-slug]]` references the LLM may have
-    // emitted for pages that got absorbed during MERGE or hallucinated.
-    let mut known_slugs: std::collections::HashSet<String> =
-        all_pages.iter().map(|p| p.slug.clone()).collect();
-    if let Ok(mut entries) = tokio::fs::read_dir(wiki_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                known_slugs.insert(stem.to_string());
-            }
-        }
-    }
-
-    // Forward-link target set: existing pages from the index + new
-    // pages being written in this batch (so two new pages mentioning
-    // each other cross-link). Eligibility filter applied per call site.
-    let mut titled_pool: Vec<(String, String)> = existing_titled.to_vec();
-    for p in all_pages {
-        titled_pool.push((p.slug.clone(), p.title.clone()));
-    }
-
-    // Preserve created_at and accumulate sources across merges. Without
-    // this, each merge would overwrite the previous session list and
-    // created_at, leaving merged pages looking single-source.
-    let prior_read_handles: Vec<_> = all_pages
-        .iter()
-        .map(|page| {
-            let existing_path = wiki_dir.join(format!("{}.md", page.slug));
-            tokio::spawn(async move { tokio::fs::read_to_string(&existing_path).await.ok() })
-        })
-        .collect();
-
-    let mut records = Vec::with_capacity(all_pages.len());
-    for (page, prior) in all_pages.iter().zip(prior_read_handles) {
-        let scrubbed_body = memex_core::validate::scrub_wiki_links(&page.body, &known_slugs);
-        // Auto cross-link forward: bracket eligible existing-title
-        // mentions in this body. Self excluded by stem comparison.
-        let eligible: Vec<(String, String)> = titled_pool
-            .iter()
-            .filter(|(s, _)| s != &page.slug && memex_core::crosslink::auto_link_eligible(s))
-            .cloned()
-            .collect();
-        let (linked_body, _linked) =
-            memex_core::crosslink::forward_link(&scrubbed_body, &eligible, &page.slug);
-        let scrubbed_body = linked_body;
-        let safe_title = page.title.replace(['\n', '\r'], " ");
-
-        let existing_content = prior.await.ok().flatten();
-        let (created_at, sources) = existing_content
-            .as_deref()
-            .and_then(|c| memex_core::validate::parse_frontmatter(c).ok())
-            .map(|(fm, _body)| {
-                let mut srcs = fm.sources;
-                if !srcs.iter().any(|s| s == transcript_path) {
-                    srcs.push(transcript_path.to_string());
-                }
-                (fm.created_at, srcs)
-            })
-            .unwrap_or_else(|| (now_dt, vec![transcript_path.to_string()]));
-
-        let yaml = serde_yaml::to_string(&memex_core::types::PageFrontmatterRef {
-            title: &safe_title,
-            summary: None,
-            tags: &page.tags,
-            collections: effective_collections,
-            created_at,
-            updated_at: now_dt,
-            sources: &sources,
-        })
-        .expect("frontmatter always serializes");
-        records.push(memex_core::search::IngestWikiPage {
-            slug: page.slug.clone(),
-            title: page.title.clone(),
-            content: format!("---\n{yaml}---\n\n{scrubbed_body}"),
-            tags: page.tags.join(","),
-        });
-    }
-    records
 }
 
 /// Drop EXTRACT pages with empty/invalid slug-title-body, re-slugify
@@ -985,7 +923,6 @@ fn validate_extracted_pages(
             Some(crate::daemon::queue::ExtractedPage {
                 slug,
                 title: page.title,
-                tags: page.tags,
                 body: memex_core::transcript::truncate(&page.body, 20_000),
             })
         })
@@ -1000,7 +937,7 @@ fn validate_extracted_pages(
 /// model-lock-bound. The caller must hold the embedder mutex; we don't
 /// take it here so the lifetime stays explicit.
 fn find_dedup_slugs(
-    search: &memex_core::search::Bm25Search,
+    search: &memex_core::search::Db,
     valid_pages: &[crate::daemon::queue::ExtractedPage],
     model: &mut dyn memex_core::embed::Embedder,
     memex_root: &Path,
@@ -1033,7 +970,7 @@ async fn materialize_dedup_pairs(
     for (page, slug) in valid_pages.iter().zip(slugs.into_iter()) {
         match slug {
             Some(slug) => {
-                let existing_path = wiki_dir.join(format!("{slug}.md"));
+                let existing_path = memex_core::wiki::wiki_path_for_slug(wiki_dir, &slug);
                 tracing::info!(slug = %slug, path = %existing_path.display(), "reading existing page for merge");
                 if let Ok(existing_content) = tokio::fs::read_to_string(&existing_path).await {
                     // Strip frontmatter before sending to MERGE. If we send
@@ -1063,7 +1000,7 @@ async fn materialize_dedup_pairs(
 /// the embedding model, and the memex root used to derive the DB-relative
 /// path stamped on the row.
 struct EmbedCtx<'a> {
-    search: &'a memex_core::search::Bm25Search,
+    search: &'a memex_core::search::Db,
     model: &'a mut dyn memex_core::embed::Embedder,
     memex_root: &'a Path,
 }
@@ -1086,41 +1023,6 @@ fn embed_and_mark(
     if let Err(e) = memex_core::retrieval::embed_document(ctx.search, hash, title, body, ctx.model) {
         tracing::warn!(error = ?e, %doc_type, path = %rel_str, "embed_document failed");
     }
-}
-
-/// Atomically write every wiki record to disk, in parallel. Returns
-/// the list of slugs that failed to write so the caller can surface
-/// the failure as a daemon error rather than silently continuing with
-/// a documents row whose file is missing on disk.
-async fn write_wiki_files(
-    wiki_dir: &Path,
-    records: &[memex_core::search::IngestWikiPage],
-) -> Vec<(String, String)> {
-    let _ = tokio::fs::create_dir_all(wiki_dir).await;
-    let handles: Vec<_> = records
-        .iter()
-        .map(|page| {
-            let page_path = wiki_dir.join(format!("{}.md", page.slug));
-            let slug = page.slug.clone();
-            let fut = async_atomic_write(page_path, page.content.as_bytes().to_vec());
-            tokio::spawn(async move { (slug, fut.await) })
-        })
-        .collect();
-    let mut failures = Vec::new();
-    for h in handles {
-        match h.await {
-            Ok((_, Ok(()))) => {}
-            Ok((slug, Err(e))) => {
-                tracing::warn!(slug = %slug, %e, "failed to write wiki page file");
-                failures.push((slug, e.to_string()));
-            }
-            Err(e) => {
-                tracing::warn!(?e, "wiki write task panicked");
-                failures.push((String::new(), format!("write task panicked: {e}")));
-            }
-        }
-    }
-    failures
 }
 
 /// Heuristic: does this slug violate the one-subject rule?
@@ -1192,4 +1094,5 @@ mod tests {
             );
         }
     }
+
 }

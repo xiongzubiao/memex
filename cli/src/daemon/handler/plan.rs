@@ -96,40 +96,35 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
     }
 
     if !overlap_inputs.is_empty() {
-        let merge_pairs: Vec<crate::daemon::queue::MergePair> = overlap_inputs
-            .iter()
-            .map(|(_, page, existing)| crate::daemon::queue::MergePair {
+        // Per-slug fan-out: each merge dry-run is its own LLM call so a
+        // slow or failing merge on one slug doesn't block or fail the
+        // others. Futures share borrowed state and are awaited in scope.
+        let merge_futs = overlap_inputs.iter().map(|(_, page, existing)| {
+            let pair = crate::daemon::queue::MergePair {
                 slug: page.slug.clone(),
                 proposed: page.body.clone(),
                 existing: existing.clone(),
+            };
+            run_worker_job(state, move |reply| {
+                crate::daemon::queue::BackendJob::Merge(crate::daemon::queue::MergeJob {
+                    pages: vec![pair],
+                    reply,
+                })
             })
-            .collect();
-        let merge_result = run_worker_job(state, |reply| {
-            crate::daemon::queue::BackendJob::Merge(crate::daemon::queue::MergeJob {
-                pages: merge_pairs,
-                reply,
-            })
-        })
-        .await;
-        match merge_result {
-            Ok(reply) => {
-                let mut merged_by_slug: std::collections::HashMap<
-                    String,
-                    crate::daemon::queue::ExtractedPage,
-                > = reply
-                    .merged_pages
-                    .into_iter()
-                    .map(|p| (p.slug.clone(), p))
-                    .collect();
-                for (idx, page, existing_body) in overlap_inputs {
-                    match merged_by_slug.remove(&page.slug) {
+        });
+        let merge_results = futures::future::join_all(merge_futs).await;
+        for ((idx, page, existing_body), result) in
+            overlap_inputs.into_iter().zip(merge_results)
+        {
+            match result {
+                Ok(reply) => {
+                    match reply.merged_pages.into_iter().find(|p| p.slug == page.slug) {
                         Some(merged) => {
                             let target_hash =
                                 memex_core::storage::content_hash(existing_body.as_bytes());
                             let merge_diff = compute_unified_diff(&existing_body, &merged.body);
                             let mut p = Proposal::new_for_page(idx, page);
                             p.title = merged.title;
-                            p.tags = merged.tags;
                             p.body = merged.body;
                             p.merge_target_slug = Some(p.slug.clone());
                             p.merge_target_hash = Some(target_hash);
@@ -143,11 +138,8 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
                         )),
                     }
                 }
-            }
-            Err(e) => {
-                let reason = e.message();
-                for (idx, page, _) in overlap_inputs {
-                    proposals.push(merge_failure_proposal(idx, page, &reason));
+                Err(e) => {
+                    proposals.push(merge_failure_proposal(idx, page, &e.message()));
                 }
             }
         }
@@ -242,7 +234,7 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
         }
         let target = plan.proposals[i].slug.clone();
         let _slug_guard =
-            crate::daemon::handler::acquire_slug_locks(&state.writer, vec![target.clone()]).await;
+            crate::daemon::handler::acquire_slug_lock(&state.writer, &target).await;
 
         let target_path = memex_core::wiki::wiki_path_for_slug(&wiki_dir, &target);
         if !target_path.exists() {
@@ -316,39 +308,33 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
         rereview_inputs.push((i, existing_body, existing_hash));
     }
 
-    // Phase 2: one batched MERGE-dry-run for all stale proposals.
+    // Phase 2: per-slug MERGE-dry-run for all stale proposals. Each
+    // re-merge is its own LLM call so a slow or failing slug doesn't
+    // block or fail the others.
     if !rereview_inputs.is_empty() {
-        let merge_pairs: Vec<crate::daemon::queue::MergePair> = rereview_inputs
-            .iter()
-            .map(|(i, existing, _)| crate::daemon::queue::MergePair {
+        let merge_futs = rereview_inputs.iter().map(|(i, existing, _)| {
+            let pair = crate::daemon::queue::MergePair {
                 slug: plan.proposals[*i].slug.clone(),
                 proposed: plan.proposals[*i].body.clone(),
                 existing: existing.clone(),
+            };
+            run_worker_job(state, move |reply| {
+                crate::daemon::queue::BackendJob::Merge(crate::daemon::queue::MergeJob {
+                    pages: vec![pair],
+                    reply,
+                })
             })
-            .collect();
-        let merge_result = run_worker_job(state, |reply| {
-            crate::daemon::queue::BackendJob::Merge(crate::daemon::queue::MergeJob {
-                pages: merge_pairs,
-                reply,
-            })
-        })
-        .await;
-        match merge_result {
-            Ok(reply) => {
-                let mut merged_by_slug: std::collections::HashMap<
-                    String,
-                    crate::daemon::queue::ExtractedPage,
-                > = reply
-                    .merged_pages
-                    .into_iter()
-                    .map(|p| (p.slug.clone(), p))
-                    .collect();
-                for (i, existing_body, existing_hash) in rereview_inputs {
-                    let target = plan.proposals[i].slug.clone();
-                    match merged_by_slug.remove(&target) {
+        });
+        let merge_results = futures::future::join_all(merge_futs).await;
+        for ((i, existing_body, existing_hash), result) in
+            rereview_inputs.into_iter().zip(merge_results)
+        {
+            let target = plan.proposals[i].slug.clone();
+            match result {
+                Ok(reply) => {
+                    match reply.merged_pages.into_iter().find(|p| p.slug == target) {
                         Some(merged) => {
                             plan.proposals[i].title = merged.title;
-                            plan.proposals[i].tags = merged.tags;
                             plan.proposals[i].merge_diff =
                                 Some(compute_unified_diff(&existing_body, &merged.body));
                             plan.proposals[i].body = merged.body;
@@ -362,11 +348,8 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
                         }
                     }
                 }
-            }
-            Err(e) => {
-                let reason = e.message();
-                for (i, _, _) in rereview_inputs {
-                    plan.proposals[i].error = Some(reason.clone());
+                Err(e) => {
+                    plan.proposals[i].error = Some(e.message());
                     any_failed = true;
                 }
             }
@@ -441,20 +424,15 @@ pub(super) async fn apply_proposal_to_wiki(
         }
     };
 
-    // Collapse newlines so YAML stays a single-line scalar; serde_yaml
-    // escapes the rest.
-    let safe_title = proposal.title.replace(['\n', '\r'], " ");
-    let yaml = serde_yaml::to_string(&memex_core::types::PageFrontmatterRef {
-        title: &safe_title,
-        summary: None,
-        tags: &proposal.tags,
-        collections: &[],
+    let file = memex_core::wiki::compose_wiki_markdown(
+        &proposal.title,
+        &proposal.body,
         created_at,
-        updated_at: now_dt,
-        sources: &sources,
-    })
+        &sources,
+        &[],
+        now_dt,
+    )
     .map_err(|e| DaemonError::Internal(format!("frontmatter serialize: {e}")))?;
-    let file = format!("---\n{yaml}---\n\n{}", proposal.body);
     crate::daemon::handler::async_atomic_write(wiki_path.clone(), file.into_bytes()).await?;
 
     // Index after write so chunks/embeddings stay consistent.
@@ -534,7 +512,8 @@ mod tests {
             )
         };
         let frontmatter = format!(
-            "---\ntitle: Existing\ntags: []\ncreated_at: 2024-01-01T00:00:00Z\nupdated_at: 2024-01-01T00:00:00Z\nsources: {yaml_sources}\n---\n\n{body}"
+            "---\ntitle: Existing
+created_at: 2024-01-01T00:00:00Z\nupdated_at: 2024-01-01T00:00:00Z\nsources: {yaml_sources}\n---\n\n{body}"
         );
         let path = wiki_dir.join(format!("{slug}.md"));
         std::fs::write(path, frontmatter).unwrap();
@@ -550,7 +529,6 @@ mod tests {
             index: 0,
             slug: "new-page".into(),
             title: "New Page".into(),
-            tags: vec!["t1".into()],
             body: "fresh body".into(),
             merge_target_slug: None,
             merge_target_hash: None,
@@ -566,7 +544,6 @@ mod tests {
         let body = std::fs::read_to_string(root.join("wiki/new-page.md")).unwrap();
         let (fm, parsed_body) = memex_core::validate::parse_frontmatter(&body).unwrap();
         assert_eq!(fm.title, "New Page");
-        assert_eq!(fm.tags, vec!["t1".to_string()]);
         assert_eq!(fm.sources, vec!["#src-test".to_string()]);
         assert!(parsed_body.contains("fresh body"), "got: {parsed_body}");
     }
@@ -576,20 +553,19 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
         let _ = memex_core::Memex::open(root.clone()).unwrap();
-        seed_existing_page(&root, "mmai", "old body", &["#src-old"]);
+        seed_existing_page(&root, "alpha", "old body", &["#src-old"]);
         let state = test_state(root.clone());
         let proposal = Proposal {
             index: 0,
-            slug: "mmai".into(),
-            title: "MMAI".into(),
-            tags: vec![],
+            slug: "alpha".into(),
+            title: "Alpha".into(),
             body: "merged body".into(),
-            merge_target_slug: Some("mmai".into()),
+            merge_target_slug: Some("alpha".into()),
             merge_target_hash: Some(memex_core::storage::content_hash("old body".as_bytes())),
             merge_diff: None,
             dropped: false,
             committed: false,
-            original_slug: "mmai".into(),
+            original_slug: "alpha".into(),
             error: None,
         };
         let prior = super::PriorPage::Existing {
@@ -599,7 +575,7 @@ mod tests {
         super::apply_proposal_to_wiki(&proposal, "src-new", prior, &state)
             .await
             .unwrap();
-        let body = std::fs::read_to_string(root.join("wiki/mmai.md")).unwrap();
+        let body = std::fs::read_to_string(root.join("wiki/alpha.md")).unwrap();
         let (fm, parsed_body) = memex_core::validate::parse_frontmatter(&body).unwrap();
         assert_eq!(
             fm.created_at.format("%Y-%m-%d").to_string(),
@@ -626,7 +602,6 @@ mod tests {
             index: 0,
             slug: "no-injection".into(),
             title: "Hello\nsources:\n  - \"#fake\"\nbogus: x".into(),
-            tags: vec![],
             body: "body".into(),
             merge_target_slug: None,
             merge_target_hash: None,
@@ -658,38 +633,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn apply_proposal_serializes_tag_with_special_chars() {
-        // A tag with embedded YAML-special chars must serialize back to a
-        // single tag (escaped), not inject new fields.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        let _ = memex_core::Memex::open(root.clone()).unwrap();
-        let state = test_state(root.clone());
-        let evil_tag = "evil\nbogus: x";
-        let proposal = Proposal {
-            index: 0,
-            slug: "tag-test".into(),
-            title: "OK".into(),
-            tags: vec!["clean".into(), evil_tag.into()],
-            body: "body".into(),
-            merge_target_slug: None,
-            merge_target_hash: None,
-            merge_diff: None,
-            dropped: false,
-            committed: false,
-            original_slug: "tag-test".into(),
-            error: None,
-        };
-        super::apply_proposal_to_wiki(&proposal, "src-x", super::PriorPage::New, &state)
-            .await
-            .unwrap();
-        let body = std::fs::read_to_string(root.join("wiki/tag-test.md")).unwrap();
-        let (fm, _) = memex_core::validate::parse_frontmatter(&body).unwrap();
-        assert_eq!(fm.tags.len(), 2, "tags expanded from injection: {:?}", fm.tags);
-        assert_eq!(fm.tags[0], "clean");
-        assert_eq!(fm.tags[1], evil_tag);
-    }
 
     #[tokio::test]
     async fn plan_apply_rejects_invalid_version() {

@@ -322,7 +322,6 @@ impl IntegrationHarness {
         let req = Request::Write {
             title: name.to_string(),
             content: body.to_string(),
-            tags: vec![],
             source: None,
             force: true,
         };

@@ -8,11 +8,9 @@ use crate::error::{MemexError, Result};
 pub struct RawFrontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")] pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub source_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub ingested_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub converter: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub agent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub session_id: Option<String>,
 }
 
 /// True for `http://` and `https://` source paths. Used to distinguish a
@@ -81,8 +79,6 @@ mod tests {
             ingested_at: Some("2026-04-26T10:00:00Z".into()),
             converter: Some("markitdown".into()),
             title: Some("T".into()),
-            agent: None,
-            session_id: None,
         };
         let s = assemble_raw_file(&fm, "body bytes");
         assert!(s.starts_with("---\n"));

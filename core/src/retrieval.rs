@@ -4,13 +4,13 @@
 
 use crate::embed::{EmbeddingModel, Embedder, catch_unwind_silent, load_model};
 use crate::error::Result;
-use crate::search::{self, Bm25Search, MIN_SCORE, SearchResult};
+use crate::search::{self, Db, MIN_SCORE, SearchResult};
 use crate::vector::vector_search_collapsed;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, path::PathBuf};
 
 /// Disk-read cache shared between the vector probes and the BM25
-/// snippet backfill. A wiki page that appears in primary, lex, vec,
+/// body-attach pass. A wiki page that appears in primary, lex, vec,
 /// and hyde lists is read from disk once per query.
 type BodyCache = std::collections::HashMap<(String, String), String>;
 
@@ -41,19 +41,23 @@ pub struct Expansion {
     /// HyDE term embeddings — same handling as `vec_embs`. Separate name
     /// for clarity; the retrieval treatment is identical.
     pub hyde_embs: Vec<Vec<f32>>,
+    /// HyDE string — used as additional tokens when scoring chunks for
+    /// best-chunk pick on legacy doc-granularity results. Shaped like a
+    /// hypothetical answer ("2023-05-07 — Caroline went to an LGBTQ
+    /// support group..."), so its content tokens often overlap with the
+    /// answer span in the wiki/raw.
+    pub hyde: String,
 }
 
 /// Hybrid BM25 + vector retrieval with optional expansion.
 ///
 /// `intent` (when `Some`) forces the weak-signal branch so the caller's
-/// expansion+rerank pipeline always runs, and is plumbed into
-/// `vector_search_as_results` so each `SearchResult.snippet` can be a
-/// focused excerpt that prefers intent-bearing lines.
+/// expansion+rerank pipeline always runs.
 ///
-/// `memex_root` is the on-disk root used to materialize chunk text into
-/// focused snippets (`crate::read_body_from_disk`).
+/// `memex_root` is the on-disk root used to materialize chunk bodies
+/// (`crate::read_body_from_disk`).
 pub fn hybrid_retrieve_expanded(
-    search: &Bm25Search,
+    search: &Db,
     question: &str,
     q_emb: &[f32],
     expansion: &Expansion,
@@ -62,8 +66,11 @@ pub fn hybrid_retrieve_expanded(
     memex_root: &std::path::Path,
 ) -> Result<HybridResult> {
     let collections = search::normalize_collections(collections);
-    let wiki = search.search_by_doc_type_in_collections(question, "wiki", 20, &collections)?;
-    let source = search.search_by_doc_type_in_collections(question, "raw", 20, &collections)?;
+    // Chunk-level BM25: each chunk is its own result so RRF dedupes at
+    // chunk granularity, letting multiple chunks of the same doc both
+    // surface. chunks_fts is indexed at ingest by store_chunk.
+    let wiki = search.search_chunks_by_doc_type(question, "wiki", 20, &collections)?;
+    let source = search.search_chunks_by_doc_type(question, "raw", 20, &collections)?;
 
     // Strong-signal probe: an obvious BM25 winner in *either* list is
     // sufficient justification to skip LLM expansion. Each list gets
@@ -80,20 +87,23 @@ pub fn hybrid_retrieve_expanded(
         Signal::Weak
     };
 
-    // Per-list RRF weights, factored as `wiki_factor × positional_factor`:
-    // - Wiki factor (2×): trust curated wiki content over raw source.
-    // - Positional factor (1×, disabled): QMD enables positional because
-    //   it has a post-RRF reranker to repair any over-boost; memex does not.
+    // Per-list RRF weights: primary 2× / expansion 1×.
+    // The primary list runs the user's literal query against BM25/vector;
+    // expansions (lex/vec/hyde rewrites) hedge against synonyms but at
+    // the cost of pulling in tangentially relevant chunks. Boosting the
+    // primary list biases retrieval toward the user's exact wording —
+    // critical when the wiki preserves source phrasing the user is likely
+    // to type. Mirrors QMD's `hybridQuery` (store.ts:4121-4122).
     const W_WIKI_PRIMARY: f32 = 2.0;
-    const W_SOURCE_PRIMARY: f32 = 1.0;
-    const W_WIKI_EXPANSION: f32 = 2.0;
+    const W_SOURCE_PRIMARY: f32 = 2.0;
+    const W_WIKI_EXPANSION: f32 = 1.0;
     const W_SOURCE_EXPANSION: f32 = 1.0;
 
     let mut lists = vec![wiki, source];
     let mut weights: Vec<f32> = vec![W_WIKI_PRIMARY, W_SOURCE_PRIMARY];
 
     // Cache disk reads per (doc_type, path), shared across every vector
-    // probe AND the BM25 snippet backfill — a wiki page that appears in
+    // probe AND the BM25 body-attach pass — a wiki page that appears in
     // primary, lex, vec, hyde lists is read from disk once per query.
     let mut body_cache: BodyCache = std::collections::HashMap::new();
 
@@ -139,12 +149,12 @@ pub fn hybrid_retrieve_expanded(
         )?;
     }
 
-    // Lex expansion — one wiki + one source BM25 probe per term.
+    // Lex expansion — one wiki + one source chunk-BM25 probe per term.
     for term in &expansion.lex {
-        let lex_wiki = search.search_by_doc_type_in_collections(term, "wiki", 20, &collections)?;
+        let lex_wiki = search.search_chunks_by_doc_type(term, "wiki", 20, &collections)?;
         lists.push(lex_wiki);
         weights.push(W_WIKI_EXPANSION);
-        let lex_source = search.search_by_doc_type_in_collections(term, "raw", 20, &collections)?;
+        let lex_source = search.search_chunks_by_doc_type(term, "raw", 20, &collections)?;
         lists.push(lex_source);
         weights.push(W_SOURCE_EXPANSION);
     }
@@ -181,10 +191,12 @@ pub fn hybrid_retrieve_expanded(
     let mut results: Vec<SearchResult> =
         fused.into_iter().filter(|r| r.score >= MIN_SCORE).collect();
 
-    backfill_bm25_snippets(
+    populate_bodies(
         &mut results,
         search,
         question,
+        &expansion.lex,
+        &expansion.hyde,
         intent,
         memex_root,
         &mut body_cache,
@@ -193,16 +205,14 @@ pub fn hybrid_retrieve_expanded(
     Ok(HybridResult { results, signal })
 }
 
-/// Stat-check + snippet-render pass for fused BM25/vector results.
+/// Stat-check + body-attach pass for fused BM25/vector results.
 ///
 /// Two responsibilities, deliberately fused into one pass so they
 /// share `body_cache` and the per-result iteration:
 ///
 /// 1. **Stat-check**: drop hits whose on-disk mtime/size disagree with
-///    the indexed values. Otherwise the snippet would slice the wrong
-///    bytes (chunk pos/len computed against a stale body). The vector
-///    path already does this via `meta_by_id` at chunk-fanout time;
-///    this is the BM25-side parallel.
+///    the indexed values. Otherwise the body slice would be cut from
+///    the wrong bytes (chunk pos/len computed against a stale body).
 ///    `retain` (not `swap_remove`) preserves the RRF-fused order — a
 ///    middle-ranked stale entry shouldn't push a tail-ranked entry
 ///    above its honest peers.
@@ -210,16 +220,26 @@ pub fn hybrid_retrieve_expanded(
 ///    instead of N per-row SELECTs: ~80 fused candidates used to mean
 ///    ~80 lock acquisitions on the query critical path.
 ///
-/// 2. **Snippet rendering**: for each surviving BM25-only hit (vector
-///    hits already brought their own snippet), score every chunk via
-///    `score_chunk` against query+intent terms, render a focused
-///    snippet from the best chunk's `(pos, len)`. Falls back to
-///    whole-body when no chunks exist (doc indexed without an ONNX
-///    model loaded).
-fn backfill_bm25_snippets(
+/// 2. **Body attach**: for chunk-granular results (`chunk_seq=Some`),
+///    slice the chunk bytes by stored `(pos, len)`. For legacy
+///    doc-granular results, score every chunk via `score_chunk`
+///    against query+intent terms and slice the best one. Falls back
+///    to whole-body when no chunks exist (doc indexed without an ONNX
+///    model loaded). Mirrors qmd's `--no-rerank` chunk-pick step
+///    (`src/store.ts:4129-4154`): the keyword-best chunk wins,
+///    never the vector-best chunk.
+///
+/// Query terms passed to `score_chunk` are filtered to those longer
+/// than 2 characters, matching qmd's `t.length > 2` filter at
+/// `src/store.ts:4131`. Short common tokens like "the", "did", "to"
+/// would contribute uniform noise to chunk scores; dropping them
+/// keeps the signal-bearing nouns and verbs in charge.
+fn populate_bodies(
     results: &mut Vec<SearchResult>,
-    search: &Bm25Search,
+    search: &Db,
     question: &str,
+    lex: &[String],
+    hyde: &str,
     intent: Option<&str>,
     memex_root: &std::path::Path,
     body_cache: &mut BodyCache,
@@ -245,9 +265,9 @@ fn backfill_bm25_snippets(
     results.retain(|r| {
         let path_str = r.path.to_string_lossy().to_string();
         match meta_by_pair.get(&(r.doc_type.clone(), path_str.clone())) {
-            Some(meta) => !is_result_stale(memex_root, &path_str, &meta.mtime, meta.size),
+            Some(meta) => !is_result_stale(memex_root, &path_str, meta.mtime, meta.size),
             // Pair absent: either concurrent delete between fusion
-            // and stat (correct to keep — snippet degrades gracefully)
+            // and stat (correct to keep — body slice degrades gracefully)
             // or the batched lookup failed and the map is empty (also
             // correct to keep — same fallback semantics as the prior
             // per-row Err arm).
@@ -255,15 +275,41 @@ fn backfill_bm25_snippets(
         }
     });
 
-    let query_terms: Vec<String> = question
+    // Tokenize: lowercase, strip leading/trailing punctuation, drop
+    // stopwords. No length filter; short content tokens (e.g. "AI",
+    // "ML", "JS") survive.
+    //
+    // Include lex + hyde tokens. lex is a 1-3 word distillation of the
+    // question; hyde is a hypothetical-answer sentence whose content
+    // tokens often overlap with the actual answer line. Both add
+    // discriminative power for chunks/lines whose vocabulary doesn't
+    // appear in the original question.
+    let mut combined_query = String::from(question);
+    for term in lex {
+        if !term.is_empty() {
+            combined_query.push(' ');
+            combined_query.push_str(term);
+        }
+    }
+    if !hyde.is_empty() {
+        combined_query.push(' ');
+        combined_query.push_str(hyde);
+    }
+    let query_terms: Vec<String> = combined_query
         .split_whitespace()
-        .map(|s| s.to_lowercase())
+        .map(|s| {
+            let lower = s.to_lowercase();
+            lower
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_string()
+        })
+        .filter(|t| !t.is_empty() && !crate::snippet::INTENT_STOP_WORDS.contains(&t.as_str()))
         .collect();
     let intent_terms = intent
         .map(crate::snippet::extract_intent_terms)
         .unwrap_or_default();
     for r in results.iter_mut() {
-        if !r.snippet.is_empty() {
+        if !r.body.is_empty() {
             continue;
         }
         let path_str = r.path.to_string_lossy().to_string();
@@ -277,7 +323,7 @@ fn backfill_bm25_snippets(
                             doc_type = %r.doc_type,
                             path = %path_str,
                             error = %e,
-                            "retrieval: read body failed; falling back to empty snippet"
+                            "retrieval: read body failed; leaving body empty"
                         );
                         String::new()
                     }
@@ -289,7 +335,14 @@ fn backfill_bm25_snippets(
         let chunks: Vec<(usize, usize)> = search
             .with_connection(|c| crate::vector::list_chunks_by_hash(c, &r.hash))
             .unwrap_or_default();
-        let (best_pos, best_len) = if chunks.is_empty() {
+        let (best_pos, best_len) = if let Some(seq) = r.chunk_seq {
+            // Result was retrieved at chunk granularity, so use that
+            // specific chunk's bytes rather than re-running a per-chunk pick.
+            chunks
+                .get(seq as usize)
+                .copied()
+                .unwrap_or((0, body.len()))
+        } else if chunks.is_empty() {
             (0, body.len())
         } else {
             chunks
@@ -310,15 +363,10 @@ fn backfill_bm25_snippets(
                 })
                 .unwrap_or((0, body.len()))
         };
-        let snippet_result = crate::snippet::extract_focused_snippet(
-            body,
-            best_pos,
-            best_len,
-            question,
-            intent,
-            crate::snippet::SNIPPET_MAX_LEN,
-        );
-        r.snippet = snippet_result;
+        r.body = body
+            .get(best_pos..best_pos + best_len)
+            .unwrap_or("")
+            .to_string();
     }
 }
 
@@ -451,13 +499,13 @@ pub const EMBED_BATCH_SIZE: usize = 8;
 /// `EMBED_BATCH_SIZE` per ONNX call. Errors propagate from embedding or
 /// storage failures.
 pub fn embed_document(
-    search: &Bm25Search,
+    search: &Db,
     hash: &str,
     title: &str,
     body: &str,
     model: &mut dyn Embedder,
 ) -> Result<()> {
-    let chunks = crate::chunking::chunk_text(body, 900, 0.15);
+    let chunks = crate::chunking::chunk_full_pipeline(body, model)?;
 
     // Build all prefixed inputs upfront, then embed in batches of
     // `EMBED_BATCH_SIZE` per ONNX call.
@@ -476,7 +524,8 @@ pub fn embed_document(
     search.with_transaction(|tx| {
         crate::vector::delete_chunks(tx, hash)?;
         for (seq, (chunk, emb)) in chunks.iter().zip(all_embeds.iter()).enumerate() {
-            crate::vector::store_chunk(tx, hash, seq as i32, chunk.pos, chunk.len, emb)?;
+            let chunk_text = &body[chunk.pos..chunk.pos + chunk.len];
+            crate::vector::store_chunk(tx, hash, seq as i32, chunk.pos, chunk.len, chunk_text, emb)?;
         }
         // Stamp embed_model atomically with chunk write. Without this,
         // a tx-then-stamp split races: chunks land but the stamp lands
@@ -507,13 +556,13 @@ pub fn embed_document(
 /// (e.g. "Caroline" fuzzy-matching "Gina" because both embed as "person"),
 /// which corrupts the merge pipeline downstream.
 pub fn search_wiki_by_title(
-    search: &Bm25Search,
+    search: &Db,
     title: &str,
     model: &mut dyn Embedder,
     memex_root: &std::path::Path,
 ) -> Result<Option<String>> {
     let bm25 = search
-        .search_title_only(title, "wiki", 5)
+        .search_by_doc_type(title, "wiki", 5, &[])
         .ok()
         .unwrap_or_default();
     if bm25.is_empty() {
@@ -538,7 +587,7 @@ pub fn search_wiki_by_title(
     // (e.g. "Auth Migration" over "Auth Service").
     let title_emb = embed_query(model, title)?;
     let mut body_cache = std::collections::HashMap::new();
-    // Dedup path: no user query/intent — the snippet is unused (caller
+    // Dedup path: no user query/intent — the body is unused (caller
     // only inspects path/slug).
     let dedup_ctx = VecQueryCtx {
         search,
@@ -590,7 +639,7 @@ fn slug_from_search_result(r: &search::SearchResult) -> Option<String> {
 fn is_result_stale(
     memex_root: &std::path::Path,
     rel_path: &str,
-    indexed_mtime: &str,
+    indexed_mtime: std::time::SystemTime,
     indexed_size: i64,
 ) -> bool {
     let abs = memex_root.join(rel_path);
@@ -607,7 +656,9 @@ fn is_result_stale(
                 return true;
             }
             let on_disk_size = meta.len() as i64;
-            let on_disk_mtime = crate::storage::file_mtime_iso(&abs);
+            let Ok(on_disk_mtime) = meta.modified() else {
+                return true; // platform/fs without mtime → treat as stale
+            };
             on_disk_size != indexed_size || on_disk_mtime != indexed_mtime
         }
         Err(_) => true, // file missing → always stale
@@ -616,18 +667,21 @@ fn is_result_stale(
 
 /// Map chunk-level vector search hits to document-level SearchResults.
 ///
-/// Materializes a focused snippet for each result by reading the doc body
-/// from disk and slicing around the matching chunk via `(pos, len)`. The
-/// snippet is a diff-style header + numbered window picked by
-/// `crate::snippet::extract_focused_snippet`, optionally biased toward
-/// `intent`-bearing lines. Non-query callers can pass `intent = None`
-/// and `primary_query = ""` — the line picker falls through to line 0
-/// in that case.
+/// Returns one result per distinct doc with `body = ""`. Body
+/// attachment is the responsibility of `populate_bodies`, which runs
+/// after RRF fusion and picks the keyword-best chunk per doc — so
+/// every result, regardless of which list (BM25 or vector) introduced
+/// it, gets the same chunk-pick treatment. Mirrors qmd's `--no-rerank`
+/// path where `bestIdx` is determined by binary keyword overlap rather
+/// than vector similarity (`src/store.ts:4129-4154`).
+///
+/// `(pos, len)` from the vector hit is no longer consumed here; the
+/// post-fusion chunk picker re-reads the chunks list from the index.
 /// Per-query context bundled for `vector_search_as_results`. Stable for
 /// the lifetime of one user query — only the embedding + doc_type vary
 /// across the wiki/raw fan-out, so they stay positional args.
 pub struct VecQueryCtx<'a> {
-    pub search: &'a Bm25Search,
+    pub search: &'a Db,
     pub collections: &'a [String],
     pub primary_query: &'a str,
     pub intent: Option<&'a str>,
@@ -640,11 +694,15 @@ pub fn vector_search_as_results(
     doc_type: &str,
     body_cache: &mut std::collections::HashMap<(String, String), String>,
 ) -> Result<Vec<SearchResult>> {
+    // body_cache is unused here now (body attach moved to
+    // populate_bodies). Kept in the signature so callers don't have to
+    // thread two cache instances; populate_bodies will warm it instead.
+    let _ = body_cache;
     let VecQueryCtx {
         search,
         collections,
-        primary_query,
-        intent,
+        primary_query: _,
+        intent: _,
         memex_root,
     } = *ctx;
     // Per-doc_type pool size. Larger than the BM25 list limit (20)
@@ -658,7 +716,7 @@ pub fn vector_search_as_results(
         120
     };
     let vec_results = search
-        .with_connection(|conn| vector_search_collapsed(conn, q_emb, fetch_limit, doc_type))?;
+        .with_connection(|conn| vector_search_collapsed(conn, q_emb, fetch_limit * 5, doc_type))?;
 
     let selected: HashSet<String> = selected.into_iter().collect();
     let mut out = Vec::new();
@@ -701,40 +759,20 @@ pub fn vector_search_as_results(
             // refreshes the index, and `memex lint` surfaces the drift
             // if the user asks.
             if let Some((indexed_mtime, indexed_size)) = meta_by_id.get(&doc.id)
-                && is_result_stale(memex_root, &doc.path, indexed_mtime, *indexed_size)
+                && is_result_stale(memex_root, &doc.path, *indexed_mtime, *indexed_size)
             {
                 continue;
             }
-            let cache_key = (doc.doc_type.clone(), doc.path.clone());
-            let body = body_cache.entry(cache_key).or_insert_with(|| {
-                match crate::read_body_from_disk(memex_root, &doc.doc_type, &doc.path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            doc_type = %doc.doc_type,
-                            path = %doc.path,
-                            error = %e,
-                            "retrieval: read body failed; falling back to empty snippet"
-                        );
-                        String::new()
-                    }
-                }
-            });
-            let snippet_result = crate::snippet::extract_focused_snippet(
-                body,
-                vr.pos,
-                vr.len,
-                primary_query,
-                intent,
-                crate::snippet::SNIPPET_MAX_LEN,
-            );
+            // Snippet is left empty; populate_bodies fills it after fusion
+            // using the chunk identified by `chunk_seq`.
             out.push(SearchResult {
                 path: PathBuf::from(&doc.path),
                 title: doc.title.clone(),
                 score: vr.score,
-                snippet: snippet_result,
+                body: String::new(),
                 doc_type: doc.doc_type.clone(),
                 hash: vr.hash.clone(),
+                chunk_seq: Some(vr.seq),
             });
         }
     }
@@ -764,8 +802,8 @@ mod tests {
         search
             .with_transaction(|tx| {
                 tx.execute(
-                    "INSERT INTO documents (doc_type, path, title, hash, tags, source, mtime, size) \
-                     VALUES ('wiki', 'wiki/atomic.md', 'Atomic', ?1, '', NULL, '2026-04-30T00:00:00Z', ?2)",
+                    "INSERT INTO documents (doc_type, path, title, hash, source, mtime, size) \
+                     VALUES ('wiki', 'wiki/atomic.md', 'Atomic', ?1, NULL, 1000, ?2)",
                     rusqlite::params![&hash, body.len() as i64],
                 )?;
                 Ok(())
@@ -816,10 +854,11 @@ mod tests {
         let abs = dir.path().join(rel);
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         std::fs::write(&abs, "body content").unwrap();
-        let mtime = crate::storage::file_mtime_iso(&abs);
-        let size = std::fs::metadata(&abs).unwrap().len() as i64;
+        let meta = std::fs::metadata(&abs).unwrap();
+        let mtime = meta.modified().unwrap();
+        let size = meta.len() as i64;
         assert!(
-            !is_result_stale(dir.path(), rel, &mtime, size),
+            !is_result_stale(dir.path(), rel, mtime, size),
             "matching mtime+size => not stale"
         );
     }
@@ -831,10 +870,10 @@ mod tests {
         let abs = dir.path().join(rel);
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
         std::fs::write(&abs, "body content").unwrap();
-        let mtime = crate::storage::file_mtime_iso(&abs);
+        let mtime = std::fs::metadata(&abs).unwrap().modified().unwrap();
         let indexed_size = 9999i64; // pretend index thinks it's a different size
         assert!(
-            is_result_stale(dir.path(), rel, &mtime, indexed_size),
+            is_result_stale(dir.path(), rel, mtime, indexed_size),
             "size mismatch => stale"
         );
     }
@@ -854,7 +893,8 @@ mod tests {
         // Index a wiki document (the on-disk content + DB row + mtime/size).
         std::fs::write(
             memex.wiki_dir().join("auth.md"),
-            format!("---\ntitle: Auth\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body}"),
+            format!("---\ntitle: Auth
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body}"),
         )
         .unwrap();
         crate::index_wiki::index_wiki_file(
@@ -870,7 +910,7 @@ mod tests {
         memex
             .search()
             .with_connection(|conn| {
-                crate::vector::store_chunk(conn, &body_hash, 0, 0, body.len(), &fixture)?;
+                crate::vector::store_chunk(conn, &body_hash, 0, 0, body.len(), "", &fixture)?;
                 Ok(())
             })
             .unwrap();
@@ -893,7 +933,8 @@ mod tests {
         // pos/len coordinates.
         std::fs::write(
             memex.wiki_dir().join("auth.md"),
-            format!("---\ntitle: Auth\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body} ADDITIONAL EDITED CONTENT"),
+            format!("---\ntitle: Auth
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body} ADDITIONAL EDITED CONTENT"),
         )
         .unwrap();
         let mut body_cache2 = std::collections::HashMap::new();
@@ -919,7 +960,8 @@ mod tests {
         let body = "Working with the linux kernel internals requires deep knowledge.";
         std::fs::write(
             memex.wiki_dir().join("kernel-notes.md"),
-            format!("---\ntitle: Kernel Notes\ntags: []\nsources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\n---\n\n{body}"),
+            format!("---\ntitle: Kernel Notes
+sources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\n---\n\n{body}"),
         )
         .unwrap();
         crate::index_wiki::index_wiki_file(
@@ -944,12 +986,12 @@ mod tests {
         .unwrap();
         assert_eq!(pre.results.len(), 1, "baseline: BM25 finds kernel-notes");
 
-        // Corrupt the indexed mtime — file on disk is fresh, DB says ancient.
+        // Corrupt the indexed mtime — file on disk is fresh, DB says 0 (ancient).
         memex
             .search()
             .with_connection(|conn| {
                 conn.execute(
-                    "UPDATE documents SET mtime='1900-01-01T00:00:00Z' \
+                    "UPDATE documents SET mtime=0 \
                      WHERE doc_type='wiki' AND path='wiki/kernel-notes.md'",
                     [],
                 )?;
@@ -979,7 +1021,7 @@ mod tests {
     fn stat_check_flags_stale_when_file_missing() {
         let dir = TempDir::new().unwrap();
         assert!(
-            is_result_stale(dir.path(), "wiki/gone.md", "2026-04-30T00:00:00Z", 100),
+            is_result_stale(dir.path(), "wiki/gone.md", std::time::UNIX_EPOCH, 100),
             "missing file => stale"
         );
     }
@@ -996,7 +1038,7 @@ mod tests {
         let target = dir.path().join("target.md");
         std::fs::write(&target, "regular body").unwrap();
         let target_meta = std::fs::metadata(&target).unwrap();
-        let target_mtime = crate::storage::file_mtime_iso(&target);
+        let target_mtime = target_meta.modified().unwrap();
         let target_size = target_meta.len() as i64;
 
         // Symlink wiki/link.md → target.md within the same dir.
@@ -1008,7 +1050,7 @@ mod tests {
         // Without symlink-aware checking, the function would follow the
         // symlink and report "not stale" because target metadata matches.
         assert!(
-            is_result_stale(dir.path(), "wiki/link.md", &target_mtime, target_size),
+            is_result_stale(dir.path(), "wiki/link.md", target_mtime, target_size),
             "symlink with target-matching metadata must still be flagged stale"
         );
     }

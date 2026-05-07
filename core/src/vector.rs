@@ -17,14 +17,15 @@ pub struct VectorResult {
 }
 
 /// Store a chunk: position metadata in `chunks`, embedding in the sqlite-vec
-/// `chunks_vec` virtual table. The two rows are keyed so `chunks.hash ||
-/// '_' || chunks.seq == chunks_vec.hash_seq`.
+/// `chunks_vec` virtual table, and chunk text in `chunks_fts` for chunk-level
+/// BM25. The three rows are keyed by (hash, seq).
 pub fn store_chunk(
     conn: &Connection,
     hash: &str,
     seq: i32,
     pos: usize,
     len: usize,
+    chunk_text: &str,
     embedding: &[f32],
 ) -> Result<()> {
     conn.execute(
@@ -45,6 +46,17 @@ pub fn store_chunk(
     conn.execute(
         "INSERT INTO chunks_vec (hash_seq, embedding) VALUES (?1, ?2)",
         rusqlite::params![hash_seq, blob],
+    )?;
+
+    // chunks_fts: contentless FTS5, no INSERT OR REPLACE. Delete-then-insert
+    // by (hash, seq) so re-embed/re-ingest replaces the indexed chunk text.
+    conn.execute(
+        "DELETE FROM chunks_fts WHERE hash = ?1 AND seq = ?2",
+        rusqlite::params![hash, seq],
+    )?;
+    conn.execute(
+        "INSERT INTO chunks_fts(chunk_text, hash, seq) VALUES (?1, ?2, ?3)",
+        rusqlite::params![chunk_text, hash, seq],
     )?;
     Ok(())
 }
@@ -193,8 +205,8 @@ pub fn list_chunks_by_hash(conn: &Connection, hash: &str) -> Result<Vec<(usize, 
     Ok(rows)
 }
 
-/// Delete all chunks for a given content hash from both the chunks table
-/// and the sqlite-vec index.
+/// Delete all chunks for a given content hash from the chunks table, the
+/// sqlite-vec index, and chunks_fts.
 pub fn delete_chunks(conn: &Connection, hash: &str) -> Result<()> {
     // Fetch affected seqs first so we can delete matching chunks_vec rows.
     let seqs: Vec<i32> = {
@@ -207,6 +219,7 @@ pub fn delete_chunks(conn: &Connection, hash: &str) -> Result<()> {
         let hash_seq = format!("{hash}_{seq}");
         let _ = conn.execute("DELETE FROM chunks_vec WHERE hash_seq = ?1", [hash_seq]);
     }
+    conn.execute("DELETE FROM chunks_fts WHERE hash = ?1", [hash])?;
     conn.execute("DELETE FROM chunks WHERE hash = ?1", [hash])?;
     Ok(())
 }
@@ -240,8 +253,8 @@ mod tests {
     /// goes through `commit_doc`.
     fn insert_wiki_doc(conn: &Connection, hash: &str) {
         conn.execute(
-            "INSERT OR IGNORE INTO documents (doc_type, path, title, hash, tags, source, mtime, size, embed_model, embedded_at)
-             VALUES ('wiki', ?1, '', ?2, '', NULL, '', 0, NULL, NULL)",
+            "INSERT OR IGNORE INTO documents (doc_type, path, title, hash, source, mtime, size, embed_model, embedded_at)
+             VALUES ('wiki', ?1, '', ?2, NULL, '', 0, NULL, NULL)",
             rusqlite::params![format!("wiki/{hash}.md"), hash],
         )
         .unwrap();
@@ -263,7 +276,7 @@ mod tests {
     fn store_and_search_vectors() {
         let conn = setup_db();
         insert_wiki_doc(&conn, "hash1");
-        store_chunk(&conn, "hash1", 0, 0, 10, &fake_embedding(0.5)).unwrap();
+        store_chunk(&conn, "hash1", 0, 0, 10, "", &fake_embedding(0.5)).unwrap();
         let results = vector_search(&conn, &fake_embedding(0.5), 10, "wiki").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].hash, "hash1");
@@ -279,13 +292,13 @@ mod tests {
         let query = dir_embedding(1.0, 0.0);
 
         let emb_a = dir_embedding(0.95, 0.05);
-        store_chunk(&conn, "hash1", 0, 0, 7, &emb_a).unwrap();
+        store_chunk(&conn, "hash1", 0, 0, 7, "", &emb_a).unwrap();
 
         let emb_b = dir_embedding(0.9, 0.1);
-        store_chunk(&conn, "hash1", 1, 0, 7, &emb_b).unwrap();
+        store_chunk(&conn, "hash1", 1, 0, 7, "", &emb_b).unwrap();
 
         let emb_c = dir_embedding(0.5, 0.5);
-        store_chunk(&conn, "hash2", 0, 0, 7, &emb_c).unwrap();
+        store_chunk(&conn, "hash2", 0, 0, 7, "", &emb_c).unwrap();
 
         let results = vector_search_collapsed(&conn, &query, 10, "wiki").unwrap();
         // One row per hash; hash1 should win with its better chunk.
@@ -298,7 +311,7 @@ mod tests {
     #[test]
     fn store_chunk_inserts_pos_len_and_vec() {
         let conn = setup_db();
-        store_chunk(&conn, "hash1", 0, 42, 100, &fake_embedding(0.5)).unwrap();
+        store_chunk(&conn, "hash1", 0, 42, 100, "", &fake_embedding(0.5)).unwrap();
         let (pos, len): (i64, i64) = conn
             .query_row(
                 "SELECT pos, len FROM chunks WHERE hash='hash1' AND seq=0",

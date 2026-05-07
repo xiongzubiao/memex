@@ -5,11 +5,21 @@
 
 use memex_core::Memex;
 use memex_core::retrieval::{hybrid_retrieve_expanded, Expansion, Signal};
-use memex_core::search::UpsertDocument;
+use memex_core::search::{commit_doc, DocSpec};
 use tempfile::TempDir;
 
-fn upsert(memex: &Memex, doc: UpsertDocument) {
-    memex.search().upsert_document(&doc).unwrap();
+/// Seed a document via `commit_doc` so chunks + chunks_fts get
+/// populated. Chunk-level BM25 retrieval queries chunks_fts, not
+/// documents_fts, so a plain `upsert_document` would leave the body
+/// invisible to retrieval.
+fn upsert(memex: &Memex, doc: DocSpec) {
+    memex
+        .search()
+        .with_transaction(|tx| {
+            commit_doc(tx, &doc)?;
+            Ok(())
+        })
+        .unwrap();
 }
 
 /// Insert 8 unrelated decoy wiki pages so BM25 idf is meaningful. With
@@ -27,19 +37,16 @@ fn insert_decoys(memex: &Memex) {
         ("decoy-sql", "SQL Indexing", "B-tree indexes let queries find rows without scanning the table."),
         ("decoy-tcp", "TCP Handshake", "SYN, SYN-ACK, ACK establishes a reliable connection."),
     ];
-    for (i, (slug, title, body)) in decoys.iter().enumerate() {
-        let hash = format!("{:0>64}", format!("d{i:0>2}"));
+    for (slug, title, body) in decoys.iter() {
         upsert(
             memex,
-            UpsertDocument {
+            DocSpec {
                 doc_type: "wiki",
                 path: &format!("wiki/{slug}.md"),
                 title,
-                hash: &hash,
-                tags: "entity",
                 source: None,
                 body,
-                mtime: "2026-04-27T00:00:00Z",
+                mtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1000),
                 size: body.len() as i64,
             },
         );
@@ -57,30 +64,27 @@ fn strong_signal_fires_on_source_only_match() {
     // be signal=strong because the source list has a clean winner.
     upsert(
         &memex,
-        UpsertDocument {
+        DocSpec {
             doc_type: "wiki",
             path: "wiki/cooking.md",
             title: "Pasta Cooking",
-            hash: "0000000000000000000000000000000000000000000000000000000000000001",
-            tags: "entity",
             source: None,
             body: "Boil pasta in salted water until al dente.",
-            mtime: "2026-04-27T00:00:00Z",
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1000),
             size: 42,
         },
     );
     upsert(
         &memex,
-        UpsertDocument {
+        DocSpec {
             doc_type: "raw",
             path: "raw/aa/transcript.md",
             title: "Bearer token discussion",
-            hash: "0000000000000000000000000000000000000000000000000000000000000002",
-            tags: "",
             source: Some("transcript"),
-            body: "Bearer tokens are short-lived credentials. The bearer header carries the token. \
-                   Bearer authentication is a stateless scheme.",
-            mtime: "2026-04-27T00:00:00Z",
+            body: "Bearer tokens. Bearer tokens. Bearer tokens. Bearer tokens. \
+                   Bearer tokens are short-lived credentials. Bearer tokens flow through HTTP \
+                   headers. Bearer tokens authenticate the caller. Bearer authentication.",
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1000),
             size: 200,
         },
     );
@@ -108,29 +112,25 @@ fn weak_signal_when_no_clean_winner() {
     // Two source docs both matching "bearer" — no clean gap between them.
     upsert(
         &memex,
-        UpsertDocument {
+        DocSpec {
             doc_type: "raw",
             path: "raw/aa/transcript1.md",
             title: "Bearer token discussion",
-            hash: "0000000000000000000000000000000000000000000000000000000000000003",
-            tags: "",
             source: Some("transcript"),
             body: "Bearer tokens are short-lived credentials.",
-            mtime: "2026-04-27T00:00:00Z",
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1000),
             size: 50,
         },
     );
     upsert(
         &memex,
-        UpsertDocument {
+        DocSpec {
             doc_type: "raw",
             path: "raw/bb/transcript2.md",
             title: "Bearer Auth Flow",
-            hash: "0000000000000000000000000000000000000000000000000000000000000004",
-            tags: "",
             source: Some("transcript"),
             body: "Bearer tokens flow through HTTP headers.",
-            mtime: "2026-04-27T00:00:00Z",
+            mtime: std::time::UNIX_EPOCH + std::time::Duration::from_nanos(1000),
             size: 50,
         },
     );

@@ -55,8 +55,6 @@ pub enum Request {
         title: String,
         content: String,
         #[serde(default)]
-        tags: Vec<String>,
-        #[serde(default)]
         source: Option<String>,
         #[serde(default)]
         force: bool,
@@ -350,11 +348,10 @@ mod tests {
             serde_json::from_str(r#"{"op":"write","title":"Test","content":"body"}"#).unwrap();
         match r {
             Request::Write {
-                title, content, tags, source, force, ..
+                title, content, source, force, ..
             } => {
                 assert_eq!(title, "Test");
                 assert_eq!(content, "body");
-                assert!(tags.is_empty());
                 assert!(source.is_none());
                 assert!(!force);
             }
@@ -582,11 +579,11 @@ mod tests {
     #[test]
     fn plan_applied_event_serializes_with_committed_list() {
         let e = Event::PlanApplied {
-            committed: vec!["mmai".into(), "gpu-checkpoint".into()],
+            committed: vec!["alpha".into(), "gpu-checkpoint".into()],
         };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""type":"plan_applied""#));
-        assert!(s.contains(r#""mmai""#));
+        assert!(s.contains(r#""alpha""#));
         assert!(s.contains(r#""gpu-checkpoint""#));
     }
 }

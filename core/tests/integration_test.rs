@@ -26,7 +26,8 @@ fn lint_detects_dangling_link() {
 
     std::fs::write(
         root.join("wiki/page-a.md"),
-        "---\ntitle: Page A\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSee [[ghost-page]] for more.\n",
+        "---\ntitle: Page A
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSee [[ghost-page]] for more.\n",
     ).unwrap();
 
     let report = memex.lint().unwrap();
@@ -46,7 +47,8 @@ fn reindex_populates_search() {
 
     std::fs::write(
         root.join("wiki/test-topic.md"),
-        "---\ntitle: Test Topic\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSome content about the topic.\n",
+        "---\ntitle: Test Topic
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSome content about the topic.\n",
     ).unwrap();
 
     memex.reindex().unwrap();

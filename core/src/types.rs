@@ -9,8 +9,6 @@ pub struct PageFrontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
     pub collections: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -27,7 +25,6 @@ pub struct PageFrontmatterRef<'a> {
     pub title: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<&'a str>,
-    pub tags: &'a [String],
     pub collections: &'a [String],
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -91,7 +88,6 @@ pub struct Document {
     pub path: String,
     pub title: String,
     pub hash: String,
-    pub tags: String,
 }
 
 #[cfg(test)]
@@ -103,7 +99,6 @@ mod tests {
         let fm = PageFrontmatter {
             title: "Test".to_string(),
             summary: Some("A test page.".to_string()),
-            tags: vec!["entity".to_string()],
             collections: vec!["default".to_string()],
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -112,7 +107,7 @@ mod tests {
         let yaml = serde_yaml::to_string(&fm).unwrap();
         let back: PageFrontmatter = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(back.title, "Test");
-        assert_eq!(back.tags, vec!["entity"]);
+        assert_eq!(back.collections, vec!["default"]);
     }
 
     /// Locks in the YAML shape that `cli/src/daemon/handler.rs` depends on
@@ -122,7 +117,6 @@ mod tests {
         let fm = PageFrontmatter {
             title: "T".to_string(),
             summary: None,
-            tags: vec![],
             collections: vec![],
             created_at: "2026-04-24T00:00:00Z".parse().unwrap(),
             updated_at: "2026-04-24T00:00:00Z".parse().unwrap(),
@@ -134,14 +128,5 @@ mod tests {
             "summary must be omitted when None: {yaml}"
         );
         assert!(yaml.ends_with('\n'), "must end with newline: {yaml:?}");
-        assert!(yaml.contains("tags: []"), "empty tags render as []: {yaml}");
-    }
-
-    #[test]
-    fn frontmatter_tags_default_to_empty() {
-        let yaml = "title: No Tags\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n";
-        let fm: PageFrontmatter = serde_yaml::from_str(yaml).unwrap();
-        assert!(fm.tags.is_empty());
-        assert!(fm.collections.is_empty());
     }
 }

@@ -29,6 +29,7 @@ rand = "0.8"
 dirs = "5.0"
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 tracing = "0.1"
+sentencex = "0.1.23"
 
 [build-dependencies]
 serde_json = "1.0"

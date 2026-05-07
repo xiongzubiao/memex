@@ -6,63 +6,45 @@
 
 
 use crate::common;
-use memex_cli::daemon::handler::{HandlerState, handle};
+use memex_cli::daemon::handler::{
+    HandlerState, ReaderSession, SharedEmbedder, WriterSession, handle, shared_embedder,
+};
 use memex_cli::daemon::memex_handle::MemexHandle;
 use memex_cli::daemon::protocol::{Event, Request};
-use memex_cli::daemon::retrieval::{Entry, RetrievalReq, RetrievalResp};
+use memex_cli::daemon::retrieval;
 use memex_core::Memex;
-use memex_core::retrieval::Signal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-fn spawn_retrieval_actor(
-    root: PathBuf,
-) -> (
-    tokio::sync::mpsc::Sender<RetrievalReq>,
-    tokio::task::JoinHandle<()>,
-) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<RetrievalReq>(1);
-    let handle = tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            let memex = Memex::open(root.clone()).unwrap();
-            let results = memex
-                .search()
-                .search_by_doc_type_in_collections(
-                    &req.question,
-                    "wiki",
-                    req.top_k,
-                    &req.collections,
-                )
-                .unwrap();
-
-            let entries = results
-                .into_iter()
-                .enumerate()
-                .map(|(idx, r)| {
-                    let title = std::path::Path::new(&r.path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| r.title.clone());
-                    Entry {
-                        id: memex_core::docid::short(&r.hash).to_string(),
-                        title,
-                        doc_type: r.doc_type.clone(),
-                        rank: (idx + 1) as u32,
-                        signal: Signal::Strong,
-                        body: std::fs::read_to_string(root.join(&r.path)).unwrap_or_default(),
-                    }
-                })
-                .collect();
-
-            let _ = req.reply.send(Ok(RetrievalResp {
-                entries,
-                signal: Signal::Strong,
-            }));
-        }
-    });
-    (tx, handle)
+/// Build a HandlerState wired to the **production** retrieval actor
+/// (title-FTS + chunk-FTS + vector + RRF + signal classification).
+/// Sharing the MemexHandle and SharedEmbedder between the actor and
+/// the handler keeps test and production query paths in lockstep —
+/// avoids the test-vs-prod divergence the previous stub permitted.
+fn test_state(root: PathBuf) -> HandlerState {
+    let memex_handle = MemexHandle::new();
+    let _ = memex_handle.get_or_open(&root);
+    let embed_model: SharedEmbedder = shared_embedder(memex_core::embed::MockEmbedder);
+    let retrieval_tx = retrieval::spawn(memex_handle.clone(), embed_model.clone());
+    let reader = ReaderSession {
+        bound_root: root,
+        memex_handle,
+        embed_model,
+    };
+    let writer = WriterSession {
+        reader,
+        slug_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        content_hash_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
+    HandlerState {
+        pid: 1234,
+        started_at: chrono::Utc::now(),
+        retrieval: retrieval_tx,
+        jobs: Arc::new(memex_cli::daemon::worker::WorkerPool::new_inert_for_test()),
+        config: Arc::new(memex_cli::daemon::config::Config::default()),
+        writer,
+    }
 }
 
 fn context_entry_titles(events: &[Event]) -> Vec<String> {
@@ -86,33 +68,6 @@ fn context_entry_titles(events: &[Event]) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn test_state(
-    retrieval: tokio::sync::mpsc::Sender<RetrievalReq>,
-    bound_root: PathBuf,
-) -> HandlerState {
-    let reader_session = memex_cli::daemon::handler::ReaderSession {
-        bound_root,
-        memex_handle: MemexHandle::new(),
-        embed_model: memex_cli::daemon::handler::shared_embedder(memex_core::embed::MockEmbedder),
-    };
-    let writer_session = memex_cli::daemon::handler::WriterSession {
-        reader: reader_session,
-        slug_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        content_hash_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    };
-    HandlerState {
-        pid: 1234,
-        started_at: chrono::Utc::now(),
-        retrieval,
-        jobs: Arc::new(memex_cli::daemon::worker::WorkerPool::new(
-            memex_cli::daemon::config::WorkerConfig::default(),
-            MemexHandle::new(),
-        )),
-        config: Arc::new(memex_cli::daemon::config::Config::default()),
-        writer: writer_session,
-    }
-}
-
 #[tokio::test]
 async fn query_raw_returns_indexed_entry() {
     let tmp = TempDir::new().unwrap();
@@ -125,8 +80,7 @@ async fn query_raw_returns_indexed_entry() {
         "- 2026-04-16: Production rollout begins",
     );
 
-    let (retrieval, _join) = spawn_retrieval_actor(root.clone());
-    let state = test_state(retrieval, root.clone());
+    let state = test_state(root.clone());
 
     let events = handle(
         Request::Query {
@@ -172,8 +126,7 @@ async fn query_raw_with_default_collection_excludes_non_default_docs() {
         )
         .unwrap();
 
-    let (retrieval, _join) = spawn_retrieval_actor(root.clone());
-    let state = test_state(retrieval, root.clone());
+    let state = test_state(root.clone());
 
     let events = handle(
         Request::Query {
@@ -220,8 +173,7 @@ async fn query_raw_with_explicit_collection_includes_only_matching_docs() {
         )
         .unwrap();
 
-    let (retrieval, _join) = spawn_retrieval_actor(root.clone());
-    let state = test_state(retrieval, root.clone());
+    let state = test_state(root.clone());
 
     let events = handle(
         Request::Query {
@@ -251,8 +203,7 @@ async fn query_rejects_empty_question() {
     let root = tmp.path().join("memex");
     common::ingest_page(&root, "any-page", "Any", "any body");
 
-    let (retrieval, _join) = spawn_retrieval_actor(root.clone());
-    let state = test_state(retrieval, root.clone());
+    let state = test_state(root.clone());
 
     for blank in &["", "   ", "\n\t  \n"] {
         let events = handle(

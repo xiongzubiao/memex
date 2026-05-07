@@ -21,6 +21,67 @@ pub struct ReconcileReport {
     pub hash_mismatches: usize,
 }
 
+/// Output of `reconcile_walk`: the file lists the caller should index
+/// + the doc-row paths it should delete. Lets the daemon chunk the
+/// per-file indexing so the embed-model lock isn't held for an entire
+/// long reconcile sweep.
+#[derive(Debug, Default)]
+pub struct ReconcilePlan {
+    pub wiki_paths: Vec<std::path::PathBuf>,
+    pub raw_paths: Vec<std::path::PathBuf>,
+    pub to_delete: Vec<String>,
+    pub skipped_symlinks: usize,
+}
+
+/// Build a reconcile plan: walk wiki+raw, compute the set of stale
+/// `documents` paths to delete, and apply the same safety threshold as
+/// `reconcile`. Caller is responsible for actually invoking
+/// `index_wiki_file` / `index_raw_file` per path and
+/// `delete_document_with_cleanup` per stale path. The split lets the
+/// caller release the embed-model lock between batches of files
+/// during long sweeps.
+pub fn reconcile_walk(memex: &Memex, opts: ReconcileOptions) -> Result<ReconcilePlan> {
+    let mut plan = ReconcilePlan::default();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut walk_report = ReconcileReport::default();
+    plan.wiki_paths = walk_dir(
+        &memex.wiki_dir(),
+        "wiki",
+        memex,
+        &mut seen,
+        &mut walk_report,
+    )?;
+    plan.raw_paths = walk_dir(&memex.raw_dir(), "raw", memex, &mut seen, &mut walk_report)?;
+    plan.skipped_symlinks = walk_report.skipped_symlinks;
+
+    let to_delete: Vec<String> = memex.search().with_connection(|conn| {
+        let mut s = conn.prepare("SELECT path FROM documents")?;
+        let paths: Vec<String> = s
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .filter(|p| !seen.contains(p))
+            .collect();
+        Ok(paths)
+    })?;
+
+    let total_existing: i64 = memex.search().with_connection(|c| {
+        Ok(c.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?)
+    })?;
+    let threshold = std::cmp::max(10, (total_existing as f64 * 0.5) as i64) as usize;
+    if !opts.force && to_delete.len() > threshold {
+        return Err(MemexError::Other(anyhow::anyhow!(
+            "reconciliation would delete {} documents ({}% of {}). \
+             Refusing. Possible causes: wiki/raw unmounted, sync moved files away, accidental rm. \
+             Investigate the missing files (e.g. remount or restore) and restart the daemon.",
+            to_delete.len(),
+            (to_delete.len() as f64 / total_existing.max(1) as f64 * 100.0).round() as i64,
+            total_existing,
+        )));
+    }
+    plan.to_delete = to_delete;
+    Ok(plan)
+}
+
 /// Reconcile the on-disk `wiki/` and `raw/` trees with the SQLite index.
 ///
 /// Index-only — no embedding. Use `reconcile_with_embed` from the
@@ -195,7 +256,8 @@ mod tests {
         std::fs::write(
             path,
             format!(
-                "---\ntitle: {slug}\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body}"
+                "---\ntitle: {slug}
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body}"
             ),
         )
         .unwrap();
@@ -232,7 +294,8 @@ mod tests {
         let target = dir.path().join("outside.md");
         std::fs::write(
             &target,
-            "---\ntitle: outside\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nx",
+            "---\ntitle: outside
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nx",
         )
         .unwrap();
         #[cfg(unix)]
@@ -303,7 +366,8 @@ mod tests {
         // on filesystems with 1-second mtime resolution.
         std::fs::write(
             memex.wiki_dir().join("alpha.md"),
-            "---\ntitle: alpha\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nedited body, longer than the original",
+            "---\ntitle: alpha
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nedited body, longer than the original",
         )
         .unwrap();
         reconcile(&memex, ReconcileOptions::default()).unwrap();
@@ -368,7 +432,8 @@ mod tests {
         std::fs::create_dir_all(&subdir).unwrap();
         std::fs::write(
             subdir.join("buried.md"),
-            "---\ntitle: buried\ntags: []\nsources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\n---\n\nburied body",
+            "---\ntitle: buried
+sources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\n---\n\nburied body",
         )
         .unwrap();
 

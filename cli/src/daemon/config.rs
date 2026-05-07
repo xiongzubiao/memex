@@ -37,6 +37,10 @@ pub struct DaemonConfig {
     /// still running after 6s SIGTERM; giving up" and return, but the
     /// daemon will continue draining until this timeout expires.
     pub drain_timeout_sec: u64,
+    /// Background reconcile cadence. Default: 1h. Set to 0 to disable.
+    /// (See `server::run_daemon` for why the timer exists; the
+    /// validator clamps the range.)
+    pub reconcile_interval_sec: u64,
 }
 
 impl Default for DaemonConfig {
@@ -46,6 +50,7 @@ impl Default for DaemonConfig {
             log_file: memex_root().join("daemon.log"),
             worker: WorkerConfig::default(),
             drain_timeout_sec: 3,
+            reconcile_interval_sec: 3600,
         }
     }
 }
@@ -181,6 +186,14 @@ impl Config {
             bail!(
                 "daemon.idle_timeout_min = {} out of range 1..=1440",
                 d.idle_timeout_min
+            );
+        }
+        // 0 disables; otherwise floor at 60s (sub-minute reconciles
+        // would burn CPU without catching anything new) and cap at 24h.
+        if d.reconcile_interval_sec != 0 && !(60..=86400).contains(&d.reconcile_interval_sec) {
+            bail!(
+                "daemon.reconcile_interval_sec = {} out of range 60..=86400 (or 0 to disable)",
+                d.reconcile_interval_sec
             );
         }
         let w = &d.worker;

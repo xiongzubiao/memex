@@ -16,14 +16,16 @@ fn lint_fix_reverify_skips_already_fixed() {
 
     // Create a page via writer, reindex so DB knows about it.
     let w = Memex::open_writer(root.clone()).unwrap();
-    let content_v1 = "---\ntitle: Foo\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nV1.\n";
+    let content_v1 = "---\ntitle: Foo
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nV1.\n";
     let page_path = root.join("wiki/foo.md");
     std::fs::write(&page_path, content_v1).unwrap();
     w.reindex().unwrap();
     drop(w);
 
     // Now induce stale-index (edit the file on disk).
-    let content_v2 = "---\ntitle: Foo\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nV2.\n";
+    let content_v2 = "---\ntitle: Foo
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nV2.\n";
     induce_stale_index(&root, "foo", content_v2);
 
     // Reader opens — its connection is created here.
@@ -94,13 +96,15 @@ fn apply_fix_locked_releases_lock_on_return() {
 
     // Create a stale-index issue.
     let w = Memex::open_writer(root.clone()).unwrap();
-    let content_v1 = "---\ntitle: Foo\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nV1.\n";
+    let content_v1 = "---\ntitle: Foo
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nV1.\n";
     std::fs::write(root.join("wiki/foo.md"), content_v1).unwrap();
     w.reindex().unwrap();
     drop(w);
 
     // Induce staleness.
-    let content_v2 = "---\ntitle: Foo\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nV2.\n";
+    let content_v2 = "---\ntitle: Foo
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nV2.\n";
     std::fs::write(root.join("wiki/foo.md"), content_v2).unwrap();
 
     let reader = Memex::open(root.clone()).unwrap();

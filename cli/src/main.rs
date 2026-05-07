@@ -78,6 +78,11 @@ enum Commands {
         #[arg(long)]
         fix: bool,
     },
+    /// Rebuild chunks/chunks_fts/chunks_vec for every document in place.
+    /// Used after chunker logic changes to refresh chunk boundaries
+    /// without re-running EXTRACT/MERGE.
+    #[command(hide = true)]
+    Rechunk,
     /// Plan-pipeline subcommands (see also: `source plan` and `plan apply`).
     Plan {
         #[command(subcommand)]
@@ -310,10 +315,10 @@ fn run_read(
             // Read content: wiki pages from disk, source documents from disk.
             //
             // When slicing flags are set, wiki pages are read via
-            // `read_body_from_disk` (frontmatter stripped) so line numbers
-            // are consistent with `@@ -N,M @@` headers from `memex query`.
-            // Without slicing flags, wiki pages are printed verbatim
-            // (frontmatter included) — preserving existing behaviour.
+            // `read_body_from_disk` (frontmatter stripped) so `--from-line`
+            // counts the body content, not the YAML header. Without
+            // slicing flags, wiki pages are printed verbatim (frontmatter
+            // included).
             let body = if doc.doc_type == "wiki" {
                 let full_path = root.join(&doc.path);
                 let canonical = full_path.canonicalize().unwrap_or(full_path.clone());
@@ -369,7 +374,7 @@ fn run_read(
 fn open_editor_for_page(name: &str) -> anyhow::Result<String> {
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let template =
-        format!("---\ntitle: {name}\ntags: []\ncreated_at: {now}\nupdated_at: {now}\n---\n\n");
+        format!("---\ntitle: {name}\ncreated_at: {now}\nupdated_at: {now}\n---\n\n");
 
     let tmp = std::env::temp_dir().join(format!("memex-{}.md", std::process::id()));
     std::fs::write(&tmp, &template)?;
@@ -686,24 +691,10 @@ fn run_write(
         anyhow::bail!("empty content");
     }
 
-    // Generic-YAML walk; parse_page_for_indexing requires created_at/updated_at.
-    let tags = memex_core::storage::split_frontmatter(&content)
-        .and_then(|(yaml, _)| serde_yaml::from_str::<serde_yaml::Value>(yaml).ok())
-        .and_then(|v| v.get("tags").cloned())
-        .and_then(|v| v.as_sequence().cloned())
-        .map(|seq| {
-            seq.into_iter()
-                .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
     let events = send_to_daemon(
         memex_cli::daemon::protocol::Request::Write {
             title: name.to_string(),
             content,
-            tags,
             source: source.map(str::to_string),
             force,
         },
@@ -815,6 +806,52 @@ fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
+    Ok(())
+}
+
+fn run_rechunk() -> anyhow::Result<()> {
+    let root = memex_cli::memex_root();
+    let memex = memex_core::Memex::open_writer(root.clone())?;
+    let mut model = memex_core::retrieval::load_default_model()?;
+    let docs: Vec<(String, String, String, String)> = memex
+        .search()
+        .with_connection(|c| {
+            let mut stmt = c.prepare("SELECT doc_type, path, hash, title FROM documents")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })?;
+    println!("rechunking {} documents", docs.len());
+    let mut ok = 0usize;
+    let mut err = 0usize;
+    for (doc_type, path, hash, title) in docs {
+        let body = match memex_core::read_body_from_disk(&root, &doc_type, &path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("read failed: {doc_type}:{path}: {e}");
+                err += 1;
+                continue;
+            }
+        };
+        if let Err(e) =
+            memex_core::retrieval::embed_document(memex.search(), &hash, &title, &body, &mut model)
+        {
+            eprintln!("embed failed: {doc_type}:{path}: {e}");
+            err += 1;
+        } else {
+            ok += 1;
+        }
+    }
+    println!("rechunk complete: ok={ok} err={err}");
     Ok(())
 }
 
@@ -1303,6 +1340,10 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 memex_cli::init_ort_runtime().map_err(|e| anyhow::anyhow!(e))?;
             }
             run_lint(fix)
+        }
+        Commands::Rechunk => {
+            memex_cli::init_ort_runtime().map_err(|e| anyhow::anyhow!(e))?;
+            run_rechunk()
         }
         Commands::Daemon { action } => match action {
             DaemonAction::Start { foreground } => {

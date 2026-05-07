@@ -329,3 +329,172 @@ async fn merge_failure_preserves_existing_wiki_page() {
         "alice.md must NOT contain the second-ingest proposal:\n{after_second}"
     );
 }
+
+/// Pin per-slug merge dispatch: N merge pairs → N single-slug MERGE
+/// LLM calls, not one batched call. The batched form failed every slug
+/// if any one timed out.
+#[tokio::test(flavor = "multi_thread")]
+async fn document_ingest_dispatches_per_slug_merge_calls() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let extract_calls = Arc::new(AtomicUsize::new(0));
+    let extract_clone = extract_calls.clone();
+    let merge_records: Arc<std::sync::Mutex<Vec<(String, usize)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let merge_clone = merge_records.clone();
+
+    let h = match IntegrationHarness::start_with_mock_extract_and_merge_with_embed(
+        move |_prompt| {
+            extract_clone.fetch_add(1, Ordering::Relaxed);
+            r#"
+- slug: andrew
+  title: Andrew
+  tags: []
+  body: New andrew content from this session.
+- slug: audrey
+  title: Audrey
+  tags: []
+  body: New audrey content from this session.
+"#
+            .to_string()
+        },
+        move |prompt| {
+            let payload = prompt.split_once("\n\n").map(|(_, p)| p).unwrap_or("");
+            let v: serde_json::Value = serde_json::from_str(payload.trim()).unwrap_or_default();
+            let pages = v.get("pages").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+            let count = pages.len();
+            let slug = pages.first()
+                .and_then(|p| p.get("slug"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("?")
+                .to_string();
+            merge_clone.lock().unwrap().push((slug.clone(), count));
+            format!(
+                "- slug: {slug}\n  title: {}\n  tags: []\n  body: Merged {slug}.\n",
+                slug.chars().next().unwrap_or('?').to_uppercase().to_string()
+                    + slug.get(1..).unwrap_or("")
+            )
+        },
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("SKIP: ONNX embed model unavailable: {e}");
+            return;
+        }
+    };
+
+    crate::common::ingest_page(
+        h.memex_root(),
+        "andrew",
+        "Andrew",
+        "Existing andrew content.",
+    );
+    crate::common::ingest_page(
+        h.memex_root(),
+        "audrey",
+        "Audrey",
+        "Existing audrey content.",
+    );
+
+    let req = Request::Ingest {
+        source: IngestSource::Document {
+            source_path: "https://example.com/conv".into(),
+            content: "# Conv\n\nA conversation between Andrew and Audrey.\n".into(),
+        },
+        collections: vec![],
+    };
+    let events = h.send(&req).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Stored { .. })),
+        "expected Stored event, got: {events:?}"
+    );
+
+    let recs = merge_records.lock().unwrap();
+    assert_eq!(
+        recs.len(),
+        2,
+        "expected 2 per-slug MERGE calls (andrew + audrey), got {}: {recs:?}",
+        recs.len()
+    );
+    for (slug, count) in recs.iter() {
+        assert_eq!(
+            *count, 1,
+            "MERGE call for slug={slug} carried {count} pages; per-slug fan-out requires 1 page per call"
+        );
+    }
+    let mut slugs: Vec<&str> = recs.iter().map(|(s, _)| s.as_str()).collect();
+    slugs.sort();
+    assert_eq!(slugs, vec!["andrew", "audrey"]);
+}
+
+/// Pin per-slug fault isolation: one slug's MERGE failure leaves
+/// the other slug's update committed. Batched MergeJob failed
+/// all-or-nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn document_ingest_per_slug_merge_fault_isolation() {
+    let h = match IntegrationHarness::start_with_mock_extract_and_merge_with_embed(
+        |_prompt| {
+            r#"
+- slug: andrew
+  title: Andrew
+  tags: []
+  body: New andrew body for this session.
+- slug: audrey
+  title: Audrey
+  tags: []
+  body: New audrey body for this session.
+"#
+            .to_string()
+        },
+        |prompt| {
+            let payload = prompt.split_once("\n\n").map(|(_, p)| p).unwrap_or("");
+            let v: serde_json::Value = serde_json::from_str(payload.trim()).unwrap_or_default();
+            let slug = v["pages"][0]["slug"].as_str().unwrap_or("");
+            if slug == "andrew" {
+                "this is not yaml or json — must fail to parse".to_string()
+            } else {
+                format!(
+                    "- slug: {slug}\n  title: Audrey\n  tags: []\n  body: Audrey-merged-marker.\n"
+                )
+            }
+        },
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("SKIP: ONNX embed model unavailable: {e}");
+            return;
+        }
+    };
+
+    crate::common::ingest_page(h.memex_root(), "andrew", "Andrew", "Andrew-original-content.");
+    crate::common::ingest_page(h.memex_root(), "audrey", "Audrey", "Audrey-original-content.");
+
+    let andrew_before = std::fs::read_to_string(h.memex_root().join("wiki/andrew.md")).unwrap();
+
+    let req = Request::Ingest {
+        source: IngestSource::Document {
+            source_path: "https://example.com/dual".into(),
+            content: "# Dual\n\nMentions Andrew and Audrey.\n".into(),
+        },
+        collections: vec![],
+    };
+    let events = h.send(&req).await.unwrap();
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Error { .. })),
+        "ingest should not surface an Error event despite andrew's merge failing: {events:?}"
+    );
+
+    let andrew_after = std::fs::read_to_string(h.memex_root().join("wiki/andrew.md")).unwrap();
+    assert_eq!(andrew_before, andrew_after, "andrew.md changed despite failed MERGE");
+
+    let audrey_after = std::fs::read_to_string(h.memex_root().join("wiki/audrey.md")).unwrap();
+    assert!(
+        audrey_after.contains("Audrey-merged-marker"),
+        "audrey.md missing successful-merge marker:\n{audrey_after}"
+    );
+}

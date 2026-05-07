@@ -112,10 +112,11 @@ pub const CURRENT_MODEL_NAME: &str = "embedding-gemma-300m";
 /// `CURRENT_MODEL_NAME`.
 pub const EMBED_CONTEXT_SIZE: usize = 2048;
 
-/// Margin reserved for special tokens added by the tokenizer (BOS+EOS).
-/// Content tokens are truncated to `EMBED_CONTEXT_SIZE - SPECIAL_TOKEN_MARGIN`
-/// before re-encoding, so the final input fits under the cap with the EOS
-/// preserved. Matches QMD's `safeLimit = maxTokens - 4` (qmd/src/llm.ts:969).
+/// Margin reserved for special tokens added by the tokenizer (BOS+EOS,
+/// possibly more). Matches QMD's `safeLimit = maxTokens - 4`
+/// (qmd/src/llm.ts:969). The maximum content-token count is
+/// `EMBED_CONTEXT_SIZE - SPECIAL_TOKEN_MARGIN`, exposed via
+/// `Embedder::max_input_tokens()`.
 pub const SPECIAL_TOKEN_MARGIN: usize = 4;
 
 /// Producer of fixed-dimension embedding vectors. Implemented by the
@@ -133,6 +134,19 @@ pub trait Embedder: Send {
     /// `embed_text` per item but batched at the implementation level
     /// for `EmbeddingModel` (one ONNX session.run instead of N).
     fn embed_batch(&mut self, texts: &[&str]) -> crate::error::Result<Vec<Vec<f32>>>;
+    /// Count tokens for `text` using the embedder's tokenizer. Used by
+    /// `chunking::enforce_token_budget` to ensure no chunk exceeds the
+    /// embedder context window — without this guard, an oversized
+    /// chunk gets its tail content silently dropped at embed time
+    /// (`embed_batch` truncates to `EMBED_CONTEXT_SIZE -
+    /// SPECIAL_TOKEN_MARGIN`), losing recall on the dropped portion.
+    fn count_tokens(&mut self, text: &str) -> crate::error::Result<usize>;
+    /// Maximum content-token count this embedder can accept without
+    /// truncating. Inputs longer than this get their tail silently
+    /// truncated by `embed_batch`. Chunkers should keep chunks at or
+    /// below this so every byte of the document gets represented in
+    /// some chunk's vector.
+    fn max_input_tokens(&self) -> usize;
 }
 
 /// An ONNX embedding model loaded into an inference session.
@@ -157,6 +171,16 @@ impl Embedder for EmbeddingModel {
     }
     fn embed_batch(&mut self, texts: &[&str]) -> crate::error::Result<Vec<Vec<f32>>> {
         embed_batch(self, texts)
+    }
+    fn count_tokens(&mut self, text: &str) -> crate::error::Result<usize> {
+        let encoded = self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| crate::error::MemexError::Other(anyhow::anyhow!("tokenize: {e}")))?;
+        Ok(encoded.get_ids().len())
+    }
+    fn max_input_tokens(&self) -> usize {
+        EMBED_CONTEXT_SIZE - SPECIAL_TOKEN_MARGIN
     }
 }
 
@@ -186,6 +210,12 @@ impl Embedder for MockEmbedder {
     }
     fn embed_batch(&mut self, texts: &[&str]) -> crate::error::Result<Vec<Vec<f32>>> {
         texts.iter().map(|t| self.embed_text(t)).collect()
+    }
+    fn count_tokens(&mut self, text: &str) -> crate::error::Result<usize> {
+        Ok(text.split_whitespace().count())
+    }
+    fn max_input_tokens(&self) -> usize {
+        EMBED_CONTEXT_SIZE - SPECIAL_TOKEN_MARGIN
     }
 }
 
@@ -260,51 +290,38 @@ pub fn embed_batch(
         )));
     }
 
-    // Cap at the model's context window. See module-level constants.
-    let max_len = EMBED_CONTEXT_SIZE;
-    // When a body's content tokens exceed this limit, we truncate the
-    // CONTENT to `max_len - SPECIAL_TOKEN_MARGIN` then re-encode WITH
-    // specials, producing BOS + truncated_content + EOS ≤ max_len. This
-    // preserves EOS at the boundary, which a naive `encode(text, true) +
-    // take(max_len)` would drop. Measured impact: cos = 0.988 between
-    // truncate-with-EOS and truncate-without-EOS for a 3000-token body;
-    // QMD-style scoring is +0.003-0.010 better on retrieval against the
-    // affected doc. See `core/tests/truncation_experiment.rs`.
-    let safe_content_len = max_len.saturating_sub(SPECIAL_TOKEN_MARGIN);
+    // Cap at the model's context window. Inputs whose content tokens
+    // exceed `model.max_input_tokens()` are an error: the caller
+    // (typically `chunking::enforce_token_budget`) is expected to keep
+    // chunks below the budget. Silent truncation would drop the tail
+    // content from the embedding without any signal that recall on
+    // that tail is now impossible.
+    let limit = model.max_input_tokens();
 
     // Step 1: tokenize each input.
-    let tk = &model.tokenizer;
     let mut rows: Vec<Vec<i64>> = Vec::with_capacity(texts.len());
-    for text in texts {
-        // Probe the content length without specials.
-        let probe = tk
+    for (idx, text) in texts.iter().enumerate() {
+        let probe = model
+            .tokenizer
             .encode(*text, false)
             .map_err(|e| crate::error::MemexError::Other(anyhow::anyhow!("tokenize: {e}")))?;
         let content_ids = probe.get_ids();
-        let ids: Vec<i64> = if content_ids.len() <= safe_content_len {
-            // Fits — encode with specials directly.
-            let encoded = tk
-                .encode(*text, true)
-                .map_err(|e| crate::error::MemexError::Other(anyhow::anyhow!("tokenize: {e}")))?;
-            encoded.get_ids().iter().map(|&u| u as i64).collect()
-        } else {
-            // Over cap — truncate content, decode back, re-encode with specials.
-            let truncated_ids: Vec<u32> = content_ids[..safe_content_len].to_vec();
-            let truncated_text = tk
-                .decode(&truncated_ids, true)
-                .map_err(|e| crate::error::MemexError::Other(anyhow::anyhow!("decode: {e}")))?;
-            let encoded = tk.encode(truncated_text.as_str(), true).map_err(|e| {
-                crate::error::MemexError::Other(anyhow::anyhow!("re-tokenize: {e}"))
-            })?;
-            // Defensive cap in case re-tokenization produced more tokens
-            // than expected (e.g., tokenizer added more than BOS+EOS).
-            encoded
-                .get_ids()
-                .iter()
-                .take(max_len)
-                .map(|&u| u as i64)
-                .collect()
-        };
+        if content_ids.len() > limit {
+            return Err(crate::error::MemexError::Other(anyhow::anyhow!(
+                "embed input #{idx} has {} content tokens; embedder limit is {} \
+                 (EMBED_CONTEXT_SIZE={} - SPECIAL_TOKEN_MARGIN={}). Caller must \
+                 chunk to fit before calling embed_batch.",
+                content_ids.len(),
+                limit,
+                EMBED_CONTEXT_SIZE,
+                SPECIAL_TOKEN_MARGIN
+            )));
+        }
+        let encoded = model
+            .tokenizer
+            .encode(*text, true)
+            .map_err(|e| crate::error::MemexError::Other(anyhow::anyhow!("tokenize: {e}")))?;
+        let ids: Vec<i64> = encoded.get_ids().iter().map(|&u| u as i64).collect();
         // Empty text → single padding-only token so we don't produce a 0-len row.
         let row = if ids.is_empty() { vec![0i64] } else { ids };
         rows.push(row);

@@ -4,7 +4,7 @@
 //! (see `memex daemon start`). Every async task in the daemon —
 //! request handlers, retrieval actor, watcher, worker pool — needs
 //! the same `Arc<Memex>` for that root. Sharing one `Arc` serializes
-//! DB access via `Bm25Search`'s internal mutex and avoids file-level
+//! DB access via `Db`'s internal mutex and avoids file-level
 //! lock contention that would happen if each task opened its own
 //! connection.
 //!

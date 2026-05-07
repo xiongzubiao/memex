@@ -9,6 +9,17 @@ use crate::daemon::protocol::Event;
 use crate::daemon::queue::{BackendJob, ExpandJob, SynthJob};
 use crate::daemon::retrieval::{ExpansionTerms, RetrievalError, RetrievalReq};
 
+/// Hard cap on `top_k` from a query request. Each retrieved chunk gets
+/// its body slice attached and forwarded into the synthesis prompt or
+/// raw context JSON, so an unbounded `top_k` is a prompt-size /
+/// response-size amplification vector — a single client request asking
+/// for `top_k=100000` would force the daemon to read every chunk in the
+/// index, then ship the whole corpus to the answerer LLM. The largest
+/// realistic use case (LoCoMo eval at top_200) is well under this cap;
+/// 1000 leaves headroom for unusual workloads while still bounding the
+/// blast radius.
+const MAX_TOP_K: usize = 1000;
+
 pub(super) async fn handle_query(
     question: String,
     raw: bool,
@@ -31,6 +42,7 @@ pub(super) async fn handle_query(
     if let Err(e) = memex_core::search::validate_collection_names(&collections) {
         return error_events(DaemonError::BadRequest(e));
     }
+    let top_k = top_k.min(MAX_TOP_K);
 
     // Retrieval: dispatch to the retrieval actor. Shared by raw + synth.
     let memex_root = state.reader().bound_root.clone();

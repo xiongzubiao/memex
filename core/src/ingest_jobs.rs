@@ -3,14 +3,11 @@
 //! completed / failed, plus the LLM cache prune that lives next to
 //! it because both fire from the same daemon-startup pass.
 //!
-//! Pulled out of `search/mod.rs` so the search module isn't carrying
-//! ingest-pipeline concerns in addition to the BM25 / FTS / chunks
-//! plumbing it owns. Methods are inherent on `Bm25Search` so call
-//! sites read the same as before (`search.insert_ingest_job(...)`).
+//! Methods are inherent on `Db` so call sites read the same as the
+//! rest of the DB API (`db.insert_ingest_job(...)`).
 
 use crate::error::Result;
-
-use super::{Bm25Search, mutex_err, now_rfc3339, sqlite_err};
+use crate::search::{Db, mutex_err, now_rfc3339, sqlite_err};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobType {
@@ -45,7 +42,7 @@ pub struct PendingJob {
     pub collections: Vec<String>,
 }
 
-impl Bm25Search {
+impl Db {
     pub fn insert_ingest_job(
         &self,
         job_id: &str,
@@ -189,27 +186,186 @@ impl Bm25Search {
         }
         Ok(jobs)
     }
+}
 
-    /// Returns true if any ingest-produced document with the given
-    /// content hash already finished ingestion. Gates on the
-    /// `ingest_jobs` table (status='completed'), not on raw row
-    /// existence: if a prior attempt stored the raw doc but crashed
-    /// before producing wiki pages, the raw row exists alone with no
-    /// completed job. Dedup-on-raw-existence would short-circuit the
-    /// retry forever, leaving the user with a stored raw and zero
-    /// wiki pages and no recovery path. Gating on completion lets a
-    /// retry replay the wiki extraction; the raw upsert is
-    /// idempotent.
-    pub fn ingest_dedup_exists(&self, content_hash: &str) -> Result<bool> {
-        let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM ingest_jobs \
-                 WHERE content_hash = ?1 AND status = 'completed'",
-                rusqlite::params![content_hash],
-                |r| r.get(0),
-            )
-            .map_err(sqlite_err)?;
-        Ok(count > 0)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ingest_jobs_inserts_and_lists_transcript_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
+        let s = memex.search();
+        s.insert_ingest_job(
+            "job-t1",
+            JobType::Transcript,
+            "/abs/path/to/session.jsonl",
+            Some("claude-code"),
+            "deadbeef".repeat(8).as_str(),
+            &["default".to_string()],
+        )
+        .unwrap();
+        let jobs = s.pending_ingest_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "job-t1");
+        assert_eq!(jobs[0].job_type, JobType::Transcript);
+        assert_eq!(jobs[0].agent.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn ingest_jobs_inserts_and_lists_document_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
+        let s = memex.search();
+        s.insert_ingest_job(
+            "job-d1",
+            JobType::Document,
+            "https://example.com/post",
+            None,
+            "cafebabe".repeat(8).as_str(),
+            &["team-a".to_string(), "incidents".to_string()],
+        )
+        .unwrap();
+        let jobs = s.pending_ingest_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, JobType::Document);
+        assert_eq!(jobs[0].agent, None);
+        assert_eq!(jobs[0].collections, vec!["team-a", "incidents"]);
+    }
+
+    /// Daemon startup must transition every pending/processing job to
+    /// failed with the canonical "interrupted by daemon restart"
+    /// reason and bump updated_at. Completed/failed rows must NOT be
+    /// touched. This invariant is load-bearing: the 30-day prune is
+    /// keyed off updated_at, so a restart pushing the field forward
+    /// gives the user the full retention window to inspect what
+    /// failed before the row is reaped.
+    #[test]
+    fn recover_stuck_ingest_jobs_only_touches_in_flight_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
+        let s = memex.search();
+        s.insert_ingest_job(
+            "job-pending",
+            JobType::Transcript,
+            "/p1.jsonl",
+            None,
+            "00".repeat(32).as_str(),
+            &[],
+        )
+        .unwrap();
+        s.insert_ingest_job(
+            "job-processing",
+            JobType::Transcript,
+            "/p2.jsonl",
+            None,
+            "11".repeat(32).as_str(),
+            &[],
+        )
+        .unwrap();
+        s.update_ingest_job_status("job-processing", "processing", None)
+            .unwrap();
+        s.insert_ingest_job(
+            "job-completed",
+            JobType::Transcript,
+            "/p3.jsonl",
+            None,
+            "22".repeat(32).as_str(),
+            &[],
+        )
+        .unwrap();
+        s.update_ingest_job_status("job-completed", "completed", None)
+            .unwrap();
+        s.insert_ingest_job(
+            "job-failed",
+            JobType::Transcript,
+            "/p4.jsonl",
+            None,
+            "33".repeat(32).as_str(),
+            &[],
+        )
+        .unwrap();
+        s.update_ingest_job_status("job-failed", "failed", Some("worker died"))
+            .unwrap();
+
+        let recovered = s.recover_stuck_ingest_jobs().unwrap();
+        assert_eq!(recovered, 2, "pending + processing should transition");
+
+        let row_status = |job_id: &str| -> (String, Option<String>) {
+            s.with_connection(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT status, error FROM ingest_jobs WHERE job_id=?1",
+                        rusqlite::params![job_id],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                    )
+                    .unwrap())
+            })
+            .unwrap()
+        };
+        assert_eq!(row_status("job-pending").0, "failed");
+        assert_eq!(row_status("job-processing").0, "failed");
+        assert_eq!(
+            row_status("job-pending").1.as_deref(),
+            Some("interrupted by daemon restart")
+        );
+        assert_eq!(row_status("job-completed").0, "completed");
+        assert_eq!(row_status("job-failed").1.as_deref(), Some("worker died"));
+    }
+
+    /// Prune deletes terminal rows older than the cutoff and leaves
+    /// recent ones plus in-flight rows alone.
+    #[test]
+    fn prune_terminal_ingest_jobs_keyed_off_updated_at() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
+        let s = memex.search();
+        s.insert_ingest_job(
+            "old",
+            JobType::Transcript,
+            "/old.jsonl",
+            None,
+            "aa".repeat(32).as_str(),
+            &[],
+        )
+        .unwrap();
+        s.update_ingest_job_status("old", "completed", None).unwrap();
+        s.insert_ingest_job(
+            "new",
+            JobType::Transcript,
+            "/new.jsonl",
+            None,
+            "bb".repeat(32).as_str(),
+            &[],
+        )
+        .unwrap();
+        s.update_ingest_job_status("new", "completed", None).unwrap();
+        s.with_connection(|conn| {
+            conn.execute(
+                "UPDATE ingest_jobs SET updated_at = datetime('now', '-60 days') \
+                 WHERE job_id = 'old'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let pruned = s.prune_terminal_ingest_jobs(30).unwrap();
+        assert_eq!(pruned, 1, "only `old` should be pruned at 30-day cutoff");
+        let remaining: Vec<String> = s
+            .with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT job_id FROM ingest_jobs ORDER BY job_id")
+                    .unwrap();
+                let rows: Vec<String> = stmt
+                    .query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(remaining, vec!["new".to_string()]);
     }
 }

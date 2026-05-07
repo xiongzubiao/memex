@@ -1,4 +1,4 @@
-//! Index a single wiki markdown file into `documents` + `documents_fts`,
+//! Index a single wiki markdown file into `documents` + `titles_fts`,
 //! optionally embedding its body chunks if a model is provided.
 //!
 //! Production callers (daemon watcher, ingest handler, reconciliation) load
@@ -12,7 +12,6 @@ use crate::Memex;
 use crate::embed::Embedder;
 use crate::error::Result;
 use crate::search::{CommitOutcome, DocSpec, commit_doc};
-use crate::storage::file_mtime_iso;
 use crate::validate;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,7 +44,7 @@ pub fn index_wiki_file(
     // Stat first so reconcile can skip unchanged files without reading them.
     let meta = std::fs::metadata(path)?;
     let size = meta.len() as i64;
-    let mtime = file_mtime_iso(path);
+    let mtime = meta.modified()?;
 
     if let Some(existing) = memex.search().get_document_meta("wiki", &rel_str)?
         && existing.mtime == mtime
@@ -58,12 +57,11 @@ pub fn index_wiki_file(
     let content = String::from_utf8(bytes).map_err(|e| {
         crate::error::MemexError::Other(anyhow::anyhow!("non-utf8 wiki body: {e}"))
     })?;
-    // parse_frontmatter is wiki-schema-aware (title, tags, ...) and gives
-    // us the body slice that commit_doc will hash and feed to FTS.
+    // parse_frontmatter is wiki-schema-aware and gives us the body
+    // slice that commit_doc will hash and feed to chunks_fts.
     let (fm, body) = validate::parse_frontmatter(&content).map_err(|e| {
         crate::error::MemexError::Other(anyhow::anyhow!("frontmatter parse failed: {e}"))
     })?;
-    let tags_csv = fm.tags.join(",");
 
     let result = memex.search().with_transaction(|tx| {
         commit_doc(
@@ -72,9 +70,8 @@ pub fn index_wiki_file(
                 doc_type: "wiki",
                 path: &rel_str,
                 title: &fm.title,
-                tags: &tags_csv,
                 source: None,
-                mtime: &mtime,
+                mtime,
                 body: &body,
                 size,
             },
@@ -109,7 +106,8 @@ mod tests {
         let path = memex.wiki_dir().join("auth-tokens.md");
         std::fs::write(
             &path,
-            "---\ntitle: Auth Tokens\ntags:\n  - concept\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\nsources: []\n---\n\n# Auth Tokens\n\nBearer tokens auth users.\n",
+            "---\ntitle: Auth Tokens
+created_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\nsources: []\n---\n\n# Auth Tokens\n\nBearer tokens auth users.\n",
         )
         .unwrap();
 
@@ -117,22 +115,20 @@ mod tests {
         assert_eq!(outcome, IndexOutcome::Inserted);
 
         let conn = memex.search().conn_for_test();
-        let (path_db, title, hash, tags, embed_model): (
-            String,
+        let (path_db, title, hash, embed_model): (
             String,
             String,
             String,
             Option<String>,
         ) = conn
             .query_row(
-                "SELECT path, title, hash, tags, embed_model FROM documents WHERE doc_type='wiki' LIMIT 1",
+                "SELECT path, title, hash, embed_model FROM documents WHERE doc_type='wiki' LIMIT 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
         assert_eq!(path_db, "wiki/auth-tokens.md");
         assert_eq!(title, "Auth Tokens");
-        assert_eq!(tags, "concept");
         assert_eq!(hash.len(), 64);
         assert!(
             embed_model.is_none(),
@@ -141,13 +137,16 @@ mod tests {
 
         let fts_hits: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'bearer'",
+                "SELECT COUNT(*) FROM titles_fts WHERE titles_fts MATCH 'auth'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(fts_hits, 1);
 
+        // chunks + chunks_fts are populated at commit time so chunk-level
+        // BM25 works without an embedder. The vector index (chunks_vec)
+        // is still empty until the embed step runs.
         let chunk_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM chunks WHERE hash=?1",
@@ -155,7 +154,15 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(chunk_count, 0);
+        assert!(chunk_count >= 1, "chunks rows should be populated at commit");
+        let vec_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM chunks_vec WHERE hash_seq LIKE ?1 || '%'",
+                rusqlite::params![hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vec_count, 0, "chunks_vec must remain empty without an embedder");
     }
 
     #[test]
@@ -165,7 +172,8 @@ mod tests {
         let path = memex.wiki_dir().join("p.md");
         std::fs::write(
             &path,
-            "---\ntitle: P\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nbody",
+            "---\ntitle: P
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nbody",
         )
         .unwrap();
         let outcome1 = index_wiki_file(&memex, &path, None).unwrap();

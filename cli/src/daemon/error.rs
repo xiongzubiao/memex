@@ -12,7 +12,9 @@ pub enum DaemonError {
     /// collection(s): X, Y".
     RetrievalEmpty { collections: Vec<String> },
     Internal(String),
-    SubprocessTimeout,
+    SubprocessTimeout {
+        timeout_sec: u64,
+    },
     /// Subprocess crashed. Carries the diagnostic (combined context +
     /// drained stderr) so the user sees why, not just a generic message.
     SubprocessCrashed(String),
@@ -32,7 +34,7 @@ impl DaemonError {
             DaemonError::VersionMismatch { .. } => "version_mismatch",
             DaemonError::RetrievalEmpty { .. } => "retrieval_empty",
             DaemonError::Internal(_) => "internal",
-            DaemonError::SubprocessTimeout => "subprocess_timeout",
+            DaemonError::SubprocessTimeout { .. } => "subprocess_timeout",
             DaemonError::SubprocessCrashed(_) => "subprocess_crashed",
             DaemonError::BackendUnavailable(_) => "backend_unavailable",
             DaemonError::Conflict(_) => "conflict",
@@ -42,7 +44,7 @@ impl DaemonError {
 
     pub fn exit_code(&self) -> i32 {
         match self {
-            DaemonError::SubprocessTimeout | DaemonError::SubprocessCrashed(_) => 4,
+            DaemonError::SubprocessTimeout { .. } | DaemonError::SubprocessCrashed(_) => 4,
             _ => 1,
         }
     }
@@ -67,8 +69,8 @@ impl DaemonError {
                 }
             }
             DaemonError::Internal(reason) => reason.clone(),
-            DaemonError::SubprocessTimeout => {
-                "no reply within daemon.worker.timeout_sec".to_string()
+            DaemonError::SubprocessTimeout { timeout_sec } => {
+                format!("no reply within {timeout_sec}s (daemon.worker.timeout_sec)")
             }
             DaemonError::SubprocessCrashed(reason) => reason.clone(),
             DaemonError::BackendUnavailable(reason) => reason.clone(),
@@ -96,7 +98,7 @@ impl From<crate::daemon::queue::WorkerError> for DaemonError {
         use crate::daemon::queue::WorkerError;
         match e {
             WorkerError::Crash(reason) => DaemonError::SubprocessCrashed(reason),
-            WorkerError::Timeout => DaemonError::SubprocessTimeout,
+            WorkerError::Timeout { secs } => DaemonError::SubprocessTimeout { timeout_sec: secs },
             WorkerError::Backend { message, code } => {
                 let formatted = match code {
                     Some(c) => format!("[{c}] {message}"),
@@ -120,7 +122,7 @@ mod tests {
         );
         assert_eq!(DaemonError::BadRequest("x".into()).exit_code(), 1);
 
-        assert_eq!(DaemonError::SubprocessTimeout.exit_code(), 4);
+        assert_eq!(DaemonError::SubprocessTimeout { timeout_sec: 300 }.exit_code(), 4);
         assert_eq!(DaemonError::SubprocessCrashed("".into()).exit_code(), 4);
         assert_eq!(DaemonError::SubprocessCrashed("x".into()).exit_code(), 4);
 
@@ -174,8 +176,8 @@ mod tests {
         // Field-less variants supply a short description that adds info
         // beyond the code (which config knob, what's missing, etc.).
         assert_eq!(
-            DaemonError::SubprocessTimeout.to_string(),
-            "subprocess_timeout: no reply within daemon.worker.timeout_sec"
+            DaemonError::SubprocessTimeout { timeout_sec: 300 }.to_string(),
+            "subprocess_timeout: no reply within 300s (daemon.worker.timeout_sec)"
         );
         assert_eq!(
             DaemonError::RetrievalEmpty { collections: vec![] }.to_string(),

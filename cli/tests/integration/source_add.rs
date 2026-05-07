@@ -123,7 +123,6 @@ async fn source_delete_refuses_when_referenced_without_force() {
     let r = Request::Write {
         title: "Referencing".into(),
         content: "---\ntitle: Referencing\n---\n\nbody".to_string(),
-        tags: vec![],
         source: Some(src_docid.clone()),
         force: false,
     };
@@ -207,7 +206,6 @@ async fn write_with_source_docid_succeeds() {
     let r = Request::Write {
         title: "Test Page".into(),
         content: "---\ntitle: Test Page\n---\n\nBody.\n".into(),
-        tags: vec![],
         source: Some(src_docid.clone()),
         force: false,
     };
@@ -242,7 +240,6 @@ async fn write_rejects_non_docid_source() {
     let r = Request::Write {
         title: "Test".into(),
         content: "---\ntitle: Test\n---\n\nbody.\n".into(),
-        tags: vec![],
         source: Some("/path/to/file.md".into()), // looks like fspath, not a docid
         force: false,
     };

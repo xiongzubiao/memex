@@ -64,7 +64,7 @@ impl Memex {
         // so we parse and hash the body to get a comparable value.
         for doc in &db_docs {
             let slug = slug_of_db_path(&doc.path);
-            let full_path = wiki_dir.join(format!("{slug}.md"));
+            let full_path = crate::wiki::wiki_path_for_slug(&wiki_dir, &slug);
             if full_path.exists()
                 && let Ok(content) = std::fs::read_to_string(&full_path) {
                     let disk_body_hash = match validate::parse_frontmatter(&content) {
@@ -251,14 +251,14 @@ impl Memex {
     }
 }
 
-use crate::search::Bm25Search;
+use crate::search::Db;
 
 /// Re-verify that the issue still describes the current committed state.
-/// Uses the provided `&Bm25Search` connection — caller is responsible for
+/// Uses the provided `&Db` connection — caller is responsible for
 /// having the right snapshot (reader's stale snapshot if the connection is
 /// long-lived; fresh snapshot if the connection was just opened under lock).
 pub(crate) fn is_issue_still_present(
-    search: &Bm25Search,
+    search: &Db,
     root: &std::path::Path,
     issue: &LintIssue,
 ) -> crate::error::Result<bool> {
@@ -338,7 +338,7 @@ pub(crate) fn is_issue_still_present(
     }
 }
 
-/// Apply a single lint fix to the provided `&Bm25Search`.
+/// Apply a single lint fix to the provided `&Db`.
 ///
 /// Auto-fix semantics (passive sync only — no auto-cross-linking;
 /// authoring belongs to `memex write` / `memex ingest`):
@@ -352,7 +352,7 @@ pub(crate) fn is_issue_still_present(
 /// Link issues (`DanglingLink`, `MissingLink`) are report-only — fixing
 /// them requires LLM judgment and is left to the caller.
 pub(crate) fn apply_fix_inner(
-    search: &Bm25Search,
+    search: &Db,
     root: &std::path::Path,
     issue: &LintIssue,
 ) -> crate::error::Result<()> {
@@ -372,19 +372,19 @@ pub(crate) fn apply_fix_inner(
 /// file off disk, commit_doc as wiki, set collections, embed.
 /// `StaleIndex` upserts an existing row; `UntrackedFile` inserts.
 fn fix_wiki_reindex(
-    search: &Bm25Search,
+    search: &Db,
     root: &std::path::Path,
     issue: &LintIssue,
 ) -> crate::error::Result<()> {
     let full_path = root.join(&issue.target);
     let content = std::fs::read_to_string(&full_path)?;
-    let (title, body, tags, _summary, collections) =
+    let (title, body, _summary, collections) =
         crate::search::parse_page_for_indexing(&content).ok_or_else(|| {
             crate::error::MemexError::ValidationFailure {
                 details: format!("page {} has no valid frontmatter", issue.target),
             }
         })?;
-    let mtime = crate::storage::file_mtime_iso(&full_path);
+    let mtime = std::fs::metadata(&full_path)?.modified()?;
     let size = content.len() as i64;
     let result = search.with_transaction(|tx| {
         crate::search::commit_doc(
@@ -393,9 +393,8 @@ fn fix_wiki_reindex(
                 doc_type: "wiki",
                 path: &issue.target,
                 title: &title,
-                tags: &tags,
                 source: None,
-                mtime: &mtime,
+                mtime,
                 body: &body,
                 size,
             },
@@ -415,7 +414,7 @@ fn fix_wiki_reindex(
 /// current model. Iterates by hash since `chunks` are hash-keyed; one
 /// embed_document call refreshes every row that shared the body.
 fn fix_outdated_embedding(
-    search: &Bm25Search,
+    search: &Db,
     root: &std::path::Path,
 ) -> crate::error::Result<()> {
     let mut model = crate::retrieval::load_default_model()?;
@@ -447,7 +446,7 @@ fn fix_outdated_embedding(
 /// matches whichever convention the row used (`<slug>` or
 /// `wiki/<slug>.md`).
 fn fix_missing_file(
-    search: &Bm25Search,
+    search: &Db,
     issue: &LintIssue,
 ) -> crate::error::Result<()> {
     search.delete_document_with_cleanup(&issue.target)?;
@@ -461,7 +460,7 @@ fn fix_missing_file(
 /// - normal rename: move the file to its new content-addressed path,
 ///   commit the new row, drop the old row and its chunks
 fn fix_raw_hash_mismatch(
-    search: &Bm25Search,
+    search: &Db,
     root: &std::path::Path,
     issue: &LintIssue,
 ) -> crate::error::Result<()> {
@@ -511,7 +510,7 @@ fn fix_raw_hash_mismatch(
 /// RawHashMismatch again, and the fix replays (the second tx is a no-op
 /// delete).
 fn fix_raw_hash_duplicate(
-    search: &Bm25Search,
+    search: &Db,
     old_rel: &str,
     old_abs: &std::path::Path,
 ) -> crate::error::Result<()> {
@@ -533,7 +532,7 @@ fn fix_raw_hash_duplicate(
 /// roll the file back so disk and DB stay consistent.
 #[allow(clippy::too_many_arguments)]
 fn fix_raw_hash_rename(
-    search: &Bm25Search,
+    search: &Db,
     root: &std::path::Path,
     old_rel: &str,
     old_abs: &std::path::Path,
@@ -547,8 +546,9 @@ fn fix_raw_hash_rename(
     let new_rel = crate::storage::rel_path_string(
         new_abs.strip_prefix(root).unwrap_or(new_abs),
     );
-    let mtime = crate::storage::file_mtime_iso(new_abs);
-    let size = std::fs::metadata(new_abs).map(|m| m.len() as i64).unwrap_or(0);
+    let meta = std::fs::metadata(new_abs)?;
+    let mtime = meta.modified()?;
+    let size = meta.len() as i64;
     let tx_result = search.with_transaction(|tx| {
         crate::search::commit_doc(
             tx,
@@ -556,9 +556,8 @@ fn fix_raw_hash_rename(
                 doc_type: "raw",
                 path: &new_rel,
                 title,
-                tags: "",
                 source,
-                mtime: &mtime,
+                mtime,
                 body,
                 size,
             },
@@ -630,18 +629,17 @@ fn drop_raw_row_and_chunks(
     tx: &rusqlite::Connection,
     old_rel: &str,
 ) -> crate::error::Result<()> {
-    let prior: Option<(i64, String, String, String)> = tx
+    let prior: Option<(i64, String, String)> = tx
         .query_row(
-            "SELECT id, title, tags, hash FROM documents WHERE doc_type='raw' AND path=?1",
+            "SELECT id, title, hash FROM documents WHERE doc_type='raw' AND path=?1",
             [old_rel],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
-    if let Some((id, prior_title, prior_tags, prior_hash)) = prior.as_ref() {
+    if let Some((id, prior_title, prior_hash)) = prior.as_ref() {
         let _ = tx.execute(
-            "INSERT INTO documents_fts(documents_fts, rowid, path, title, tags, body) \
-             VALUES('delete', ?1, ?2, ?3, ?4, '')",
-            rusqlite::params![id, old_rel, prior_title, prior_tags],
+            "INSERT INTO titles_fts(titles_fts, rowid, title) VALUES('delete', ?1, ?2)",
+            rusqlite::params![id, prior_title],
         );
         let other_refs: i64 = tx.query_row(
             "SELECT COUNT(*) FROM documents WHERE hash = ?1 AND id != ?2",
@@ -691,7 +689,8 @@ mod tests {
         write_and_index(
             &root,
             "page-a.md",
-            "---\ntitle: Page A\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSee [[nonexistent-page]] for details.\n",
+            "---\ntitle: Page A
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSee [[nonexistent-page]] for details.\n",
         );
 
         let memex = open_and_reindex(&root);
@@ -715,13 +714,15 @@ mod tests {
         write_and_index(
             &root,
             "caching.md",
-            "---\ntitle: Caching Strategies\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nCaching is important.\n",
+            "---\ntitle: Caching Strategies
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nCaching is important.\n",
         );
 
         write_and_index(
             &root,
             "performance.md",
-            "---\ntitle: Performance\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nImprove performance with caching strategies and other techniques.\n",
+            "---\ntitle: Performance
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nImprove performance with caching strategies and other techniques.\n",
         );
 
         let memex = open_and_reindex(&root);
@@ -760,13 +761,15 @@ mod tests {
         write_and_index(
             &root,
             "caching.md",
-            "---\ntitle: Caching\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nCaching info.\n",
+            "---\ntitle: Caching
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nCaching info.\n",
         );
 
         write_and_index(
             &root,
             "performance.md",
-            "---\ntitle: Performance\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nImprove performance with [[caching]] and other techniques.\n",
+            "---\ntitle: Performance
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nImprove performance with [[caching]] and other techniques.\n",
         );
 
         let memex = open_and_reindex(&root);
@@ -802,7 +805,8 @@ mod tests {
         write_and_index(
             &root,
             "fresh.md",
-            "---\ntitle: Fresh\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nbody content\n",
+            "---\ntitle: Fresh
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nbody content\n",
         );
         let memex = open_and_reindex(&root);
 
@@ -828,14 +832,16 @@ mod tests {
         write_and_index(
             &root,
             "stale-page.md",
-            "---\ntitle: Stale Page\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nOriginal content.\n",
+            "---\ntitle: Stale Page
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nOriginal content.\n",
         );
         let memex = open_and_reindex(&root);
 
         // Modify the file on disk without reindexing.
         std::fs::write(
             root.join("wiki/stale-page.md"),
-            "---\ntitle: Stale Page\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nModified content that is different.\n",
+            "---\ntitle: Stale Page
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nModified content that is different.\n",
         )
         .unwrap();
 
@@ -858,7 +864,8 @@ mod tests {
         // Write a file to disk without indexing it.
         std::fs::write(
             root.join("wiki/untracked.md"),
-            "---\ntitle: Untracked\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nNot indexed.\n",
+            "---\ntitle: Untracked
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nNot indexed.\n",
         )
         .unwrap();
 
@@ -887,7 +894,8 @@ mod tests {
         write_and_index(
             &root,
             "test.md",
-            "---\ntitle: Test\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nbody\n",
+            "---\ntitle: Test
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nbody\n",
         );
         let memex = open_and_reindex(&root);
 
@@ -932,7 +940,8 @@ mod tests {
         write_and_index(
             &root,
             "will-delete.md",
-            "---\ntitle: Will Delete\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nContent.\n",
+            "---\ntitle: Will Delete
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nContent.\n",
         );
         let memex = open_and_reindex(&root);
 
@@ -951,7 +960,7 @@ mod tests {
 
     /// Set `documents.embed_model` for the given path; in the new schema
     /// stale-embedding detection lives on the document, not on chunks.
-    fn set_embed_model(search: &crate::search::Bm25Search, path: &str, model: &str) {
+    fn set_embed_model(search: &crate::search::Db, path: &str, model: &str) {
         search
             .with_connection(|conn| {
                 conn.execute(
@@ -973,7 +982,8 @@ mod tests {
         write_and_index(
             &root,
             "embed-page.md",
-            "---\ntitle: Embed Page\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSome content for embedding.\n",
+            "---\ntitle: Embed Page
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSome content for embedding.\n",
         );
         let memex = open_and_reindex(&root);
 
@@ -1027,7 +1037,8 @@ mod tests {
         write_and_index(
             &root,
             "stale.md",
-            "---\ntitle: Stale\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nstale body\n",
+            "---\ntitle: Stale
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nstale body\n",
         );
         let memex = open_and_reindex(&root);
         let search = memex.search();
@@ -1045,6 +1056,7 @@ mod tests {
                     0,
                     0,
                     11,
+                    "",
                     &vec![0.1f32; crate::embed::EMBEDDING_DIM],
                 )?;
                 Ok(())
@@ -1093,7 +1105,8 @@ mod tests {
         write_and_index(
             &root,
             "embed-test.md",
-            "---\ntitle: Embed Test\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSome content.\n",
+            "---\ntitle: Embed Test
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nSome content.\n",
         );
         let memex = open_and_reindex(&root);
         let search = memex.search();
@@ -1127,7 +1140,8 @@ mod tests {
         write_and_index(
             &root,
             "current-page.md",
-            "---\ntitle: Current Page\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nContent.\n",
+            "---\ntitle: Current Page
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nContent.\n",
         );
         let memex = open_and_reindex(&root);
 
@@ -1240,7 +1254,8 @@ mod tests {
         write_and_index(
             &root,
             "ghost.md",
-            "---\ntitle: Ghost\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nGhost body.\n",
+            "---\ntitle: Ghost
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nGhost body.\n",
         );
         let memex = open_and_reindex(&root);
         // Confirm the row exists.
@@ -1335,14 +1350,14 @@ mod tests {
             .search()
             .with_transaction(|tx| {
                 tx.execute(
-                    "INSERT INTO documents (doc_type, path, title, hash, tags, source, mtime, size) \
-                     VALUES ('raw', ?1, 'Edited', ?2, '', 'https://x/edited', '2026-04-29T00:00:00Z', ?3)",
+                    "INSERT INTO documents (doc_type, path, title, hash, source, mtime, size) \
+                     VALUES ('raw', ?1, 'Edited', ?2, 'https://x/edited', 1000, ?3)",
                     rusqlite::params![&stale_rel_for_insert, &old_body_hash, body.len() as i64],
                 )?;
                 // Seed a chunk at the OLD hash so the test can verify
                 // the chunks-leak fix actually deletes it.
                 let dummy_embedding = vec![0.0f32; 768];
-                crate::vector::store_chunk(tx, &old_body_hash, 0, 0, body.len(), &dummy_embedding)?;
+                crate::vector::store_chunk(tx, &old_body_hash, 0, 0, body.len(), "", &dummy_embedding)?;
                 Ok(())
             })
             .unwrap();
@@ -1412,7 +1427,8 @@ mod tests {
         // Drop a file on disk; do NOT index.
         std::fs::write(
             root.join("wiki/orphan.md"),
-            "---\ntitle: Orphan\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nOrphan body.\n",
+            "---\ntitle: Orphan
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nOrphan body.\n",
         )
         .unwrap();
         let memex = crate::Memex::open_writer(root.clone()).unwrap();

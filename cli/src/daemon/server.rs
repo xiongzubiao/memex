@@ -43,6 +43,65 @@ pub enum StartOutcome {
     AlreadyRunning,
 }
 
+/// Files-per-chunk for chunked reconcile. Embed-model lock is acquired
+/// once per chunk and released between chunks so concurrent ingest
+/// embeds can interleave during long sweeps. 32 balances lock churn
+/// (each acquisition is microseconds) against ingest tail latency.
+const RECONCILE_CHUNK: usize = 32;
+
+/// Run a reconcile pass with chunked embed-model locking: walks once
+/// (no embedder needed), then per-file indexes in `RECONCILE_CHUNK`
+/// batches with the lock held only across each batch. Releases between
+/// batches, deletes stale doc rows at the end (no lock needed).
+pub(crate) async fn reconcile_chunked(
+    memex: &memex_core::Memex,
+    embed_model: &crate::daemon::handler::SharedEmbedder,
+    opts: memex_core::reconcile::ReconcileOptions,
+) -> memex_core::error::Result<memex_core::reconcile::ReconcileReport> {
+    let plan = memex_core::reconcile::reconcile_walk(memex, opts)?;
+    let mut report = memex_core::reconcile::ReconcileReport {
+        skipped_symlinks: plan.skipped_symlinks,
+        ..Default::default()
+    };
+    for chunk in plan.wiki_paths.chunks(RECONCILE_CHUNK) {
+        let mut guard = embed_model.lock().await;
+        for path in chunk {
+            match memex_core::index_wiki::index_wiki_file(memex, path, Some(guard.as_mut())) {
+                Ok(memex_core::index_wiki::IndexOutcome::Skipped) => report.skipped += 1,
+                Ok(_) => report.indexed += 1,
+                Err(e) => {
+                    tracing::warn!(path=%path.display(), %e, "reconcile: skip wiki file");
+                    report.skipped += 1;
+                }
+            }
+        }
+    }
+    for chunk in plan.raw_paths.chunks(RECONCILE_CHUNK) {
+        let mut guard = embed_model.lock().await;
+        for path in chunk {
+            match memex_core::index_raw::index_raw_file(memex, path, Some(guard.as_mut())) {
+                Ok(memex_core::index_raw::IndexOutcome::Skipped) => report.skipped += 1,
+                Ok(memex_core::index_raw::IndexOutcome::HashMismatch) => {
+                    report.hash_mismatches += 1;
+                }
+                Ok(_) => report.indexed += 1,
+                Err(e) => {
+                    tracing::warn!(path=%path.display(), %e, "reconcile: skip raw file");
+                    report.skipped += 1;
+                }
+            }
+        }
+    }
+    for path in &plan.to_delete {
+        if let Err(e) = memex.search().delete_document_with_cleanup(path) {
+            tracing::warn!(?e, %path, "reconcile: delete failed");
+        } else {
+            report.deleted += 1;
+        }
+    }
+    Ok(report)
+}
+
 /// Run the daemon main loop. Blocks until SIGTERM or idle timeout.
 pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome> {
     // 1. Lock 2.
@@ -226,13 +285,7 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                 Err(e) => warn!(?e, "stuck-job recovery failed; continuing"),
             }
 
-            let mut guard = embed_model.lock().await;
-            let result = memex_core::reconcile::reconcile_with_embed(
-                &memex,
-                Default::default(),
-                guard.as_mut(),
-            );
-            match result {
+            match reconcile_chunked(&memex, &embed_model, Default::default()).await {
                 Ok(r) => info!(
                     indexed = r.indexed,
                     deleted = r.deleted,
@@ -272,12 +325,13 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                     match state.writer.memex_handle().get_or_open(&root) {
                         Ok(memex) => {
                             info!("rebuilt fresh index.db after corruption; running reconcile");
-                            let mut guard = embed_model.lock().await;
-                            match memex_core::reconcile::reconcile_with_embed(
+                            match reconcile_chunked(
                                 &memex,
+                                &embed_model,
                                 Default::default(),
-                                guard.as_mut(),
-                            ) {
+                            )
+                            .await
+                            {
                                 Ok(r) => {
                                     info!(
                                         indexed = r.indexed,
@@ -307,43 +361,40 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
         }
     }
 
-    // 6. Watcher: detect external edits and re-index.
+    // 6. Watcher: detect external edits and re-index. The reconcile
+    // timer below (step 6b) is the safety net; `native_unreliable`
+    // collected here decides whether the timer needs the short
+    // cadence. Set to true on (a) network filesystems where native
+    // backends drop events, (b) native init failure on local disks
+    // (inotify exhaustion, missing backend), or (c) spawn_watcher
+    // returning Err with no usable watcher at all.
     let watch_root = state.writer.bound_root().to_path_buf();
+    let mut native_unreliable = false;
     match state.writer.memex_handle().get_or_open(&watch_root) {
         Ok(watch_memex) => {
             let (watch_tx, watch_rx) =
                 tokio::sync::mpsc::channel::<crate::daemon::watcher::WatcherEvent>(64);
-            // Native watchers (inotify/FSEvents/etc.) don't deliver
-            // events reliably across NFS/SMB/etc. Probe both wiki and
-            // raw dirs; if either is on a network FS, force polling so
-            // we don't silently miss changes.
             let wiki_dir = watch_memex.wiki_dir();
             let raw_dir = watch_memex.raw_dir();
-            let force_polling = crate::daemon::fs_kind::is_network_fs(&wiki_dir)
+            native_unreliable = crate::daemon::fs_kind::is_network_fs(&wiki_dir)
                 || crate::daemon::fs_kind::is_network_fs(&raw_dir);
-            if force_polling {
-                info!(
-                    poll_interval_sec = watch_memex.config().poll_interval_sec,
-                    "watcher: network filesystem detected; using polling"
-                );
+            if native_unreliable {
+                info!("watcher: network filesystem detected");
             }
             match crate::daemon::watcher::spawn_watcher(
-                crate::daemon::watcher::WatcherConfig {
-                    wiki_dir,
-                    raw_dir,
-                    poll_interval: std::time::Duration::from_secs(
-                        watch_memex.config().poll_interval_sec,
-                    ),
-                    force_polling,
-                },
+                crate::daemon::watcher::WatcherConfig { wiki_dir, raw_dir },
                 watch_tx,
             ) {
-                Ok(_watcher) => {
+                Ok(watcher) => {
+                    if !watcher.native_active {
+                        info!("watcher: native backend unavailable");
+                        native_unreliable = true;
+                    }
                     // Keep watcher alive for daemon lifetime by storing in a task.
                     let memex_handle_for_watch = state.writer.memex_handle().clone();
                     let embed_model_for_watch = embed_model.clone();
                     tokio::spawn(async move {
-                        let _keep_alive = _watcher;
+                        let _keep_alive = watcher;
                         let mut watch_rx = watch_rx;
                         while let Some(evt) = watch_rx.recv().await {
                             if let Err(e) = crate::daemon::watcher::handle_watch_event(
@@ -360,12 +411,94 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                 }
                 Err(e) => {
                     warn!(?e, "watcher startup failed; daemon will run without filesystem watching");
+                    native_unreliable = true;
                 }
             }
         }
         Err(e) => {
             warn!(?e, "could not open memex for watcher; skipping watcher startup");
         }
+    }
+
+    // 6b. Periodic reconcile timer. Single mechanism for catching drift
+    // the native watcher misses, including:
+    // - Phase 9 (DB commit) failures where raw+wiki landed but the
+    //   `documents` row didn't (no file event fires on retry).
+    // - Network-filesystem hosts where native watchers can't deliver
+    //   events reliably — used to be a separate polling-watcher loop;
+    //   now this timer covers both cases.
+    // - General drift between filesystem and index.
+    //
+    // Interval scales with watcher health: when native is unreliable
+    // (network FS or init failure) we tick on the shorter
+    // `core.poll_interval_sec` so changes don't sit undetected for an
+    // hour; otherwise we use `daemon.reconcile_interval_sec` (default
+    // 1h) since drift on native watchers is rare and reconcile costs
+    // CPU. Reconcile is idempotent and skips files whose mtime+size
+    // match, so no-op passes are cheap.
+    if cfg.daemon.reconcile_interval_sec > 0 {
+        let memex_for_interval = state.writer.memex_handle().get_or_open(&root).ok();
+        let interval = if native_unreliable {
+            let poll_interval_sec = memex_for_interval
+                .as_ref()
+                .map(|m| m.config().poll_interval_sec)
+                .unwrap_or(300);
+            Duration::from_secs(poll_interval_sec.min(cfg.daemon.reconcile_interval_sec))
+        } else {
+            Duration::from_secs(cfg.daemon.reconcile_interval_sec)
+        };
+        let memex_handle_for_reconcile = state.writer.memex_handle().clone();
+        let embed_model_for_reconcile = embed_model.clone();
+        let root_for_reconcile = root.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Default `Burst` missed-tick behavior would fire every
+            // skipped tick back-to-back if a reconcile pass overruns
+            // the interval (large roots, short intervals, or contention
+            // on the embed model lock can cause this). `Delay` waits a
+            // full interval from the end of the previous pass, bounding
+            // CPU/IO pressure to one reconcile-per-interval-window
+            // regardless of how long any single pass takes.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately; skip it because startup
+            // reconcile already ran. Wait one full interval before the
+            // first periodic pass.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let memex = match memex_handle_for_reconcile.get_or_open(&root_for_reconcile) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(?e, "periodic reconcile: get_or_open failed; skipping pass");
+                        continue;
+                    }
+                };
+                match reconcile_chunked(
+                    &memex,
+                    &embed_model_for_reconcile,
+                    Default::default(),
+                )
+                .await
+                {
+                    Ok(r) => {
+                        if r.indexed > 0 || r.deleted > 0 || r.hash_mismatches > 0 {
+                            info!(
+                                indexed = r.indexed,
+                                deleted = r.deleted,
+                                hash_mismatches = r.hash_mismatches,
+                                "periodic reconcile: drift detected and corrected"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(?e, "periodic reconcile failed; will retry next interval"),
+                }
+            }
+        });
+        info!(
+            interval_sec = interval.as_secs(),
+            native_unreliable,
+            "periodic reconcile timer armed"
+        );
     }
 
     // 7. Accept loop with idle timeout + SIGTERM. Signal handlers were

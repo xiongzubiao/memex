@@ -566,8 +566,11 @@ def parse_args():
                    help="Identifier for this run; used in output paths and log names.")
     p.add_argument("--backend", default="openai-api", choices=AGENT_FORMATS,
                    help="Daemon worker backend (sets MEMEX__DAEMON__WORKER__BACKEND).")
-    p.add_argument("--model", default="gpt-5",
-                   help="Daemon worker model (sets MEMEX__DAEMON__WORKER__MODEL).")
+    p.add_argument("--model", default=None,
+                   help="Daemon worker model (sets MEMEX__DAEMON__WORKER__MODEL). "
+                        "If unset, the daemon picks the backend-appropriate "
+                        "default (claude-sonnet-4-6 for claude-code, gpt-5.4-mini "
+                        "for codex/openai-api, gemini-3-flash-preview for gemini-cli).")
     p.add_argument("--judge-model", default="gpt-5",
                    help="Model used to judge answers.")
     p.add_argument("--judge-provider", default="openai",
@@ -793,19 +796,46 @@ async def async_main():
                 ev_ctx = _build_ev_ctx(
                     evidence_lookup, data["conversation_idx"],
                     data.get("evidence", []))
-                data["cutoff_results"] = await eval_raw_cutoffs(
-                    question=data["question"],
-                    category=data["category"],
-                    gold=data["ground_truth_answer"],
-                    ev_ctx=ev_ctx,
-                    raw_entries=raw_entries,
-                    cutoffs=cutoffs,
-                    answerer_llm=answerer_llm,
-                    judge_llm=judge_llm,
-                    predict_only=args.predict_only,
-                    logger=logger,
-                    question_id=data.get("question_id", ""))
-                await asyncio.to_thread(save_result_json, p, data)
+                # Skip cutoffs that already have results to avoid redundant
+                # answerer+judge LLM calls. Only compute missing cutoffs and
+                # merge with existing.
+                #
+                # A cutoff counts as "done" only if it has both an answer
+                # AND (when judging) a judgment. Predict-only runs persist
+                # `generated_answer` without `judgment`/`score`; without the
+                # judgment check, --reanswer would silently treat predict-only
+                # cached entries as complete and roll up unjudged metrics
+                # as 0.0.
+                existing_cutoffs = data.get("cutoff_results") or {}
+
+                def _cutoff_complete(label):
+                    cur = existing_cutoffs.get(label) or {}
+                    if not cur.get("generated_answer"):
+                        return False
+                    if not args.predict_only and "judgment" not in cur:
+                        return False
+                    return True
+
+                missing_cutoffs = [
+                    c for c in cutoffs if not _cutoff_complete(cutoff_label(c))
+                ]
+                if missing_cutoffs:
+                    new_results = await eval_raw_cutoffs(
+                        question=data["question"],
+                        category=data["category"],
+                        gold=data["ground_truth_answer"],
+                        ev_ctx=ev_ctx,
+                        raw_entries=raw_entries,
+                        cutoffs=missing_cutoffs,
+                        answerer_llm=answerer_llm,
+                        judge_llm=judge_llm,
+                        predict_only=args.predict_only,
+                        logger=logger,
+                        question_id=data.get("question_id", ""))
+                    merged = dict(existing_cutoffs)
+                    merged.update(new_results)
+                    data["cutoff_results"] = merged
+                    await asyncio.to_thread(save_result_json, p, data)
                 return data
 
         paths = [str(p) for p in sorted(Path(output_dir).rglob("conv*_q*.json"))]
@@ -815,6 +845,34 @@ async def async_main():
         if all_evaluations:
             metrics = compute_locomo_metrics(all_evaluations, cutoffs)
             display_results(metrics, cutoffs)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            unified_path = os.path.join(
+                args.output_dir, f"locomo_results_{timestamp}.json")
+            save_result_json(unified_path, {
+                "metadata": {
+                    "benchmark": "locomo",
+                    "project_name": args.project_name,
+                    "run_id": args.run_id,
+                    "timestamp": timestamp,
+                    "judge_model": args.judge_model,
+                    "judge_provider": args.judge_provider,
+                    "answerer_model": answerer_model if args.raw_query else args.model,
+                    "answerer_provider": answerer_provider if args.raw_query else args.backend,
+                    "total_questions": len(all_evaluations),
+                    "top_k": args.top_k,
+                    "top_k_cutoffs": [cutoff_label(c) for c in cutoffs],
+                    "categories": categories,
+                    "questions": None,
+                    "with_evidence": args.with_evidence,
+                    "judge_only": False,
+                    "previous_results_file": None,
+                    "merged_from_questions": None,
+                },
+                "metrics_by_cutoff": metrics,
+                "evaluations": all_evaluations,
+            })
+            print(f"\nResults saved to: {unified_path}")
         print(f"\nRe-answered {len(all_evaluations)} questions"
               + (f" (skipped {skipped} without cached retrieval)"
                  if skipped else ""))
@@ -942,6 +1000,16 @@ async def async_main():
                              conv_idx, rc, stderr.strip()[:500])
                 backfill_failures.append(conv_idx)
                 return
+
+            # Stop the daemon so its codex worker subprocesses (which saw
+            # source content during EXTRACT/MERGE) exit. The next call into
+            # `memex_query` auto-starts a fresh daemon with fresh worker
+            # threads. Without this, EXPAND turns can inherit prior
+            # EXTRACT/MERGE context from the worker's persistent thread —
+            # measured at ~+6 pts of inflated score on conv 0 — making
+            # benchmark numbers reflect cross-job context leakage rather
+            # than retrieval quality.
+            await asyncio.to_thread(memex_daemon_stop, conv_root)
 
         # Queries start as soon as this conv's backfill finishes — other convs
         # may still be backfilling, which overlaps their agents with these

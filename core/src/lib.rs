@@ -8,9 +8,11 @@ pub mod error;
 pub mod index;
 pub mod index_raw;
 pub mod index_wiki;
+pub mod ingest_jobs;
 pub mod llm_cache;
 pub mod lint;
 pub mod model;
+pub mod node_parser;
 pub mod raw;
 pub mod reconcile;
 pub mod retrieval;
@@ -52,7 +54,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use config::Config;
-use search::Bm25Search;
+use search::Db;
 
 /// Filename for the BM25 + content SQLite database.
 pub const INDEX_DB_NAME: &str = "index.db";
@@ -76,7 +78,7 @@ impl Drop for WriterLock {
 /// on `{root}/.lock`. Mutating methods check this via `require_writer()`.
 pub struct Memex {
     root: PathBuf,
-    search: Bm25Search,
+    search: Db,
     _writer_lock: Option<WriterLock>,
     config: Config,
 }
@@ -101,7 +103,7 @@ impl Memex {
     pub fn open(root: PathBuf) -> error::Result<Self> {
         let config = Config::load(&root)?;
         let (root, wiki_dir) = prepare_root(root, &config)?;
-        let search = Bm25Search::open(&root.join(INDEX_DB_NAME))?;
+        let search = Db::open(&root.join(INDEX_DB_NAME))?;
 
         // Migration hint: if DB is empty but wiki/ has .md files, suggest rebuild.
         // Spec Section 7 — r1 auto-rebuilt here; we moved that to open_writer to
@@ -150,7 +152,7 @@ impl Memex {
             })?;
         let writer_lock = WriterLock { file: lock_file };
 
-        let search = Bm25Search::open(&root.join(INDEX_DB_NAME))?;
+        let search = Db::open(&root.join(INDEX_DB_NAME))?;
 
         // Stale tmp cleanup — safe because we hold the writer flock.
         storage::cleanup_stale_tmp_files(&wiki_dir);
@@ -176,7 +178,7 @@ impl Memex {
         self.config.raw_dir(&self.root)
     }
 
-    pub fn search(&self) -> &Bm25Search {
+    pub fn search(&self) -> &Db {
         &self.search
     }
 
@@ -253,7 +255,7 @@ impl Memex {
 
         // Fresh connection — sees the latest committed state, not the reader's
         // pinned WAL snapshot from process start.
-        let fresh = search::Bm25Search::open(&self.root.join(INDEX_DB_NAME))?;
+        let fresh = search::Db::open(&self.root.join(INDEX_DB_NAME))?;
 
         if !lint::is_issue_still_present(&fresh, &self.root, issue)? {
             return Ok(FixOutcome::Stale);
@@ -361,7 +363,8 @@ mod tests {
         let root = dir.path().join("memex");
         std::fs::create_dir_all(root.join("wiki")).unwrap();
         let content =
-            "---\ntitle: T\ntags: []\nsources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\n---\n\nbody content\n";
+            "---\ntitle: T
+sources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\n---\n\nbody content\n";
         std::fs::write(root.join("wiki/p.md"), content).unwrap();
 
         let from_disk = read_body_from_disk(&root, "wiki", "wiki/p.md").unwrap();
@@ -391,7 +394,8 @@ mod tests {
         let writer = Memex::open_writer(root.clone()).unwrap();
         std::fs::write(
             root.join("wiki/test-page.md"),
-            "---\ntitle: Test Page\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nTest content.\n",
+            "---\ntitle: Test Page
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\n\nTest content.\n",
         ).unwrap();
         writer.reindex().unwrap();
         let idx = writer.read_index().unwrap();

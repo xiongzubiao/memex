@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::Memex;
 use crate::embed::Embedder;
 use crate::error::Result;
-use crate::storage::{content_hash, file_mtime_iso};
+use crate::storage::content_hash;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum IndexOutcome {
@@ -32,7 +32,7 @@ pub fn index_raw_file(
     // Stat first so reconcile can skip unchanged files without reading them.
     let meta = std::fs::metadata(path)?;
     let size = meta.len() as i64;
-    let mtime = file_mtime_iso(path);
+    let mtime = meta.modified()?;
 
     if let Some(existing) = memex.search().get_document_meta("raw", &rel_str)?
         && existing.mtime == mtime
@@ -77,9 +77,8 @@ pub fn index_raw_file(
                 doc_type: "raw",
                 path: &rel_str,
                 title: &title,
-                tags: "",
                 source: source.as_deref(),
-                mtime: &mtime,
+                mtime,
                 body,
                 size,
             },

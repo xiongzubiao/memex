@@ -2,7 +2,7 @@
 
 use crate::daemon::error::DaemonError;
 use crate::daemon::handler::{
-    HandlerState, acquire_slug_locks, error_events, get_or_open_memex,
+    HandlerState, acquire_slug_lock, error_events, get_or_open_memex,
 };
 use crate::daemon::protocol::Event;
 
@@ -19,7 +19,7 @@ pub(super) async fn handle_delete(
     let search = memex.search();
 
     // Acquire the per-slug lock so no concurrent write/delete races.
-    let _slug_guard = acquire_slug_locks(&state.writer, vec![slug.clone()]).await;
+    let _slug_guard = acquire_slug_lock(&state.writer, &slug).await;
 
     // Resolve the wiki doc.
     let docs = match search.resolve_ref_documents(&slug) {
@@ -36,17 +36,19 @@ pub(super) async fn handle_delete(
     };
     let target_path = wiki_doc.path.clone();
 
-    // Backlink scan via FTS — guards against deleting a page that is
-    // still linked from elsewhere. Post-delete dangling references
-    // are reported by `memex lint`, not by this handler.
+    // Backlink scan via chunks_fts — guards against deleting a page
+    // that is still linked from elsewhere. The `[[<slug>]]` text lives
+    // in chunk bodies, so scan there and `GROUP BY hash` to dedupe.
+    // Post-delete dangling references are reported by `memex lint`,
+    // not by this handler.
     if !force {
         let pattern = format!("\"[[{slug}]]\"");
         let backlinks: Vec<String> = match search.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT d.path FROM documents d \
-                 JOIN documents_fts f ON f.rowid = d.id \
+                "SELECT DISTINCT d.path FROM documents d \
+                 JOIN chunks_fts cf ON cf.hash = d.hash \
                  WHERE d.doc_type = 'wiki' AND d.path != ?1 \
-                   AND documents_fts MATCH ?2",
+                   AND cf.chunk_text MATCH ?2",
             )?;
             let rows: Vec<String> = stmt
                 .query_map(rusqlite::params![&target_path, &pattern], |r| {

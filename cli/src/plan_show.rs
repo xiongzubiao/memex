@@ -33,14 +33,9 @@ pub fn format_plan(plan: &Plan) -> String {
         if p.slug != p.original_slug {
             status.push_str(&format!(" (edited from {})", p.original_slug));
         }
-        let tags = if p.tags.is_empty() {
-            String::new()
-        } else {
-            p.tags.join(", ")
-        };
         out.push_str(&format!(
-            "{} | {} | {} | {} | {}\n",
-            p.index, p.slug, p.title, tags, status
+            "{} | {} | {} | {}\n",
+            p.index, p.slug, p.title, status
         ));
     }
     for p in &plan.proposals {
@@ -75,23 +70,21 @@ mod tests {
             proposals: vec![
                 Proposal {
                     index: 0,
-                    slug: "mmai".into(),
-                    title: "MMAI".into(),
-                    tags: vec!["ai".into(), "platform".into()],
+                    slug: "alpha".into(),
+                    title: "Alpha".into(),
                     body: "...".into(),
-                    merge_target_slug: Some("mmai".into()),
+                    merge_target_slug: Some("alpha".into()),
                     merge_target_hash: Some("f".repeat(64)),
                     merge_diff: Some("--- existing\n+++ merged\n@@\n+## New\n".into()),
                     dropped: false,
                     committed: false,
-                    original_slug: "mmai".into(),
+                    original_slug: "alpha".into(),
                     error: None,
                 },
                 Proposal {
                     index: 1,
                     slug: "gpu-checkpoint".into(),
                     title: "GPU Checkpoint".into(),
-                    tags: vec!["gpu".into()],
                     body: "...".into(),
                     merge_target_slug: None,
                     merge_target_hash: None,
@@ -112,14 +105,14 @@ mod tests {
         assert!(s.contains("4823 bytes"));
         assert!(s.contains("2 proposals"));
         assert!(s.contains("1 merge"));
-        assert!(s.contains("0 | mmai | MMAI | ai, platform | merge → mmai"));
+        assert!(s.contains("0 | alpha | Alpha | merge → alpha"));
         assert!(s.contains("1 | gpu-checkpoint"));
     }
 
     #[test]
     fn format_plan_includes_merge_diff_block() {
         let s = format_plan(&sample_plan());
-        assert!(s.contains("--- diff: mmai (proposal 0 → existing wiki page) ---"));
+        assert!(s.contains("--- diff: alpha (proposal 0 → existing wiki page) ---"));
         assert!(s.contains("+## New"));
     }
 

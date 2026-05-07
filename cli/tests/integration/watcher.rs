@@ -11,8 +11,6 @@ async fn watcher_emits_touch_when_wiki_file_is_created() {
         WatcherConfig {
             wiki_dir: root.join("wiki"),
             raw_dir: root.join("raw"),
-            poll_interval: Duration::from_secs(60),
-            force_polling: false,
         },
         tx,
     )

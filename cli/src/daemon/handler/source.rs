@@ -46,8 +46,6 @@ pub(super) async fn handle_source_add(
             ingested_at: Some(now),
             converter: None,
             title: Some(derived_title.clone()),
-            agent: None,
-            session_id: None,
         };
         let file = memex_core::raw::assemble_raw_file(&fm, &content);
         if let Err(e) = memex_core::storage::atomic_write(&raw_path, file.as_bytes()) {
@@ -169,7 +167,7 @@ pub(super) async fn handle_source_delete(
 /// Returns Ok(None) if not found, Err on lookup error.
 /// Note: "path:<src>" syntax is no longer supported (removed in foundation rewrite).
 pub(in crate::daemon::handler) fn resolve_source_ref(
-    search: &memex_core::search::Bm25Search,
+    search: &memex_core::search::Db,
     ref_: &str,
 ) -> Result<Option<memex_core::types::Document>, memex_core::error::MemexError> {
     let docs = search.resolve_ref_documents(ref_)?;

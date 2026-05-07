@@ -72,7 +72,8 @@ fn lint_detects_stale_index() {
     // Modify the file on disk directly (no re-index).
     std::fs::write(
         root.join("wiki/rest-patterns.md"),
-        "---\ntitle: REST Patterns\ntags:\n  - entity\ncreated_at: 2026-04-10T00:00:00Z\nupdated_at: 2026-04-10T00:00:00Z\nsources: []\n---\n\nCompletely rewritten content about REST and GraphQL.\n",
+        "---\ntitle: REST Patterns
+created_at: 2026-04-10T00:00:00Z\nupdated_at: 2026-04-10T00:00:00Z\nsources: []\n---\n\nCompletely rewritten content about REST and GraphQL.\n",
     )
     .unwrap();
 
@@ -110,7 +111,8 @@ fn lint_fix_reindexes_stale() {
     // External edit (no daemon involved while we modify the bytes).
     std::fs::write(
         root.join("wiki/rest-patterns.md"),
-        "---\ntitle: REST Patterns\ntags:\n  - entity\ncreated_at: 2026-04-10T00:00:00Z\nupdated_at: 2026-04-10T00:00:00Z\nsources: []\n---\n\nCompletely rewritten content about REST and GraphQL.\n",
+        "---\ntitle: REST Patterns
+created_at: 2026-04-10T00:00:00Z\nupdated_at: 2026-04-10T00:00:00Z\nsources: []\n---\n\nCompletely rewritten content about REST and GraphQL.\n",
     )
     .unwrap();
 

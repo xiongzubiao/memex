@@ -90,7 +90,7 @@ mod tests {
                 hash TEXT NOT NULL,
                 tags TEXT NOT NULL DEFAULT '',
                 source TEXT,
-                mtime TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
                 size INTEGER NOT NULL,
                 embed_model TEXT,
                 embedded_at TEXT,
@@ -104,7 +104,7 @@ mod tests {
     fn insert(conn: &Connection, hash: &str, path: &str) {
         conn.execute(
             "INSERT INTO documents (doc_type, path, title, hash, mtime, size) \
-             VALUES ('wiki', ?1, 'T', ?2, '2026-04-26T00:00:00Z', 0)",
+             VALUES ('wiki', ?1, 'T', ?2, 0, 0)",
             rusqlite::params![path, hash],
         )
         .unwrap();

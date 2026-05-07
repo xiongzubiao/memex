@@ -1,13 +1,14 @@
 //! Filesystem watcher: emits change events from wiki/raw trees.
 //!
 //! Native backend (notify::recommended_watcher) on Linux/macOS/Windows.
-//! Polling fallback for network drives or hosts where the native backend
-//! is unavailable. Both backends produce `WatcherEvent` values on the
-//! caller-provided channel; the consumer reindexes synchronously.
+//! Periodic full-tree reconcile (handled by the daemon's reconcile timer
+//! in server.rs, not here) catches everything the native watcher misses
+//! — including the case where native backends are unavailable (network
+//! filesystems, init failure). The watcher only owns the per-event
+//! reaction path.
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use notify::event::{ModifyKind, RenameMode};
@@ -18,39 +19,44 @@ use tokio::sync::mpsc;
 pub enum WatcherEvent {
     Touch(PathBuf),
     Remove(PathBuf),
+    /// Emergency rescan signal — emitted when the native watcher errors
+    /// (inotify queue overflow on Linux, FSEvents coalescing loss on
+    /// macOS) and may have dropped events. The consumer triggers a full
+    /// reconcile to resync. NOT used for periodic polling — the daemon's
+    /// reconcile timer handles that separately.
     Rescan,
 }
 
 pub struct WatcherConfig {
     pub wiki_dir: PathBuf,
     pub raw_dir: PathBuf,
-    pub poll_interval: Duration,
-    pub force_polling: bool,
 }
 
 pub struct WatcherHandle {
     _watcher: Option<RecommendedWatcher>,
-    _poll: Option<tokio::task::JoinHandle<()>>,
+    /// `true` if the native backend started successfully; `false`
+    /// means this daemon has no per-event detection. See
+    /// `server::run_daemon`'s reconcile-timer block for what the
+    /// caller does in the `false` case.
+    pub native_active: bool,
 }
 
+/// Spawn the native filesystem watcher.
 pub fn spawn_watcher(cfg: WatcherConfig, tx: mpsc::Sender<WatcherEvent>) -> Result<WatcherHandle> {
     let tx = Arc::new(tx);
-    let mut watcher_handle: Option<RecommendedWatcher> = None;
-    if !cfg.force_polling {
-        match start_native(&cfg, tx.clone()) {
-            Ok(w) => watcher_handle = Some(w),
-            Err(e) => tracing::warn!(?e, "native watcher unavailable; falling back to polling"),
+    let (watcher_handle, native_active) = match start_native(&cfg, tx.clone()) {
+        Ok(w) => (Some(w), true),
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "native watcher unavailable; relying on daemon reconcile timer for change detection"
+            );
+            (None, false)
         }
-    }
-    let needs_poll = watcher_handle.is_none() || cfg.force_polling;
-    let poll = if needs_poll {
-        Some(start_polling(cfg.poll_interval, tx.clone()))
-    } else {
-        None
     };
     Ok(WatcherHandle {
         _watcher: watcher_handle,
-        _poll: poll,
+        native_active,
     })
 }
 
@@ -126,20 +132,6 @@ fn start_native(
     Ok(w)
 }
 
-fn start_polling(
-    interval: Duration,
-    tx: Arc<mpsc::Sender<WatcherEvent>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(interval).await;
-            if tx.send(WatcherEvent::Rescan).await.is_err() {
-                break;
-            }
-        }
-    })
-}
-
 /// Apply a single watcher event to the index. Called serially by the consumer task.
 ///
 /// `embed_model` is the shared embedder — locked per event so the touched
@@ -212,12 +204,7 @@ pub async fn handle_watch_event(
             m.search().delete_document_with_cleanup(&rel_str)?;
         }
         WatcherEvent::Rescan => {
-            let mut guard = embed_model.lock().await;
-            memex_core::reconcile::reconcile_with_embed(
-                &m,
-                Default::default(),
-                guard.as_mut(),
-            )?;
+            crate::daemon::server::reconcile_chunked(&m, embed_model, Default::default()).await?;
         }
     }
     Ok(())

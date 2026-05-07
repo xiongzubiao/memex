@@ -13,14 +13,16 @@ fn ambiguous_4char_prefix_resolves_at_5char() {
     std::fs::write(
         memex.wiki_dir().join("a.md"),
         format!(
-            "---\ntitle: A\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{b1}"
+            "---\ntitle: A
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{b1}"
         ),
     )
     .unwrap();
     std::fs::write(
         memex.wiki_dir().join("b.md"),
         format!(
-            "---\ntitle: B\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{b2}"
+            "---\ntitle: B
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{b2}"
         ),
     )
     .unwrap();

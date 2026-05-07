@@ -21,7 +21,7 @@ use std::path::PathBuf;
 ///
 /// - `from_line=None`, `max_lines=None`: returns the whole body unchanged.
 /// - `from_line` is 1-indexed; if it is beyond EOF returns `("", (0, 0))`.
-/// - `max_lines` is a count (mirrors the `@@ -N,M @@` second field).
+/// - `max_lines` is a count of lines to include from `from_line`.
 /// - The returned `(start, end)` is `(first, last)` inclusive line numbers;
 ///   both 0 when the slice is empty.
 pub fn slice_body(

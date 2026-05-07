@@ -1334,6 +1334,7 @@ dependencies = [
  "config",
  "dirs",
  "fs2",
+ "futures",
  "glob",
  "libc",
  "memex-core",
@@ -1367,6 +1368,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "rusqlite",
+ "sentencex",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2192,6 +2194,17 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "sentencex"
+version = "0.1.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e15721ae8cbb776aba81f3b242be71c6b72cc71ab0bf05581525c670f0057d81"
+dependencies = [
+ "clap",
+ "regex",
+ "serde",
+]
 
 [[package]]
 name = "serde"

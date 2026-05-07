@@ -100,7 +100,8 @@ fn write_rejects_empty_title() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("memex");
 
-    let content = "---\ntitle: \"\"\ntags: []\ncreated_at: 2026-04-14T00:00:00Z\nupdated_at: 2026-04-14T00:00:00Z\nsources: []\n---\n\nBody.\n";
+    let content = "---\ntitle: \"\"
+created_at: 2026-04-14T00:00:00Z\nupdated_at: 2026-04-14T00:00:00Z\nsources: []\n---\n\nBody.\n";
     let err = seed_wiki_page(&root, "empty-title", content, false)
         .expect_err("write with empty title should fail");
     assert!(
@@ -114,7 +115,8 @@ fn write_handles_colon_in_title() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("memex");
 
-    let content = "---\ntitle: Go: Deep Equal Comparison\ntags: [go]\ncreated_at: 2026-04-14T00:00:00Z\nupdated_at: 2026-04-14T00:00:00Z\nsources: []\n---\n\nComparing structs.\n";
+    let content = "---\ntitle: Go: Deep Equal Comparison
+created_at: 2026-04-14T00:00:00Z\nupdated_at: 2026-04-14T00:00:00Z\nsources: []\n---\n\nComparing structs.\n";
     seed_wiki_page(&root, "go-deep-equal", content, false).expect("colon in title should be handled");
 
     let disk = std::fs::read_to_string(root.join("wiki/go-deep-equal.md")).unwrap();

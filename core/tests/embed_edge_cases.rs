@@ -22,10 +22,15 @@ fn embed_text_edge_cases_no_panic() {
     .unwrap();
     assert_eq!(v.len(), memex_core::embed::EMBEDDING_DIM);
 
-    // Very long (>2048 tokens after tokenization). Should be truncated, not panic.
+    // Very long (>2048 tokens after tokenization). Embedder rejects
+    // oversized input — caller is responsible for chunking to fit.
     let long = "the quick brown fox jumps over the lazy dog. ".repeat(1000);
-    let v = memex_core::embed::embed_text(&mut model, &long).unwrap();
-    assert_eq!(v.len(), memex_core::embed::EMBEDDING_DIM);
+    let err = memex_core::embed::embed_text(&mut model, &long).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("content tokens") && msg.contains("embedder limit"),
+        "expected token-budget error, got: {msg}"
+    );
 
     // Repeated calls.
     for _ in 0..3 {

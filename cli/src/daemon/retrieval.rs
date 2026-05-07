@@ -177,6 +177,7 @@ impl RetrievalActor {
                         },
                         vec_embs,
                         hyde_embs,
+                        hyde: e.hyde.clone(),
                     })
                 }
             };
@@ -226,7 +227,7 @@ impl RetrievalActor {
                 // Focused snippet from the vector search path (~300 chars,
                 // diff-style header). BM25-only hits have empty snippets;
                 // the synth pipeline tolerates that.
-                body: r.snippet,
+                body: r.body,
             });
         }
 

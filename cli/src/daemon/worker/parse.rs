@@ -48,8 +48,12 @@ pub fn parse_expansion(text: &str) -> Result<ExpandReply, ParseFailure> {
     }
 }
 
-/// Parse a synthesis reply. Returns `Err(raw_text)` if the payload doesn't
-/// match `{answer, citations}` — callers surface as `WorkerError::Backend`.
+/// Parse a synthesis reply. Accepts strict `{answer, citations}` JSON, then
+/// falls back to prose that **carries at least one `[[id]]` citation marker**
+/// — some models return that shape despite the prompt demanding JSON.
+/// Returns `Err` when the payload is empty, or when JSON parse fails AND the
+/// prose contains no citation markers (accepting unstructured prose would
+/// surface model hallucinations as authoritative output).
 pub fn parse_synthesis(text: &str) -> Result<SynthReply, ParseFailure> {
     #[derive(Deserialize)]
     struct Raw {
@@ -58,16 +62,59 @@ pub fn parse_synthesis(text: &str) -> Result<SynthReply, ParseFailure> {
         citations: Vec<String>,
     }
     let cleaned = strip_code_fences(text);
-    match parse_json_with_recovery::<Raw>(cleaned) {
-        Ok(r) => Ok(SynthReply {
+    if let Ok(r) = parse_json_with_recovery::<Raw>(cleaned) {
+        return Ok(SynthReply {
             answer: r.answer,
             citations: r.citations,
-        }),
-        Err(e) => Err(ParseFailure {
-            raw: text.to_string(),
-            reason: format!("expected JSON object {{answer,citations}}: {e}"),
-        }),
+        });
     }
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return Err(ParseFailure {
+            raw: text.to_string(),
+            reason: "empty synthesis reply".to_string(),
+        });
+    }
+    let citations = extract_bracket_citations(trimmed);
+    if citations.is_empty() {
+        return Err(ParseFailure {
+            raw: text.to_string(),
+            reason: "synthesis reply is neither valid JSON nor prose with [[id]] citations"
+                .to_string(),
+        });
+    }
+    Ok(SynthReply {
+        answer: trimmed.to_string(),
+        citations,
+    })
+}
+
+/// Extract every `[[id]]` marker into a deduped citation list, preserving order.
+fn extract_bracket_citations(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            let mut end = start;
+            while end + 1 < bytes.len() && !(bytes[end] == b']' && bytes[end + 1] == b']') {
+                end += 1;
+            }
+            if end + 1 < bytes.len() && bytes[end] == b']' && bytes[end + 1] == b']' {
+                if let Ok(id) = std::str::from_utf8(&bytes[start..end]) {
+                    let id = id.trim().to_string();
+                    if !id.is_empty() && !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+                i = end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Parse an ingest extraction reply. Tries JSON first (safe from YAML alias
@@ -388,7 +435,7 @@ fn drop_duplicate_top_level_keys(block: &str) -> String {
                 .split_once(':')
                 .map(|(k, _)| k.trim())
                 .unwrap_or_default();
-            if matches!(key, "slug" | "title" | "tags" | "body") {
+            if matches!(key, "slug" | "title" | "body") {
                 if seen.contains(key) {
                     continue;
                 }
@@ -419,9 +466,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_reply_fallback() {
-        let e = parse_synthesis("plain").unwrap_err();
-        assert_eq!(e.raw, "plain");
+    fn parse_reply_prose_with_citations() {
+        let r = parse_synthesis(
+            "She felt freaked out and scared, but also relieved. [[2c66a0d]][[fece50d]]",
+        )
+        .unwrap();
+        assert!(r.answer.starts_with("She felt freaked"));
+        assert_eq!(r.citations, vec!["2c66a0d", "fece50d"]);
+    }
+
+    #[test]
+    fn parse_reply_plain_prose_no_citations_errors() {
+        let e = parse_synthesis("Just a sentence with no markers.").unwrap_err();
+        assert!(e.reason.contains("[[id]] citations"), "reason: {}", e.reason);
+    }
+
+    #[test]
+    fn parse_reply_empty_errors() {
+        let e = parse_synthesis("   ").unwrap_err();
+        assert!(e.reason.contains("empty"));
     }
 
     #[test]

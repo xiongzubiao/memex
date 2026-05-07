@@ -28,9 +28,12 @@ pub fn rrf_fuse(lists: &[Vec<SearchResult>], weights: &[f32], k: u32) -> Vec<Sea
 
     let k_f = k as f32;
 
-    // Accumulate scores per document path
+    // Accumulate scores keyed by (path, chunk_seq) so chunks of the
+    // same doc are kept as separate entries (chunk-level fusion). Doc-
+    // level results (chunk_seq = None, e.g. title-only paths) share a
+    // single key per path.
     let mut scores: std::collections::HashMap<
-        String,                     // path as string key
+        (String, Option<i32>),      // (path, chunk_seq) key
         (SearchResult, f32, usize), // (best result, rrf_score, best_rank_1based)
     > = std::collections::HashMap::new();
 
@@ -50,10 +53,10 @@ pub fn rrf_fuse(lists: &[Vec<SearchResult>], weights: &[f32], k: u32) -> Vec<Sea
                 0.0
             };
 
-            let path_key = result.path.to_string_lossy().to_string();
+            let key = (result.path.to_string_lossy().to_string(), result.chunk_seq);
 
             scores
-                .entry(path_key)
+                .entry(key)
                 .and_modify(|(existing, rrf_score, best_rank)| {
                     *rrf_score += contribution + bonus;
                     if rank_1based < *best_rank {
@@ -80,4 +83,67 @@ pub fn rrf_fuse(lists: &[Vec<SearchResult>], weights: &[f32], k: u32) -> Vec<Sea
             result
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::search::SearchResult;
+
+    #[test]
+    fn rrf_fuse_single_list() {
+        let list = vec![
+            SearchResult {
+                path: PathBuf::from("wiki/a.md"),
+                title: "A".to_string(),
+                score: 0.9,
+                body: String::new(),
+                doc_type: "wiki".to_string(),
+                hash: String::new(),
+                chunk_seq: None,
+            },
+            SearchResult {
+                path: PathBuf::from("wiki/b.md"),
+                title: "B".to_string(),
+                score: 0.5,
+                body: String::new(),
+                doc_type: "wiki".to_string(),
+                hash: String::new(),
+                chunk_seq: None,
+            },
+        ];
+
+        let fused = rrf_fuse(&[list], &[1.0], 60);
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].score, 1.0);
+        assert_eq!(fused[1].score, 0.5);
+    }
+
+    #[test]
+    fn rrf_fuse_wiki_weighted() {
+        let wiki_list = vec![SearchResult {
+            path: PathBuf::from("wiki/a.md"),
+            title: "A".to_string(),
+            score: 0.9,
+            body: String::new(),
+            doc_type: "wiki".to_string(),
+            hash: String::new(),
+            chunk_seq: None,
+        }];
+        let raw_list = vec![SearchResult {
+            path: PathBuf::from("raw/b.md"),
+            title: "B".to_string(),
+            score: 0.8,
+            body: String::new(),
+            doc_type: "raw".to_string(),
+            hash: String::new(),
+            chunk_seq: None,
+        }];
+
+        let fused = rrf_fuse(&[wiki_list, raw_list], &[2.0, 1.0], 60);
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].path, PathBuf::from("wiki/a.md"));
+    }
 }

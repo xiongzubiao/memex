@@ -30,8 +30,6 @@ pub struct Proposal {
     pub index: usize,
     pub slug: String,
     pub title: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
     pub body: String,
     pub merge_target_slug: Option<String>,
     pub merge_target_hash: Option<String>,
@@ -54,7 +52,6 @@ impl Proposal {
             index,
             slug: slug.clone(),
             title: page.title,
-            tags: page.tags,
             body: page.body,
             merge_target_slug: None,
             merge_target_hash: None,
@@ -183,22 +180,21 @@ mod tests {
     fn proposal_round_trip_with_merge_fields() {
         let p = Proposal {
             index: 0,
-            slug: "mmai".into(),
-            title: "MMAI".into(),
-            tags: vec!["ai".into()],
+            slug: "alpha".into(),
+            title: "Alpha".into(),
             body: "body".into(),
-            merge_target_slug: Some("mmai".into()),
+            merge_target_slug: Some("alpha".into()),
             merge_target_hash: Some("f".repeat(64)),
             merge_diff: Some("--- a\n+++ b\n".into()),
             dropped: false,
             committed: false,
-            original_slug: "mmai".into(),
+            original_slug: "alpha".into(),
             error: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: Proposal = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
-        assert!(json.contains(r#""merge_target_slug":"mmai""#));
+        assert!(json.contains(r#""merge_target_slug":"alpha""#));
         assert!(
             !json.contains(r#""error":"#),
             "error: None must be skipped via skip_serializing_if"
@@ -228,16 +224,15 @@ mod tests {
             created_at: "2026-04-30T00:00:00Z".into(),
             proposals: vec![Proposal {
                 index: 0,
-                slug: "mmai".into(),
-                title: "MMAI".into(),
-                tags: vec![],
+                slug: "alpha".into(),
+                title: "Alpha".into(),
                 body: "b".into(),
                 merge_target_slug: None,
                 merge_target_hash: None,
                 merge_diff: None,
                 dropped: false,
                 committed: false,
-                original_slug: "mmai".into(),
+                original_slug: "alpha".into(),
                 error: None,
             }],
         }
@@ -272,7 +267,7 @@ mod tests {
     #[test]
     fn validate_rejects_non_kebab_slug() {
         let mut p = valid_plan();
-        p.proposals[0].slug = "MMAI".into();
+        p.proposals[0].slug = "Alpha".into();
         assert!(p.validate().unwrap_err().contains("kebab"));
     }
 
@@ -281,16 +276,15 @@ mod tests {
         let mut p = valid_plan();
         p.proposals.push(Proposal {
             index: 1,
-            slug: "mmai".into(),
+            slug: "alpha".into(),
             title: "Dup".into(),
-            tags: vec![],
             body: "b".into(),
             merge_target_slug: None,
             merge_target_hash: None,
             merge_diff: None,
             dropped: false,
             committed: false,
-            original_slug: "mmai".into(),
+            original_slug: "alpha".into(),
             error: None,
         });
         let err = p.validate().unwrap_err();
@@ -302,16 +296,15 @@ mod tests {
         let mut p = valid_plan();
         p.proposals.push(Proposal {
             index: 1,
-            slug: "mmai".into(),
+            slug: "alpha".into(),
             title: "Dup".into(),
-            tags: vec![],
             body: "b".into(),
             merge_target_slug: None,
             merge_target_hash: None,
             merge_diff: None,
             dropped: true,
             committed: false,
-            original_slug: "mmai".into(),
+            original_slug: "alpha".into(),
             error: None,
         });
         p.validate().unwrap();
@@ -336,7 +329,7 @@ mod tests {
     fn validate_allows_slug_with_null_hash() {
         // MERGE-dry-run failure state: slug populated, hash null.
         let mut p = valid_plan();
-        p.proposals[0].merge_target_slug = Some("mmai".into());
+        p.proposals[0].merge_target_slug = Some("alpha".into());
         p.proposals[0].merge_target_hash = None;
         p.validate().unwrap();
     }

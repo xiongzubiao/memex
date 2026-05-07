@@ -485,7 +485,8 @@ mod tests {
 
         // Existing page mentions BOTH "Auth Tokens" and "REST Patterns"
         // verbatim, neither linked yet.
-        let existing = "---\ntitle: API Design\ntags: []\nsources: []\n\
+        let existing = "---\ntitle: API Design
+sources: []\n\
             created_at: 2026-04-30T00:00:00Z\nupdated_at: 2026-04-30T00:00:00Z\n\
             ---\n\nWe use Auth Tokens for clients and REST Patterns for resources.\n";
         std::fs::write(wiki_dir.join("api-design.md"), existing).unwrap();
@@ -526,7 +527,8 @@ mod tests {
         let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
         let wiki_dir = memex.wiki_dir();
 
-        let body = "---\ntitle: Auth Tokens\ntags: []\nsources: []\n\
+        let body = "---\ntitle: Auth Tokens
+sources: []\n\
             created_at: 2026-04-30T00:00:00Z\nupdated_at: 2026-04-30T00:00:00Z\n\
             ---\n\nThe Auth Tokens system manages session lifetimes.\n";
         std::fs::write(wiki_dir.join("auth-tokens.md"), body).unwrap();

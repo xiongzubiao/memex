@@ -52,7 +52,7 @@ fn concurrent_readers_ok_while_writer_holds() {
             let memex = Memex::open(r).unwrap();
             memex
                 .search()
-                .search_by_doc_type("anything", "wiki", 5)
+                .search_by_doc_type("anything", "wiki", 5, &[])
                 .unwrap()
         }));
     }

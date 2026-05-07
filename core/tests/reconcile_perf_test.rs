@@ -21,7 +21,8 @@ fn reconcile_no_change_under_2s_for_10k_docs() {
         std::fs::write(
             p,
             format!(
-                "---\ntitle: P{i}\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nbody {i}\n"
+                "---\ntitle: P{i}
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nbody {i}\n"
             ),
         )
         .unwrap();

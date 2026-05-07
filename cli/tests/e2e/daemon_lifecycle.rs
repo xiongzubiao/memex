@@ -97,24 +97,40 @@ fn concurrent_start_exactly_one_wins() {
     }
 
     // Exactly one daemon should have acquired the lock.
-    // Read the PID file to verify.
+    // Read the PID file to verify exactly one daemon won.
     assert!(
         root.join("daemon.pid").exists(),
         "no daemon acquired lock within 3s"
     );
-    let pid: u32 = std::fs::read_to_string(root.join("daemon.pid"))
+    let pid_before: u32 = std::fs::read_to_string(root.join("daemon.pid"))
         .unwrap()
         .trim()
         .parse()
         .unwrap();
 
-    // Cleanup: stop the winner, then check it exited cleanly.
+    // Hold for ~250ms and re-read; if a second daemon had taken over
+    // (lock race went wrong), the pid file would point at a different
+    // process by now. Same PID = exactly one winner held the lock for
+    // this whole window.
+    thread::sleep(Duration::from_millis(250));
+    let pid_after: u32 = std::fs::read_to_string(root.join("daemon.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        pid_before, pid_after,
+        "pid file changed: a second daemon took over after the first"
+    );
+
+    // Cleanup: stop and reap. The daemon removes its pid file on
+    // successful shutdown (server.rs:604), so we don't assert on the
+    // pid file existing post-stop.
     let _ = stop(root);
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        // Check if the PID is still running.
         let still_alive = std::process::Command::new("ps")
-            .args(["-p", &pid.to_string()])
+            .args(["-p", &pid_before.to_string()])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -123,16 +139,6 @@ fn concurrent_start_exactly_one_wins() {
         }
         thread::sleep(Duration::from_millis(50));
     }
-
-    // Verify only one PID file exists (the winner, not the loser).
-    // If a second daemon had won, we'd see a different PID.
-    // The loser should have exited cleanly (exit 0).
-    assert!(
-        root.join("daemon.pid").exists(),
-        "winner exited unexpectedly"
-    );
-
-    // Reap both `memex daemon start` invocations so they don't leave zombies.
     let _ = d1.wait();
     let _ = d2.wait();
 }

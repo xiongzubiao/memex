@@ -144,7 +144,7 @@ pub fn find_dangling_links(content: &str, wiki_dir: &Path) -> Vec<String> {
             // Reject links with path traversal or directory separators.
             !link.contains("..")
                 && !link.contains('/')
-                && !wiki_dir.join(format!("{link}.md")).exists()
+                && !crate::wiki::wiki_path_for_slug(wiki_dir, link).exists()
         })
         .collect()
 }
@@ -154,13 +154,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    const VALID_PAGE: &str = "---\ntitle: Test Page\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources:\n  - sources/documents/abc.md\n---\n\nPage body here.\n";
+    const VALID_PAGE: &str = "---\ntitle: Test Page
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources:\n  - sources/documents/abc.md\n---\n\nPage body here.\n";
 
     #[test]
     fn parse_valid_frontmatter() {
         let (fm, body) = parse_frontmatter(VALID_PAGE).unwrap();
         assert_eq!(fm.title, "Test Page");
-        assert_eq!(fm.tags, vec!["entity"]);
         assert!(body.contains("Page body"));
     }
 
@@ -184,7 +184,8 @@ mod tests {
 
     #[test]
     fn validate_page_rejects_empty_title() {
-        let page = "---\ntitle: \"\"\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nbody";
+        let page = "---\ntitle: \"\"
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nbody";
         let err = validate_page(page).unwrap_err();
         assert!(format!("{err}").contains("title is empty"));
     }
@@ -227,21 +228,24 @@ mod tests {
 
     #[test]
     fn parse_frontmatter_with_colon_in_title() {
-        let page = "---\ntitle: Go: Deep Equal Comparison\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
+        let page = "---\ntitle: Go: Deep Equal Comparison
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
         let (fm, _) = parse_frontmatter(page).unwrap();
         assert_eq!(fm.title, "Go: Deep Equal Comparison");
     }
 
     #[test]
     fn parse_frontmatter_reads_collections_default_empty() {
-        let page = "---\ntitle: Collection Test\ntags:\n  - entity\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
+        let page = "---\ntitle: Collection Test
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
         let (fm, _) = parse_frontmatter(page).unwrap();
         assert!(fm.collections.is_empty());
     }
 
     #[test]
     fn parse_frontmatter_reads_collections_explicit_values() {
-        let page = "---\ntitle: Collection Test\ntags:\n  - entity\ncollections:\n  - default\n  - team-a\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
+        let page = "---\ntitle: Collection Test
+collections:\n  - default\n  - team-a\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\n---\nBody.\n";
         let (fm, _) = parse_frontmatter(page).unwrap();
         assert_eq!(
             fm.collections,

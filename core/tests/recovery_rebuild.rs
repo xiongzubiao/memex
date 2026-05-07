@@ -8,7 +8,8 @@ fn missing_index_db_triggers_full_rebuild_from_filesystem() {
         let m = Memex::open_writer(root.clone()).unwrap();
         std::fs::write(
             m.wiki_dir().join("foo.md"),
-            "---\ntitle: Foo\ntags: []\nsources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nbody"
+            "---\ntitle: Foo
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nbody"
         ).unwrap();
         memex_core::reconcile::reconcile(&m, Default::default()).unwrap();
         let count: i64 = m.search().conn_for_test().query_row(

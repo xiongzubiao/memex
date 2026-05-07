@@ -81,21 +81,24 @@ mod tests {
 
     #[test]
     fn extract_summary_basic() {
-        let content = "---\ntitle: Test\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\n---\n\nThis is the body text.\n";
+        let content = "---\ntitle: Test
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\n---\n\nThis is the body text.\n";
         let summary = extract_summary(content, 120);
         assert_eq!(summary, "This is the body text.");
     }
 
     #[test]
     fn extract_summary_truncates() {
-        let content = "---\ntitle: T\ntags: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\n---\n\nWord1 word2 word3 word4 word5\n";
+        let content = "---\ntitle: T
+created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\n---\n\nWord1 word2 word3 word4 word5\n";
         let summary = extract_summary(content, 15);
         assert!(summary.len() <= 20, "got: {summary}");
     }
 
     #[test]
     fn extract_title_and_summary_from_frontmatter() {
-        let content = "---\ntitle: Auth Tokens\nsummary: How bearer tokens work.\ntags:\n  - concept\ncreated_at: 2024-01-01T00:00:00Z\nupdated_at: 2024-01-01T00:00:00Z\n---\n\nBody text here.\n";
+        let content = "---\ntitle: Auth Tokens\nsummary: How bearer tokens work.
+created_at: 2024-01-01T00:00:00Z\nupdated_at: 2024-01-01T00:00:00Z\n---\n\nBody text here.\n";
         let (title, summary) = extract_title_and_summary(content, 120).unwrap();
         assert_eq!(title, "Auth Tokens");
         assert_eq!(summary, "How bearer tokens work.");
@@ -103,7 +106,8 @@ mod tests {
 
     #[test]
     fn extract_title_and_summary_fallback() {
-        let content = "---\ntitle: Legacy Page\ntags:\n  - entity\ncreated_at: 2024-01-01T00:00:00Z\nupdated_at: 2024-01-01T00:00:00Z\n---\n\nThis is the body text.\n";
+        let content = "---\ntitle: Legacy Page
+created_at: 2024-01-01T00:00:00Z\nupdated_at: 2024-01-01T00:00:00Z\n---\n\nThis is the body text.\n";
         let (title, summary) = extract_title_and_summary(content, 120).unwrap();
         assert_eq!(title, "Legacy Page");
         assert_eq!(summary, "This is the body text.");

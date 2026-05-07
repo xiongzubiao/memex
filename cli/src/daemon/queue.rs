@@ -15,8 +15,9 @@ pub enum WorkerError {
     /// Subprocess-only — the OpenAI API backend never produces this.
     Crash(String),
     /// Read/request exceeded `daemon.worker.timeout_sec`. Retried once
-    /// before surfacing.
-    Timeout,
+    /// before surfacing. Carries the configured deadline so error
+    /// messages name the actual seconds, not the config-key string.
+    Timeout { secs: u64 },
     /// Backend returned an error OR produced text that didn't parse as
     /// the expected JSON reply. `code` carries the backend-native
     /// identifier when available — e.g. `authentication_failed` / `404`
@@ -85,7 +86,6 @@ pub struct IngestReply {
 pub struct ExtractedPage {
     pub slug: String,
     pub title: String,
-    pub tags: Vec<String>,
     pub body: String,
 }
 

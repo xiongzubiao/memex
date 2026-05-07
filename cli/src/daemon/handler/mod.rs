@@ -113,15 +113,21 @@ impl HandlerState {
 /// between concurrent ingests that touch overlapping slug sets.
 ///
 /// Keys on slug alone — the daemon is bound to one memex root for its
-/// lifetime, so the old `(root, slug)` tuple key didn't earn its keep.
-///
-/// The map grows by one `Arc<Mutex<()>>` per distinct slug ever seen —
-/// negligible for typical wikis. If a future long-running daemon
-/// accumulates millions, GC idle entries with:
-///   `writer.slug_locks.lock().unwrap()
-///        .retain(|_, m| Arc::strong_count(m) > 1);`
-/// (strong_count == 1 means only the map holds it; no live waiter or
-/// holder. Safe to drop.) Trigger periodically or on idle reap.
+/// lifetime. The map grows by one `Arc<Mutex<()>>` per distinct slug
+/// ever seen and is never compacted; a long-running daemon over a
+/// million-page corpus would accumulate ~80 MB of map entries, which
+/// is the practical upper bound rather than a leak with no ceiling.
+/// Single-slug convenience over `acquire_slug_locks`. Most ingest /
+/// write / delete paths touch exactly one slug; the original
+/// `vec![slug.clone()]` wrapping at every call site was noise.
+pub(super) async fn acquire_slug_lock(
+    writer: &WriterSession,
+    slug: &str,
+) -> OwnedMutexGuard<()> {
+    let mut guards = acquire_slug_locks(writer, vec![slug.to_string()]).await;
+    guards.pop().expect("acquire_slug_locks returns one guard for one slug")
+}
+
 pub(super) async fn acquire_slug_locks(
     writer: &WriterSession,
     mut slugs: Vec<String>,
@@ -275,10 +281,9 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
         Request::Write {
             title,
             content,
-            tags,
             source,
             force,
-        } => write::handle_write(title, content, tags, source, force, state).await,
+        } => write::handle_write(title, content, source, force, state).await,
 
         Request::SourceAdd {
             source_path,
@@ -611,5 +616,58 @@ mod tests {
         drop(g1);
         let v = racer.await.unwrap();
         assert_eq!(v, "second");
+    }
+
+    #[tokio::test]
+    async fn slug_lock_same_slug_serializes() {
+        let state = test_state();
+        let g1 = acquire_slug_locks(&state.writer, vec!["alice".into()]).await;
+        let writer = state.writer.clone();
+        let racer = tokio::spawn(async move {
+            let _g2 = acquire_slug_locks(&writer, vec!["alice".into()]).await;
+            "second"
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !racer.is_finished(),
+            "second acquisition on same slug completed while first held"
+        );
+        drop(g1);
+        assert_eq!(racer.await.unwrap(), "second");
+    }
+
+    #[tokio::test]
+    async fn slug_lock_disjoint_slugs_run_in_parallel() {
+        let state = test_state();
+        let g1 = acquire_slug_locks(&state.writer, vec!["alice".into()]).await;
+        let writer = state.writer.clone();
+        let racer = tokio::spawn(async move {
+            let _g2 = acquire_slug_locks(&writer, vec!["bob".into()]).await;
+            "second"
+        });
+        let v = tokio::time::timeout(std::time::Duration::from_millis(500), racer)
+            .await
+            .expect("disjoint-slug acquisition blocked behind unrelated slug")
+            .unwrap();
+        assert_eq!(v, "second");
+        drop(g1);
+    }
+
+    #[tokio::test]
+    async fn slug_lock_multi_slug_serializes_on_any_overlap() {
+        let state = test_state();
+        let g1 = acquire_slug_locks(&state.writer, vec!["alice".into(), "bob".into()]).await;
+        let writer = state.writer.clone();
+        let racer = tokio::spawn(async move {
+            let _g2 = acquire_slug_locks(&writer, vec!["alice".into(), "carol".into()]).await;
+            "second"
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !racer.is_finished(),
+            "multi-slug acquisition completed while overlapping slug was held"
+        );
+        drop(g1);
+        assert_eq!(racer.await.unwrap(), "second");
     }
 }

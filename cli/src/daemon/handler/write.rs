@@ -2,7 +2,7 @@
 
 use crate::daemon::error::DaemonError;
 use crate::daemon::handler::{
-    HandlerState, acquire_slug_locks, async_atomic_write, error_events, get_or_open_memex,
+    HandlerState, acquire_slug_lock, async_atomic_write, error_events, get_or_open_memex,
 };
 use crate::daemon::protocol::Event;
 
@@ -10,7 +10,6 @@ use crate::daemon::protocol::Event;
 pub(super) async fn handle_write(
     title: String,
     content: String,
-    tags: Vec<String>,
     source: Option<String>,
     force: bool,
     state: &HandlerState,
@@ -63,7 +62,7 @@ pub(super) async fn handle_write(
     let path = memex_core::wiki::wiki_path_for_slug(&memex.wiki_dir(), &slug);
 
     // Per-slug write lock: serialize concurrent writes to the same slug.
-    let _slug_guard = acquire_slug_locks(&state.writer, vec![slug.clone()]).await;
+    let _slug_guard = acquire_slug_lock(&state.writer, &slug).await;
 
     if path.exists() && !force {
         return error_events(DaemonError::BadRequest(format!(
@@ -121,17 +120,12 @@ pub(super) async fn handle_write(
         out
     };
 
-    let yaml_tags = if tags.is_empty() {
-        "[]".to_string()
-    } else {
-        format!("\n  - {}", tags.join("\n  - "))
-    };
     let yaml_sources = match source.as_deref() {
         Some(s) => format!("sources:\n  - \"#{s}\"\n"),
         None => "sources: []\n".to_string(),
     };
     let frontmatter_yaml = format!(
-        "title: {title}\ntags: {yaml_tags}\ncreated_at: {now}\nupdated_at: {now}\n{yaml_sources}",
+        "title: {title}\ncreated_at: {now}\nupdated_at: {now}\n{yaml_sources}",
     );
     let file = format!("---\n{frontmatter_yaml}---\n\n{linked_body}");
 

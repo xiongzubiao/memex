@@ -16,7 +16,8 @@ use crate::slugify;
 /// deterministic page on disk before invoking the binary against it.
 pub fn make_page(title: &str, body: &str) -> String {
     format!(
-        "---\ntitle: {title}\ntags:\n  - entity\ncreated_at: 2026-04-10T00:00:00Z\nupdated_at: 2026-04-10T00:00:00Z\nsources: []\n---\n\n{body}\n"
+        "---\ntitle: {title}
+created_at: 2026-04-10T00:00:00Z\nupdated_at: 2026-04-10T00:00:00Z\nsources: []\n---\n\n{body}\n"
     )
 }
 
@@ -48,7 +49,7 @@ pub fn seed_wiki_page(root: &Path, name: &str, content: &str, force: bool) -> Re
     let memex = memex_core::Memex::open_writer(root.to_path_buf())?;
     let wiki_dir = memex.wiki_dir();
     std::fs::create_dir_all(&wiki_dir).with_context(|| format!("create {wiki_dir:?}"))?;
-    let page_path = wiki_dir.join(format!("{stem}.md"));
+    let page_path = memex_core::wiki::wiki_path_for_slug(&wiki_dir, &stem);
 
     if page_path.exists() && !force {
         anyhow::bail!("wiki/{stem}.md already exists; use force=true");

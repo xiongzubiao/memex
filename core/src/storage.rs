@@ -253,19 +253,16 @@ pub fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     Some((yaml, body))
 }
 
-/// File mtime as RFC-3339 with seconds precision (e.g. `2026-04-27T14:42:07Z`).
-/// Returns "" if metadata cannot be read. Used as the change-detection key
-/// in `documents.mtime`; format must be stable across all writers (indexer,
-/// rebuild_from_filesystem, watcher) so reconcile's mtime equality holds.
-pub fn file_mtime_iso(path: &Path) -> String {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .map(|t| {
-            let dt: chrono::DateTime<chrono::Utc> = t.into();
-            dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        })
+/// Convert a `SystemTime` to nanoseconds since the Unix epoch for SQLite storage.
+pub fn systime_to_nanos(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
+        .as_nanos() as i64
+}
+
+/// Reconstruct a `SystemTime` from nanoseconds since the Unix epoch (SQLite read).
+pub fn nanos_to_systime(nanos: i64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_nanos(nanos as u64)
 }
 
 /// Try to acquire exclusive flock on `lock_path`, polling every 10ms until
@@ -420,7 +417,8 @@ mod tests {
     #[test]
     fn validate_and_split_extract_identical_body() {
         const FM: &str =
-            "title: T\ntags: []\nsources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z";
+            "title: T
+sources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z";
         let bodies = [
             "body content\n",                   // canonical
             "body content",                     // no trailing newline

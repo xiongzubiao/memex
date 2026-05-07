@@ -296,11 +296,27 @@ impl WorkerPool {
         });
     }
 
-    /// Build a pool without spawning any worker tasks. Handler unit tests
-    /// only exercise code paths that don't reach the queue.
+    /// Build a pool without spawning any LLM-subprocess workers.
+    /// Handler unit tests only exercise code paths that don't reach
+    /// the queue; the integration retrieval-only path may hit the
+    /// queue if `intent` forces expansion.
+    ///
+    /// Pre-set `live` to `max_count` so `submit()`'s autoscale branch
+    /// skips spawning a real LLM worker (which would flake on LLM
+    /// nondeterminism or burn API credits in environments where the
+    /// `claude` CLI is on PATH). Pair that with a tiny drainer task
+    /// that drops every queued job's reply sender so callers see
+    /// "expansion unavailable" deterministically and fall back to
+    /// un-expanded retrieval.
     #[cfg(any(test, feature = "test-harness"))]
     pub fn new_inert_for_test() -> Self {
-        Self::empty(WorkerConfig::default(), MemexHandle::new())
+        let pool = Self::empty(WorkerConfig::default(), MemexHandle::new());
+        pool.live.store(pool.cfg.max_count, Ordering::Release);
+        let rx = pool.rx.clone();
+        tokio::spawn(async move {
+            while rx.recv().await.is_ok() {}
+        });
+        pool
     }
 
     /// Drain the job queue via test closures instead of LLM subprocesses.
@@ -388,7 +404,12 @@ async fn run(
 
     let mut subprocess: Option<Subprocess> = None;
     let mut jobs_done: u32 = 0;
-    let mut cumulative_input_tokens: u64 = 0;
+    // The last turn's API-billed input_tokens. In claude-code stream-json
+    // the running conversation is replayed every turn, so this value is
+    // the agent's currently-used context window — the right thing to
+    // compare against `max_input_tokens` to decide "would the next turn
+    // risk overflow."
+    let mut last_turn_input_tokens: u64 = 0;
 
     let model_name = cfg
         .model
@@ -420,12 +441,12 @@ async fn run(
         // count can't be permanently inflated.
         let _busy_guard = CountGuard::inc(&busy);
         let count_hit = jobs_done >= cfg.restart_after_jobs;
-        let context_hit = cumulative_input_tokens >= context_threshold;
+        let context_hit = last_turn_input_tokens >= context_threshold;
         if count_hit || context_hit {
             if let Some(sp) = subprocess.as_mut() {
                 let trigger = if context_hit { "context" } else { "count" };
                 tracing::info!(
-                    cumulative_input_tokens,
+                    last_turn_input_tokens,
                     context_threshold,
                     jobs_done,
                     trigger,
@@ -436,7 +457,6 @@ async fn run(
                 }
             }
             jobs_done = 0;
-            cumulative_input_tokens = 0;
         }
 
         let (outcome, input_tokens) = run_job_with_retry(&mut subprocess, &cfg, &memex_handle, &job).await;
@@ -447,15 +467,15 @@ async fn run(
         // undercounting.
         let counted = !matches!(
             &outcome,
-            JobOutcome::Expand(Err(WorkerError::Crash(_) | WorkerError::Timeout))
-                | JobOutcome::Synth(Err(WorkerError::Crash(_) | WorkerError::Timeout))
-                | JobOutcome::Ingest(Err(WorkerError::Crash(_) | WorkerError::Timeout))
-                | JobOutcome::Merge(Err(WorkerError::Crash(_) | WorkerError::Timeout))
+            JobOutcome::Expand(Err(WorkerError::Crash(_) | WorkerError::Timeout { .. }))
+                | JobOutcome::Synth(Err(WorkerError::Crash(_) | WorkerError::Timeout { .. }))
+                | JobOutcome::Ingest(Err(WorkerError::Crash(_) | WorkerError::Timeout { .. }))
+                | JobOutcome::Merge(Err(WorkerError::Crash(_) | WorkerError::Timeout { .. }))
         );
         if counted {
             jobs_done = jobs_done.saturating_add(1);
         }
-        cumulative_input_tokens = cumulative_input_tokens.saturating_add(input_tokens);
+        last_turn_input_tokens = input_tokens;
 
         // Deliver reply on the matching variant. The type invariant is that
         // run_job_with_retry's outcome variant matches the job's variant
@@ -677,8 +697,8 @@ async fn run_job_with_retry(
                 *subprocess = None;
             }
             Err(_elapsed) => {
-                tracing::warn!(attempt, "turn timed out; retrying");
-                last_err = WorkerError::Timeout;
+                tracing::warn!(attempt, secs = cfg.timeout_sec, "turn timed out; retrying");
+                last_err = WorkerError::Timeout { secs: cfg.timeout_sec };
                 *subprocess = None;
             }
         }
@@ -969,7 +989,7 @@ mod tests {
     /// open a real Memex in a tempdir, pre-populate the llm_cache table,
     /// and confirm that `MemexHandle::get` returns the handle and that
     /// `lookup_cache` / `insert_cache` round-trip correctly through
-    /// `Bm25Search::with_connection`.
+    /// `Db::with_connection`.
     #[test]
     fn llm_cache_accessible_via_memex_handle_get() {
         use tempfile::TempDir;

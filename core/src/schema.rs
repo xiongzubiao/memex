@@ -33,9 +33,8 @@ CREATE TABLE IF NOT EXISTS documents (
     path         TEXT NOT NULL,
     title        TEXT NOT NULL,
     hash         TEXT NOT NULL,
-    tags         TEXT NOT NULL DEFAULT '',
     source       TEXT,
-    mtime        TEXT NOT NULL,
+    mtime        INTEGER NOT NULL,
     size         INTEGER NOT NULL,
     embed_model  TEXT,
     embedded_at  TEXT,
@@ -67,9 +66,20 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(
     embedding float[768] distance=cosine
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-    path, title, tags, body,
+-- Title-only FTS for `memex search <title>` lookups. The wider
+-- `documents_fts(path, title, tags, body)` was retired when retrieval
+-- moved to `chunks_fts`; only title lookups still need a doc-level
+-- FTS index, and they only consult the `title` column.
+CREATE VIRTUAL TABLE IF NOT EXISTS titles_fts USING fts5(
+    title,
     content='',
+    tokenize='porter unicode61'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    chunk_text,
+    hash UNINDEXED,
+    seq UNINDEXED,
     tokenize='porter unicode61'
 );
 
@@ -123,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn documents_has_new_columns() {
+    fn documents_has_expected_columns() {
         let conn = open_with_schema();
         let cols = columns_of(&conn, "documents");
         for expected in [
@@ -132,7 +142,6 @@ mod tests {
             "path",
             "title",
             "hash",
-            "tags",
             "source",
             "mtime",
             "size",
@@ -144,12 +153,33 @@ mod tests {
                 "expected `{expected}` column in documents, got: {cols:?}"
             );
         }
-        for absent in ["docid", "summary", "active", "created_at"] {
+        for absent in ["docid", "summary", "active", "created_at", "tags"] {
             assert!(
                 !cols.iter().any(|c| c == absent),
                 "did not expect `{absent}` column in documents, got: {cols:?}"
             );
         }
+    }
+
+    #[test]
+    fn titles_fts_replaces_documents_fts() {
+        let conn = open_with_schema();
+        let titles_fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='titles_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(titles_fts, 1, "expected titles_fts virtual table");
+        let documents_fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='documents_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(documents_fts, 0, "documents_fts should be retired");
     }
 
     #[test]
