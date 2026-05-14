@@ -1,10 +1,10 @@
 [package]
 name = "memex-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "CLI + query daemon for memex — personal wiki with agent-synthesized Q&A"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/memverge/memex"
+repository = "https://github.com/xiongzubiao/memex"
 keywords = ["wiki", "search", "cli", "llm", "agent"]
 categories = ["command-line-utilities", "text-processing"]
 
@@ -26,7 +26,7 @@ required-features = ["test-harness"]
 test-harness = ["dep:tempfile"]
 
 [dependencies]
-memex-core = { path = "../core", version = "0.1" }
+memex-core = { path = "../core", version = "=0.1.1" }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 async-channel = "2"

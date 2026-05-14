@@ -1,0 +1,19 @@
+storage: /verdaccio/storage/data
+auth:
+  htpasswd:
+    file: /verdaccio/storage/htpasswd
+uplinks:
+  npmjs:
+    url: https://registry.npmjs.org/
+packages:
+  '@*/*':
+    access: $all
+    publish: $all
+    proxy: npmjs
+  '**':
+    access: $all
+    publish: $all
+    proxy: npmjs
+log: { type: stdout, format: pretty, level: http }
+# Default is 10mb; the linux-x64 binary tarball is ~8mb but other platforms may grow.
+max_body_size: 200mb

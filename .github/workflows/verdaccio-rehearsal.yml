@@ -1,0 +1,73 @@
+name: Verdaccio rehearsal
+on:
+  pull_request:
+    paths:
+      - 'plugin/**'
+      - 'scripts/**'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/verdaccio-rehearsal.yml'
+  workflow_dispatch:
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          # Intentionally NO registry-url: setup-node would seed /tmp/.npmrc
+          # with `_authToken=${NODE_AUTH_TOKEN}` and pin NPM_CONFIG_USERCONFIG,
+          # which fights every subsequent attempt to set our own auth. We
+          # publish to the local Verdaccio with publish: $all (no auth) and
+          # pass --registry on each command instead.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - name: Start Verdaccio (with raised body-size limit)
+        run: |
+          docker run -d --rm --name verdaccio -p 4873:4873 \
+            -v "$PWD/.github/verdaccio-config.yaml:/verdaccio/conf/config.yaml" \
+            verdaccio/verdaccio:5
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:4873/-/ping >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:4873/-/ping >/dev/null || (docker logs verdaccio; exit 1)
+      - name: Configure dummy npm auth (Verdaccio publish:$all, but npm refuses to publish without an auth token configured)
+        run: |
+          echo "//localhost:4873/:_authToken=anonymous-ci-token" > "$HOME/.npmrc"
+      - name: Build linux-x64 binary
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu -p memex-cli
+          mkdir -p memex-linux-x64
+          cp target/x86_64-unknown-linux-gnu/release/memex memex-linux-x64/memex-linux-x64
+      - name: Stub remaining platform artifacts
+        run: |
+          for plat in memex-darwin-arm64 memex-darwin-x64 memex-linux-arm64; do
+            mkdir -p "$plat"
+            echo "stub for verdaccio rehearsal" > "$plat/$plat"
+          done
+      - name: Publish all 5 packages to local Verdaccio
+        env:
+          npm_config_registry: http://localhost:4873/
+        run: |
+          ( cd plugin && npm publish --access public )
+          node scripts/publish-platform-packages.mjs
+      - name: Install from local registry into a clean directory
+        run: |
+          mkdir /tmp/install-test && cd /tmp/install-test
+          npm init -y >/dev/null
+          npm install @xiongzubiao/memex --registry http://localhost:4873/
+          echo "--- installed packages ---"
+          npm ls @xiongzubiao/memex
+          echo "--- platform packages on disk ---"
+          ls node_modules/@xiongzubiao/
+      - name: Smoke-test the wrapper resolves the binary
+        run: |
+          cd /tmp/install-test
+          ./node_modules/.bin/memex --help || \
+            (echo "FAIL: wrapper failed; require.resolve regression?" >&2; exit 1)
+      - name: Stop Verdaccio
+        if: always()
+        run: docker stop verdaccio || true

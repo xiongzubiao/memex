@@ -12,23 +12,14 @@ use crate::daemon::handler::{
 use crate::daemon::handler::source::derive_source_title;
 use crate::daemon::protocol::Event;
 
-/// Handle a transcript-ingest request: parse, dispatch Extract, run the
-/// shared post-Extract pipeline (dedup → optional Merge → store → embed).
+/// Path-based transcript ingest: read the file, dispatch to the shared body.
 pub(super) async fn handle_ingest_transcript(
     transcript_path: String,
-    agent: String,
+    agent: crate::daemon::protocol::TranscriptAgent,
     collections: Vec<String>,
     state: &HandlerState,
 ) -> Vec<Event> {
-    use crate::daemon::queue::{BackendJob, IngestJob};
-    use memex_core::transcript::SessionFilter;
     use std::path::PathBuf;
-
-    let t0 = std::time::Instant::now();
-
-    if let Err(e) = memex_core::search::validate_collection_names(&collections) {
-        return error_events(DaemonError::BadRequest(e));
-    }
 
     let path = PathBuf::from(&transcript_path);
     if !path.is_absolute() {
@@ -36,15 +27,36 @@ pub(super) async fn handle_ingest_transcript(
             "transcript_path must be absolute".into(),
         ));
     }
-
     let raw_content =
         match read_file_capped(&path, crate::daemon::config::INGEST_MAX_BYTES as u64).await {
             Ok(c) => c,
             Err(e) => return error_events(e),
         };
+    handle_ingest_transcript_content(raw_content, transcript_path, agent, collections, state)
+        .await
+}
 
-    // Open memex via the per-root handle cache. Re-opening per-request races
-    // on schema-init DDL under concurrent ingest.
+/// Shared body: parse content for `agent`, run dedup → Extract → Merge → store.
+/// `source_label` is used purely as a label (source field, logs, events) —
+/// no file IO happens inside.
+pub(super) async fn handle_ingest_transcript_content(
+    raw_content: String,
+    source_label: String,
+    agent: crate::daemon::protocol::TranscriptAgent,
+    collections: Vec<String>,
+    state: &HandlerState,
+) -> Vec<Event> {
+    use crate::daemon::protocol::TranscriptAgent;
+    use crate::daemon::queue::{BackendJob, IngestJob};
+    use memex_core::transcript::SessionFilter;
+
+    let t0 = std::time::Instant::now();
+
+    if let Err(e) = memex_core::search::validate_collection_names(&collections) {
+        return error_events(DaemonError::BadRequest(e));
+    }
+
+    // Re-opening memex per-request races on schema-init DDL under concurrent ingest.
     let root_path = state.writer.bound_root().to_path_buf();
     let memex = match get_or_open_memex(state.writer.memex_handle(), &root_path) {
         Ok(m) => m,
@@ -53,18 +65,18 @@ pub(super) async fn handle_ingest_transcript(
     let search = memex.search();
     let effective_collections = memex_core::search::normalize_collections(&collections);
 
-    let transcript = match agent.as_str() {
-        "claude-code" => memex_core::transcript::parse_claude_code_session(
+    let transcript = match agent {
+        TranscriptAgent::ClaudeCode => memex_core::transcript::parse_claude_code_session(
             std::io::BufReader::new(raw_content.as_bytes()),
         ),
-        "codex" => memex_core::transcript::parse_codex_session(std::io::BufReader::new(
-            raw_content.as_bytes(),
-        )),
-        "gemini-cli" => memex_core::transcript::parse_gemini_cli_session(&raw_content),
-        _ => {
-            return error_events(DaemonError::BadRequest(format!("unknown agent: {agent}")));
-        }
+        TranscriptAgent::Codex => memex_core::transcript::parse_codex_session(
+            std::io::BufReader::new(raw_content.as_bytes()),
+        ),
+        TranscriptAgent::GeminiCli => memex_core::transcript::parse_gemini_cli_session(&raw_content),
+        TranscriptAgent::OpenClaw => memex_core::transcript::parse_openclaw_session(&raw_content),
+        TranscriptAgent::Hermes => memex_core::transcript::parse_hermes_session(&raw_content),
     };
+    let agent_str = agent.as_str();
 
     let transcript = match transcript {
         Ok(t) => t,
@@ -86,32 +98,23 @@ pub(super) async fn handle_ingest_transcript(
     }
     let canonical_transcript = memex_core::transcript::render_turns(&transcript.turns);
 
-    // Hash the cleaned text. This drives BOTH job_id (so a renamed or
-    // re-located transcript with identical content is recognized as a
-    // duplicate) and the dedup check on documents.hash later in the
-    // pipeline. Path-based job_id was the old behavior and re-ingested
-    // when a transcript was moved; content-based dedup is the right
-    // behavior because content identity is what matters for retrieval.
+    // Content-addressed job_id: a renamed/relocated transcript with identical
+    // content dedupes against itself rather than re-ingesting.
     let content_hash = memex_core::storage::content_hash(canonical_transcript.as_bytes());
     let job_id = format!("ingest-{}", &content_hash[..16]);
 
-    // Pre-LLM dedup: if the content-addressed raw file already exists,
-    // we've stored this content before — skip the LLM call. Partial
-    // states (raw on disk, wiki rows missing) recover via reconcile/lint
-    // rather than blocking retries forever.
     if memex_core::raw::raw_path_for_hash(&memex.raw_dir(), &content_hash).exists() {
         tracing::info!(hash=%content_hash, "transcript ingest deduped: raw file present");
         return vec![Event::Done { status: 0 }];
     }
 
-    // Persist the job before LLM dispatch so a crash doesn't lose it;
-    // INSERT OR IGNORE on the content-derived job_id dedupes concurrent
-    // ingests of the same content.
+    // Persist before LLM dispatch so a crash doesn't lose the job;
+    // INSERT OR IGNORE on the content-derived job_id dedupes concurrent ingests.
     if let Err(e) = search.insert_ingest_job(
         &job_id,
         memex_core::ingest_jobs::JobType::Transcript,
-        &transcript_path,
-        Some(&agent),
+        &source_label,
+        Some(agent_str),
         &content_hash,
         &effective_collections,
     ) {
@@ -120,33 +123,32 @@ pub(super) async fn handle_ingest_transcript(
         )));
     }
 
-    // Emit progress
     let mut events = vec![Event::Parsing {
         job_id: job_id.clone(),
-        transcript_path: transcript_path.clone(),
+        transcript_path: source_label.clone(),
     }];
 
     events.push(Event::Distilling {
         job_id: job_id.clone(),
-        transcript_path: transcript_path.clone(),
+        transcript_path: source_label.clone(),
     });
 
     let segments: Vec<crate::daemon::queue::ExtractSegment> = transcript
         .turns
-        .iter()
+        .into_iter()
         .enumerate()
         .map(|(i, t)| crate::daemon::queue::ExtractSegment {
             index: Some(i + 1),
-            role: Some(t.role.clone()),
-            timestamp: t.timestamp.clone(),
-            text: t.text.clone(),
+            role: Some(t.role),
+            timestamp: t.timestamp,
+            text: t.text,
         })
         .collect();
 
     let extracted = match run_worker_job(state, |reply| {
         BackendJob::Ingest(IngestJob {
             segments,
-            source: transcript_path.clone(),
+            source: source_label.clone(),
             chunk: None,
             reply,
         })
@@ -167,12 +169,12 @@ pub(super) async fn handle_ingest_transcript(
     }
 
     let title = if transcript.session_id.is_empty() {
-        agent.clone()
+        agent_str.to_string()
     } else {
-        format!("{} {}", agent, transcript.session_id)
+        format!("{agent_str} {}", transcript.session_id)
     };
     let fm = memex_core::raw::RawFrontmatter {
-        source: Some(transcript_path.clone()),
+        source: Some(source_label.clone()),
         source_kind: Some("transcript".into()),
         ingested_at: Some(
             chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -199,7 +201,7 @@ pub(super) async fn handle_ingest_transcript(
 
     tracing::info!(
         job_id = %job_id,
-        transcript = %transcript_path,
+        transcript = %source_label,
         elapsed_ms = t0.elapsed().as_millis() as u64,
         "ingest job completed"
     );

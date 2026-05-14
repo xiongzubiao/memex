@@ -264,9 +264,17 @@ pub async fn handle(req: Request, state: &HandlerState) -> Vec<Event> {
             collections,
         } => match source {
             crate::daemon::protocol::IngestSource::Transcript { path, agent } => {
-                ingest::handle_ingest_transcript(
-                    path,
-                    agent.as_str().to_string(),
+                ingest::handle_ingest_transcript(path, agent, collections, state).await
+            }
+            crate::daemon::protocol::IngestSource::TranscriptInline {
+                content,
+                agent,
+                source_label,
+            } => {
+                ingest::handle_ingest_transcript_content(
+                    content,
+                    source_label,
+                    agent,
                     collections,
                     state,
                 )

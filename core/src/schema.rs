@@ -14,9 +14,13 @@ pub fn register_sqlite_vec_once() {
         // `sqlite3_auto_extension` takes a function pointer and stores it
         // in a global list consulted by every subsequent SQLite connection.
         unsafe {
+            // Use std::ffi::c_char (not literal i8) — c_char is signed on
+            // x86_64-linux but unsigned on aarch64-linux, and the function
+            // pointer signature must match the target's ABI exactly. Cross-
+            // compile to aarch64 fails with "expected u8, found i8" otherwise.
             type EntryFn = unsafe extern "C" fn(
                 *mut rusqlite::ffi::sqlite3,
-                *mut *mut i8,
+                *mut *mut std::ffi::c_char,
                 *const rusqlite::ffi::sqlite3_api_routines,
             ) -> i32;
             rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), EntryFn>(

@@ -15,9 +15,9 @@
 *.pem
 credentials.json
 
-# Claude Code
-.claude/worktrees
-.claude/settings.local.json
+# Claude Code: ignore everything under .claude except settings.json
+.claude/*
+!.claude/settings.json
 
 # IDE
 .idea

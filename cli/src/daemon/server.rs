@@ -607,8 +607,15 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
 }
 
 async fn serve_connection(stream: UnixStream, state: &HandlerState) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    // Cap the request line at INGEST_MAX_BYTES + 64KB framing slop. Without
+    // this, a misbehaving local client (e.g. a buggy gateway hook handler)
+    // could send an unbounded TranscriptInline.content payload and OOM the
+    // daemon during the line read.
+    let req_cap = (crate::daemon::config::INGEST_MAX_BYTES + 64 * 1024) as u64;
+    let mut reader = BufReader::new(read_half.take(req_cap));
     let mut line = String::new();
 
     // One request per connection. Read the first line, parse, dispatch.

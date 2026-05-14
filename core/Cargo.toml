@@ -1,10 +1,10 @@
 [package]
 name = "memex-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Memex knowledge base engine — pure storage and search"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/memverge/memex"
+repository = "https://github.com/xiongzubiao/memex"
 keywords = ["wiki", "search", "retrieval", "bm25", "vector"]
 categories = ["database", "text-processing"]
 publish = false

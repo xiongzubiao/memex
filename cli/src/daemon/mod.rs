@@ -225,6 +225,37 @@ pub fn stop() -> Result<i32> {
     Ok(1)
 }
 
+/// Quiet daemon health probe for `memex doctor`. Returns `Ok(true)` if a
+/// daemon process is alive AND responds to ping within `timeout`. Returns
+/// `Ok(false)` if no daemon is running. Returns `Err` if the pid file is
+/// stale or the daemon is alive but unresponsive.
+pub fn ping_quiet(timeout: Duration) -> Result<bool> {
+    let paths = DaemonPaths::default_under(&memex_root());
+    let pid = pidfile::read(&paths.pid)?;
+    match pid {
+        None => Ok(false),
+        Some(p) if !pidfile::is_alive(p) => {
+            anyhow::bail!("stale pid file (pid {p} not running)")
+        }
+        Some(p) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let stream =
+                    client::connect_with_retry(&paths.socket, Instant::now() + timeout).await?;
+                let events = client::request(stream, &protocol::Request::Ping {}).await?;
+                if events
+                    .iter()
+                    .any(|ev| matches!(ev, protocol::Event::Pong { .. }))
+                {
+                    Ok(true)
+                } else {
+                    anyhow::bail!("daemon pid {p} responded but did not pong")
+                }
+            })
+        }
+    }
+}
+
 /// `memex daemon status` entrypoint.
 ///
 /// Checks the PID file + flock + ping, reports daemon state.
@@ -290,6 +321,8 @@ pub async fn ingest_async(
         "claude-code" => protocol::TranscriptAgent::ClaudeCode,
         "codex" => protocol::TranscriptAgent::Codex,
         "gemini-cli" => protocol::TranscriptAgent::GeminiCli,
+        "openclaw" => protocol::TranscriptAgent::OpenClaw,
+        "hermes" => protocol::TranscriptAgent::Hermes,
         other => anyhow::bail!("unknown agent: {other}"),
     };
     let events = client::request(
@@ -339,6 +372,21 @@ pub fn ingest(
             Ok(1)
         }
     }
+}
+
+/// Print an actionable hint for `retrieval_empty` instead of the raw error
+/// message. Both `query_raw` and `query_synth` route through this so users
+/// see the same guidance whether they pass `--raw` or not.
+fn print_retrieval_empty_hint(message: &str) {
+    eprintln!("memex query: {message}");
+    eprintln!();
+    eprintln!("To populate your wiki, try one of:");
+    eprintln!("  • `memex backfill claude-code`  — import existing Claude Code sessions");
+    eprintln!("  • `memex backfill codex`        — import existing Codex sessions");
+    eprintln!(
+        "  • Open a session with the marketplace plugin installed; SessionEnd ingests automatically"
+    );
+    eprintln!("  • `memex write <slug>` then paste content via stdin to add a page manually");
 }
 
 /// `memex query <question> --raw` entrypoint. Connects to the running daemon
@@ -408,7 +456,11 @@ pub fn query_raw(
                 message,
                 status,
             } => {
-                eprintln!("memex query error ({code}): {message}");
+                if code == "retrieval_empty" {
+                    print_retrieval_empty_hint(message);
+                } else {
+                    eprintln!("memex query error ({code}): {message}");
+                }
                 status_code = *status;
             }
             protocol::Event::Done { status } => {
@@ -497,7 +549,11 @@ pub fn query_synth(
                 message,
                 status,
             } => {
-                eprintln!("memex query error ({code}): {message}");
+                if code == "retrieval_empty" {
+                    print_retrieval_empty_hint(message);
+                } else {
+                    eprintln!("memex query error ({code}): {message}");
+                }
                 status_code = *status;
             }
             protocol::Event::Done { status } => {

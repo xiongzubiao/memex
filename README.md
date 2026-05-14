@@ -78,7 +78,7 @@ No `--collection` behavior:
 
 ### Prerequisites
 
-- **Unix**: macOS or Linux. Windows is not supported (Unix sockets + flock).
+- **Unix**: macOS or Linux. Windows is not yet supported in v0.1.0 — the daemon requires Unix sockets and flock. Run inside WSL2 as a workaround.
 - **Rust toolchain**: 1.80 or newer (https://rustup.rs).
 - **At least one agent CLI**: Claude Code, Codex, or Gemini CLI. Required
   for synthesis and session ingestion. `memex query --raw` and
@@ -106,24 +106,37 @@ No `--collection` behavior:
   (and `setup-browser-cookies` for login-walled pages). Used by the
   `/memex-ingest` skill when markitdown returns an empty/skeleton output.
 
+### npm (recommended)
+
+```bash
+npm install -g @xiongzubiao/memex   # binary + model + ORT
+memex install                       # register hooks with detected agents
+memex doctor                        # verify
+```
+
+`npm install -g` puts the platform binary on PATH and downloads the
+embedding model, tokenizer, and ONNX Runtime into `~/.memex/`.
+`memex install` auto-detects which of `~/.claude`, `~/.codex`, `~/.gemini`
+exist, merges hooks into each agent's settings file, and (for Claude
+Code) copies skills into `~/.claude/skills/`. Re-running is idempotent.
+
+To target a specific agent:
+
+```bash
+memex install --agent claude-code
+```
+
 ### Build from source
 
 ```bash
-git clone <repo>
+git clone https://github.com/xiongzubiao/memex.git    # private repo; auth required
 cd memex
-cargo build --release
+cargo build --release -p memex-cli
 mkdir -p ~/.local/bin
 cp target/release/memex ~/.local/bin/
-```
-
-### Plugin install (recommended)
-
-The `plugin/` directory is an npm package that handles everything:
-downloads the binary, embedding model, ONNX Runtime, and generates
-session hooks for your agent.
-
-```bash
-cd plugin && npm install
+# Then download the embedding model + tokenizer + ONNX Runtime manually,
+# or run plugin/postinstall.js after `cd plugin && npm install`.
+memex install                        # register hooks with detected agents
 ```
 
 ## Configure

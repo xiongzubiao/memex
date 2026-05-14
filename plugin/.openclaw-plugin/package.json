@@ -1,0 +1,9 @@
+{
+  "name": "memex",
+  "version": "0.1.0",
+  "description": "Memex auto-ingest hook pack for OpenClaw",
+  "type": "module",
+  "openclaw": {
+    "hooks": ["./memex"]
+  }
+}

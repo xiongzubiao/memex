@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${MEMEX_PLUGIN_DIR}/hooks/gemini-cli-session-end.js",
-            "timeout": 10
+            "command": "memex hook ingest gemini-cli",
+            "timeout": 120
           }
         ]
       }

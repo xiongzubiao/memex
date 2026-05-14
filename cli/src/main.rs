@@ -4,7 +4,11 @@ use std::io::Read as _;
 use std::path::Path;
 
 #[derive(Parser)]
-#[command(name = "memex", about = "Personal wiki storage and search engine")]
+#[command(
+    name = "memex",
+    about = "Personal wiki storage and search engine",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT"), ")")
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -16,8 +20,14 @@ enum Agent {
     ClaudeCode,
     /// OpenAI Codex CLI sessions (~/.codex/sessions/*/*/*/*.jsonl)
     Codex,
-    /// Google Gemini CLI sessions (~/.gemini/tmp/*/chats/session-*.json)
+    /// Google Gemini CLI sessions (~/.gemini/tmp/*/chats/session-*.json[l])
     GeminiCli,
+    /// OpenClaw sessions (~/.openclaw/agents/*/sessions/*.jsonl)
+    #[value(name = "openclaw")]
+    OpenClaw,
+    /// Hermes Agent sessions (~/.hermes/sessions/session_*.json)
+    #[value(name = "hermes")]
+    Hermes,
 }
 
 impl Agent {
@@ -26,6 +36,21 @@ impl Agent {
             Agent::ClaudeCode => "claude-code",
             Agent::Codex => "codex",
             Agent::GeminiCli => "gemini-cli",
+            Agent::OpenClaw => "openclaw",
+            Agent::Hermes => "hermes",
+        }
+    }
+}
+
+impl From<&Agent> for memex_cli::daemon::protocol::TranscriptAgent {
+    fn from(value: &Agent) -> Self {
+        use memex_cli::daemon::protocol::TranscriptAgent as P;
+        match value {
+            Agent::ClaudeCode => P::ClaudeCode,
+            Agent::Codex => P::Codex,
+            Agent::GeminiCli => P::GeminiCli,
+            Agent::OpenClaw => P::OpenClaw,
+            Agent::Hermes => P::Hermes,
         }
     }
 }
@@ -115,16 +140,19 @@ enum Commands {
     /// Ingest a session transcript (`--agent` or auto-detected) or a pre-converted
     /// document file (`<path>`), or stdin content (`--source <id>`).
     Ingest {
-        /// Agent override for transcript ingestion. If omitted with a positional
-        /// path, memex infers the agent from file content.
-        #[arg(long, requires = "path", conflicts_with = "source")]
+        /// Agent override for transcript ingestion. With `--source`, content
+        /// piped on stdin is parsed as a transcript for the given agent
+        /// (the source label is recorded for citations). With a positional
+        /// `path` (and no `--source`), the file is read from disk. Without
+        /// `--agent`, a positional path's agent is inferred from content.
+        #[arg(long)]
         agent: Option<Agent>,
         /// Filesystem path: transcript file (with --agent or auto-detected) OR
         /// text/Markdown document file that memex reads directly.
         #[arg(conflicts_with = "source")]
         path: Option<std::path::PathBuf>,
-        /// Source identifier for stdin-piped content (URL, logical name, or any
-        /// string that doesn't resolve to a readable file). Reads stdin as content.
+        /// Source identifier for stdin-piped content (URL, logical name, or
+        /// the original on-disk path for transcripts).
         #[arg(long)]
         source: Option<String>,
         /// Collections to associate with the ingested content
@@ -144,10 +172,51 @@ enum Commands {
     },
     /// Show daemon and ingestion status
     Status,
+    /// Run health checks on the local install (model, ORT, daemon, agent CLIs)
+    Doctor,
     /// Manage source documents (the raw material wiki pages reference)
     Source {
         #[command(subcommand)]
         action: SourceAction,
+    },
+    /// Register memex hooks (and Claude Code skills) with detected agent CLIs.
+    /// Auto-detects `~/.claude`, `~/.codex`, `~/.gemini`; idempotent.
+    Install {
+        /// Restrict install to specific agents (default: all detected).
+        #[arg(long = "agent")]
+        agents: Vec<memex_cli::install::InstallTarget>,
+        /// Print what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Subcommands invoked by agent hooks. Not for direct human use.
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+    /// Strip memex hooks + skills from detected agent CLIs. Stops the daemon.
+    /// Leaves `~/.memex/` (wiki, models) alone unless --purge is passed.
+    Uninstall {
+        /// Restrict uninstall to specific agents (default: all detected).
+        #[arg(long = "agent")]
+        agents: Vec<memex_cli::install::InstallTarget>,
+        /// Print what would change without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also delete ~/.memex/ (your wiki, models, DB, daemon state).
+        #[arg(long)]
+        purge: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookAction {
+    /// Read a session-end hook payload from stdin, extract `transcript_path`,
+    /// ingest it as the given agent. Replaces the prior node shim scripts.
+    Ingest {
+        /// Agent that produced the transcript.
+        agent: Agent,
     },
 }
 
@@ -347,14 +416,16 @@ fn run_read(
 
             let docid = memex_core::docid::short(&doc.hash).to_string();
             let total_lines = body.lines().count();
-            let (sliced, (start, end)) =
-                memex_cli::slice_body(&body, from_line, max_lines);
+            let (sliced, (start, end)) = memex_cli::slice_body(&body, from_line, max_lines);
             let header_suffix = if from_line.is_some() || max_lines.is_some() {
                 format!(" [lines {}..{} of {}]", start, end, total_lines)
             } else {
                 String::new()
             };
-            println!("=== {} {} {}{} ===", docid, doc.doc_type, stem, header_suffix);
+            println!(
+                "=== {} {} {}{} ===",
+                docid, doc.doc_type, stem, header_suffix
+            );
             print!("{sliced}");
             if !sliced.ends_with('\n') {
                 println!();
@@ -373,8 +444,7 @@ fn run_read(
 /// Open $EDITOR with a frontmatter template. Returns the edited content.
 fn open_editor_for_page(name: &str) -> anyhow::Result<String> {
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let template =
-        format!("---\ntitle: {name}\ncreated_at: {now}\nupdated_at: {now}\n---\n\n");
+    let template = format!("---\ntitle: {name}\ncreated_at: {now}\nupdated_at: {now}\n---\n\n");
 
     let tmp = std::env::temp_dir().join(format!("memex-{}.md", std::process::id()));
     std::fs::write(&tmp, &template)?;
@@ -466,9 +536,7 @@ fn run_source_show(reference: &str) -> anyhow::Result<()> {
     let doc = match doc {
         Some(d) => d,
         None => {
-            anyhow::bail!(
-                "source not found: '{reference}'. Use a docid prefix."
-            );
+            anyhow::bail!("source not found: '{reference}'. Use a docid prefix.");
         }
     };
     let body = memex_core::read_body_from_disk(memex.root(), &doc.doc_type, &doc.path)
@@ -536,11 +604,7 @@ fn human_size(bytes: usize) -> String {
 
 /// `memex source add <path>`. Reads stdin into a UTF-8 string, sends
 /// `Request::SourceAdd` to the daemon, prints the allocated docid on stdout.
-fn run_source_add(
-    source_path: &str,
-    collections: &[String],
-    verbose: bool,
-) -> anyhow::Result<()> {
+fn run_source_add(source_path: &str, collections: &[String], verbose: bool) -> anyhow::Result<()> {
     let mut buf = Vec::new();
     std::io::stdin().read_to_end(&mut buf)?;
     let content = String::from_utf8(buf)
@@ -613,8 +677,8 @@ fn run_plan_show(json_only: bool) -> anyhow::Result<()> {
     if buf.trim().is_empty() {
         anyhow::bail!("empty stdin: pipe a plan JSON file");
     }
-    let plan: memex_cli::daemon::plan::Plan = serde_json::from_str(&buf)
-        .map_err(|e| anyhow::anyhow!("plan JSON parse: {e}"))?;
+    let plan: memex_cli::daemon::plan::Plan =
+        serde_json::from_str(&buf).map_err(|e| anyhow::anyhow!("plan JSON parse: {e}"))?;
     if json_only {
         // Pass-through: re-emit (validates parseability).
         println!("{}", serde_json::to_string(&plan)?);
@@ -643,7 +707,9 @@ fn run_plan_apply() -> anyhow::Result<()> {
     for ev in events {
         match ev {
             memex_cli::daemon::protocol::Event::PlanContent { json } => content = Some(json),
-            memex_cli::daemon::protocol::Event::PlanApplied { committed } => applied = Some(committed),
+            memex_cli::daemon::protocol::Event::PlanApplied { committed } => {
+                applied = Some(committed)
+            }
             memex_cli::daemon::protocol::Event::Error { message, .. } => error = Some(message),
             memex_cli::daemon::protocol::Event::Done { status: s } => status = s,
             _ => {}
@@ -672,12 +738,7 @@ fn run_plan_apply() -> anyhow::Result<()> {
 }
 
 /// Write a wiki page via the daemon. Sends Request::Write.
-fn run_write(
-    name: &str,
-    force: bool,
-    quiet: bool,
-    source: Option<&str>,
-) -> anyhow::Result<()> {
+fn run_write(name: &str, force: bool, quiet: bool, source: Option<&str>) -> anyhow::Result<()> {
     // Read content from stdin (same as direct path)
     let content = if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         let mut buf = String::new();
@@ -737,7 +798,6 @@ fn run_write(
     Ok(())
 }
 
-
 fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
     let root = memex_cli::memex_root();
 
@@ -796,7 +856,11 @@ fn run_delete(page_ref: &str, force: bool) -> anyhow::Result<()> {
             memex_cli::daemon::protocol::Event::Deleted { slug: deleted_slug } => {
                 println!("deleted: {deleted_slug}");
             }
-            memex_cli::daemon::protocol::Event::Error { code, message, status } => {
+            memex_cli::daemon::protocol::Event::Error {
+                code,
+                message,
+                status,
+            } => {
                 eprintln!("delete error ({code}): {message}");
                 exit_code = *status;
             }
@@ -813,23 +877,21 @@ fn run_rechunk() -> anyhow::Result<()> {
     let root = memex_cli::memex_root();
     let memex = memex_core::Memex::open_writer(root.clone())?;
     let mut model = memex_core::retrieval::load_default_model()?;
-    let docs: Vec<(String, String, String, String)> = memex
-        .search()
-        .with_connection(|c| {
-            let mut stmt = c.prepare("SELECT doc_type, path, hash, title FROM documents")?;
-            let rows = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-            Ok(rows)
-        })?;
+    let docs: Vec<(String, String, String, String)> = memex.search().with_connection(|c| {
+        let mut stmt = c.prepare("SELECT doc_type, path, hash, title FROM documents")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })?;
     println!("rechunking {} documents", docs.len());
     let mut ok = 0usize;
     let mut err = 0usize;
@@ -981,6 +1043,8 @@ fn discover_session_files(
             Agent::ClaudeCode => home.join(".claude"),
             Agent::Codex => home.join(".codex"),
             Agent::GeminiCli => home.join(".gemini"),
+            Agent::OpenClaw => home.join(".openclaw"),
+            Agent::Hermes => home.join(".hermes"),
         }
     };
     // Default discovery uses the agent's well-known directory layout. When
@@ -990,14 +1054,26 @@ fn discover_session_files(
     let sub = match (agent, root_override.is_some()) {
         (Agent::ClaudeCode, false) => "projects/*/*.jsonl",
         (Agent::Codex, false) => "sessions/*/*/*/*.jsonl",
-        (Agent::GeminiCli, false) => "tmp/*/chats/session-*.json",
-        (Agent::ClaudeCode | Agent::Codex, true) => "**/*.jsonl",
-        (Agent::GeminiCli, true) => "**/session-*.json",
+        (Agent::GeminiCli, false) => "tmp/*/chats/session-*.json*",
+        (Agent::OpenClaw, false) => "agents/*/sessions/*.jsonl",
+        (Agent::Hermes, false) => "sessions/session_*.json",
+        (Agent::ClaudeCode | Agent::Codex | Agent::OpenClaw, true) => "**/*.jsonl",
+        (Agent::GeminiCli, true) => "**/session-*.json*",
+        (Agent::Hermes, true) => "**/session_*.json",
     };
     let pattern = root.join(sub);
     let files: Vec<std::path::PathBuf> = glob::glob(&pattern.to_string_lossy())
         .map_err(|e| anyhow::anyhow!("Glob error: {e}"))?
         .filter_map(|r| r.ok())
+        // OpenClaw's sessions/*.jsonl glob also matches `.trajectory.jsonl`
+        // and `.reset.<ts>.jsonl` siblings — skip those for that agent only.
+        .filter(|p| {
+            if !matches!(agent, Agent::OpenClaw) {
+                return true;
+            }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            !name.contains(".trajectory") && !name.contains(".reset.")
+        })
         .collect();
     Ok(files)
 }
@@ -1015,39 +1091,12 @@ fn default_ingest_collections(collections: &[String]) -> Vec<String> {
     }
 }
 
-/// Map a CLI `Agent` to the protocol `TranscriptAgent` used in
-/// `Request::Ingest`.
-fn agent_to_protocol(agent: &Agent) -> memex_cli::daemon::protocol::TranscriptAgent {
-    match agent {
-        Agent::ClaudeCode => memex_cli::daemon::protocol::TranscriptAgent::ClaudeCode,
-        Agent::Codex => memex_cli::daemon::protocol::TranscriptAgent::Codex,
-        Agent::GeminiCli => memex_cli::daemon::protocol::TranscriptAgent::GeminiCli,
-    }
-}
-
-/// Map a `core::transcript::TranscriptAgent` (returned by inference) to the
-/// protocol's `TranscriptAgent` (sent over the daemon socket).
-fn core_agent_to_protocol(
-    agent: memex_core::transcript::TranscriptAgent,
-) -> memex_cli::daemon::protocol::TranscriptAgent {
-    match agent {
-        memex_core::transcript::TranscriptAgent::ClaudeCode => {
-            memex_cli::daemon::protocol::TranscriptAgent::ClaudeCode
-        }
-        memex_core::transcript::TranscriptAgent::Codex => {
-            memex_cli::daemon::protocol::TranscriptAgent::Codex
-        }
-        memex_core::transcript::TranscriptAgent::GeminiCli => {
-            memex_cli::daemon::protocol::TranscriptAgent::GeminiCli
-        }
-    }
-}
-
 fn run_ingest(
     agent: Option<&Agent>,
     path: Option<&std::path::Path>,
     source: Option<&str>,
     collections: &[String],
+    quiet: bool,
 ) -> anyhow::Result<()> {
     if std::env::var("MEMEX_INTERNAL").as_deref() == Ok("1") {
         return Ok(());
@@ -1061,25 +1110,24 @@ fn run_ingest(
     let request = match (agent, path, source) {
         // Transcript mode: explicit --agent + positional path
         (Some(agent), Some(p), None) => {
-            let p_abs = std::fs::canonicalize(p)
-                .map_err(|e| anyhow::anyhow!("transcript path: {e}"))?;
+            let p_abs =
+                std::fs::canonicalize(p).map_err(|e| anyhow::anyhow!("transcript path: {e}"))?;
             memex_cli::daemon::protocol::Request::Ingest {
                 source: memex_cli::daemon::protocol::IngestSource::Transcript {
                     path: p_abs.to_string_lossy().to_string(),
-                    agent: agent_to_protocol(agent),
+                    agent: agent.into(),
                 },
                 collections,
             }
         }
         // Positional path alone (no --agent): try inference, fall back to document mode
         (None, Some(p), None) => {
-            let p_abs = std::fs::canonicalize(p)
-                .map_err(|e| anyhow::anyhow!("path: {e}"))?;
+            let p_abs = std::fs::canonicalize(p).map_err(|e| anyhow::anyhow!("path: {e}"))?;
             if let Some(detected_agent) = memex_core::transcript::detect_transcript_agent(&p_abs) {
                 memex_cli::daemon::protocol::Request::Ingest {
                     source: memex_cli::daemon::protocol::IngestSource::Transcript {
                         path: p_abs.to_string_lossy().to_string(),
-                        agent: core_agent_to_protocol(detected_agent),
+                        agent: detected_agent.into(),
                     },
                     collections,
                 }
@@ -1101,7 +1149,10 @@ fn run_ingest(
         // Stdin mode: --source + content piped on stdin. Bail early on
         // oversize so we don't waste the IPC round-trip; the daemon
         // catches empty/binary content with a more informative message.
-        (None, None, Some(src)) => {
+        // With --agent, the content is parsed as a transcript for that
+        // agent and `src` is used as the source label for citations.
+        // Without --agent, content is ingested as a generic document.
+        (agent_opt, None, Some(src)) => {
             let max = memex_cli::daemon::config::INGEST_MAX_BYTES;
             let mut buf = Vec::with_capacity(64 * 1024);
             std::io::stdin()
@@ -1115,19 +1166,28 @@ fn run_ingest(
             }
             let content = String::from_utf8(buf)
                 .map_err(|e| anyhow::anyhow!("source content is not valid UTF-8: {e}"))?;
-            memex_cli::daemon::protocol::Request::Ingest {
-                source: memex_cli::daemon::protocol::IngestSource::Document {
+            let source = match agent_opt {
+                Some(agent) => memex_cli::daemon::protocol::IngestSource::TranscriptInline {
+                    content,
+                    agent: agent.into(),
+                    source_label: src.to_string(),
+                },
+                None => memex_cli::daemon::protocol::IngestSource::Document {
                     source_path: src.to_string(),
                     content,
                 },
+            };
+            memex_cli::daemon::protocol::Request::Ingest {
+                source,
                 collections,
             }
         }
         _ => anyhow::bail!(
             "ingest requires one of:\n  \
-             --agent <agent> <transcript-path>      (transcript mode)\n  \
+             --agent <agent> <transcript-path>      (transcript file)\n  \
+             --agent <agent> --source <label>       (transcript via stdin)\n  \
              <file-path>                            (document file mode)\n  \
-             --source <id>                          (stdin mode; pipe content via stdin)"
+             --source <id>                          (document via stdin)"
         ),
     };
 
@@ -1144,7 +1204,9 @@ fn run_ingest(
                 exit_code = *status;
             }
             memex_cli::daemon::protocol::Event::Stored { wiki_pages, .. } => {
-                println!("stored: {} pages", wiki_pages.len());
+                if !quiet {
+                    println!("stored: {} pages", wiki_pages.len());
+                }
             }
             memex_cli::daemon::protocol::Event::Done { status } if *status != 0 => {
                 exit_code = *status;
@@ -1286,7 +1348,9 @@ fn run_status() -> anyhow::Result<()> {
         if let Ok((pending, completed, failed, last_activity)) = activity
             && (pending + completed + failed) > 0
         {
-            println!("Ingest: {pending} pending, {completed} completed, {failed} failed (last 30 days)");
+            println!(
+                "Ingest: {pending} pending, {completed} completed, {failed} failed (last 30 days)"
+            );
             if let Some(ts) = last_activity {
                 println!("  last activity: {ts}");
             }
@@ -1296,8 +1360,131 @@ fn run_status() -> anyhow::Result<()> {
     std::process::exit(code);
 }
 
+/// Run health checks on the local memex install. Prints PASS/FAIL per
+/// check, then a final summary. Returns 0 if all required checks pass,
+/// 1 otherwise. Optional checks (agent CLIs) are reported but never fail.
+fn run_doctor() -> i32 {
+    let mut had_fail = false;
+    let mut nofail = false;
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    // 1. Embedding model + tokenizer — use the same paths the runtime loads.
+    let model = memex_core::retrieval::default_model_path()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| format!("{home}/.memex/models/embedding-gemma-300m.onnx"));
+    print_check(
+        "model",
+        std::path::Path::new(&model).exists(),
+        &model,
+        &mut had_fail,
+    );
+    let tokenizer = memex_core::retrieval::default_tokenizer_path()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| format!("{home}/.memex/models/embedding-gemma-300m-tokenizer.json"));
+    print_check(
+        "tokenizer",
+        std::path::Path::new(&tokenizer).exists(),
+        &tokenizer,
+        &mut had_fail,
+    );
+
+    // 2. ONNX Runtime — share the loader's own candidate list.
+    let ort_candidates = memex_core::embed::candidate_dylib_paths();
+    let ort_found = ort_candidates.iter().find(|p| p.exists());
+    let detail = match ort_found {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => format!(
+            "(not found; checked {})",
+            ort_candidates
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    print_check("onnxruntime", ort_found.is_some(), &detail, &mut had_fail);
+
+    // 3. Daemon health (informational — not running is fine; will autospawn).
+    match memex_cli::daemon::ping_quiet(std::time::Duration::from_secs(2)) {
+        Ok(true) => print_check("daemon", true, "responsive", &mut nofail),
+        Ok(false) => print_check(
+            "daemon",
+            true,
+            "not running (autospawns on first use)",
+            &mut nofail,
+        ),
+        Err(e) => print_check(
+            "daemon",
+            false,
+            &format!("{e} — try `memex daemon stop && memex daemon start`"),
+            &mut had_fail,
+        ),
+    }
+
+    // 4. Agent CLIs (informational only).
+    for tool in ["claude", "codex", "gemini", "openclaw", "hermes"] {
+        let on_path = std::process::Command::new("which")
+            .arg(tool)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        print_check(
+            &format!("agent:{tool}"),
+            on_path,
+            if on_path { "on PATH" } else { "(optional)" },
+            &mut nofail,
+        );
+    }
+
+    // 5. Surface postinstall status JSON if it exists.
+    let status_path = format!("{home}/.memex/.install-status");
+    if let Ok(s) = std::fs::read_to_string(&status_path) {
+        println!("install-status: {}", s.trim().replace('\n', " "));
+    }
+
+    if had_fail {
+        eprintln!();
+        eprintln!("Some required checks failed. Re-run `npm install -g @xiongzubiao/memex`");
+        eprintln!("to repair, or set ORT_DYLIB_PATH if your ORT install is in a non-standard");
+        eprintln!("location.");
+        1
+    } else {
+        println!();
+        println!("memex is ready.");
+        0
+    }
+}
+
+fn print_check(name: &str, ok: bool, detail: &str, had_fail: &mut bool) {
+    let marker = if ok { "PASS" } else { "FAIL" };
+    println!("[{marker}] {name}: {detail}");
+    if !ok {
+        *had_fail = true;
+    }
+}
+
+/// Print a one-line warning if the embedding model isn't on disk. Vector
+/// retrieval falls back to a hash embedder otherwise, which silently
+/// degrades search quality. Skipped for `doctor` (it reports the same
+/// thing explicitly with PASS/FAIL output).
+fn warn_if_postinstall_incomplete(cmd: &Commands) {
+    if matches!(cmd, Commands::Doctor | Commands::Hook { .. } | Commands::Uninstall { .. }) {
+        return;
+    }
+    let Ok(model) = memex_core::retrieval::default_model_path() else {
+        return;
+    };
+    if !model.exists() {
+        eprintln!(
+            "warning: memex embedding model not found. Search quality will be degraded. \
+             Re-run `npm install -g @xiongzubiao/memex` or check ~/.memex/.install-status for download errors."
+        );
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
+    warn_if_postinstall_incomplete(&cli.command);
     let result = dispatch(cli);
     let exit_code = match result {
         Ok(()) => 0,
@@ -1377,6 +1564,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             path.as_deref(),
             source.as_deref(),
             &collections,
+            false,
         ),
         Commands::Backfill {
             agent,
@@ -1384,6 +1572,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             path,
         } => run_backfill(&agent, &collections, path.as_deref()),
         Commands::Status => run_status(),
+        Commands::Doctor => std::process::exit(run_doctor()),
         Commands::Source { action } => match action {
             SourceAction::Add {
                 path,
@@ -1399,7 +1588,56 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             PlanAction::Show { json } => run_plan_show(json),
             PlanAction::Apply => run_plan_apply(),
         },
+        Commands::Install { agents, dry_run } => {
+            let home = memex_cli::install::home_dir()?;
+            memex_cli::install::run(&home, &agents, dry_run)
+        }
+        Commands::Hook { action } => match action {
+            HookAction::Ingest { agent } => run_hook_ingest(&agent),
+        },
+        Commands::Uninstall { agents, dry_run, purge } => {
+            let home = memex_cli::install::home_dir()?;
+            memex_cli::install::run_uninstall(&home, &agents, dry_run, purge)
+        }
     }
+}
+
+/// `memex hook ingest <agent>` — agent hooks call this. Reads transcript path
+/// from stdin and detaches a `memex ingest` child to do the actual work, so
+/// the hook returns immediately rather than holding the agent's session-end
+/// open for the EXTRACT+MERGE pipeline. Mirrors the Python/JS gateway hook
+/// fire-and-forget pattern.
+fn run_hook_ingest(agent: &Agent) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+
+    let Some(path) = memex_cli::hook::read_transcript_path()? else {
+        return Ok(()); // MEMEX_INTERNAL=1 short-circuit
+    };
+    let memex_bin = std::env::current_exe()
+        .map_err(|e| anyhow::anyhow!("locate self for fire-and-forget spawn: {e}"))?;
+    let mut cmd = Command::new(&memex_bin);
+    cmd.args(["ingest", "--agent", agent.as_str(), &path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    // Detach the child into its own session so it isn't killed when the hook
+    // script's process group exits. Unix-only — agents are unix-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and has no library dependencies.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("spawn memex ingest: {e}"))?;
+    Ok(())
 }
 
 fn exit_code_for(err: &anyhow::Error) -> i32 {

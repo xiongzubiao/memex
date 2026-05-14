@@ -2,6 +2,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to (re-)run release for, e.g. v0.1.0"
+        required: true
 
 jobs:
   build:
@@ -11,27 +16,40 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             binary: memex-darwin-arm64
-          - os: macos-13
+            cross: false
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             binary: memex-darwin-x64
+            cross: false
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary: memex-linux-x64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            binary: memex-windows-x64.exe
+            cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            binary: memex-linux-arm64
+            cross: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }} -p memex-cli
+      - name: Install cross (for cross builds)
+        if: matrix.cross == true
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p memex-cli
+          else
+            cargo build --release --target ${{ matrix.target }} -p memex-cli
+          fi
       - name: Rename binary
         shell: bash
         run: |
           src="target/${{ matrix.target }}/release/memex"
-          [[ "${{ matrix.os }}" == "windows-latest" ]] && src="${src}.exe"
           cp "$src" "${{ matrix.binary }}"
       - uses: actions/upload-artifact@v4
         with:
@@ -51,4 +69,33 @@ jobs:
             memex-darwin-arm64/memex-darwin-arm64
             memex-darwin-x64/memex-darwin-x64
             memex-linux-x64/memex-linux-x64
-            memex-windows-x64.exe/memex-windows-x64.exe
+            memex-linux-arm64/memex-linux-arm64
+
+  publish-npm:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Upgrade npm (OIDC trusted publishing requires npm 11.5.1+)
+        run: npm install -g npm@latest
+      - uses: actions/download-artifact@v4
+      - name: Verify tag matches package.json version
+        working-directory: plugin
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag $GITHUB_REF_NAME (=$TAG) does not match plugin/package.json $PKG" >&2
+            exit 1
+          fi
+      - name: Publish platform packages (idempotent)
+        run: node scripts/publish-platform-packages.mjs
+      - name: Publish wrapper package
+        run: node scripts/publish-wrapper.mjs

@@ -1,6 +1,6 @@
 {
-  "name": "@memverge/memex",
-  "version": "0.1.0",
+  "name": "@xiongzubiao/memex",
+  "version": "0.1.1",
   "description": "Personal wiki storage and search engine for AI agents",
   "bin": {
     "memex": "./bin/memex-wrapper.js"
@@ -8,9 +8,19 @@
   "scripts": {
     "postinstall": "node postinstall.js"
   },
+  "optionalDependencies": {
+    "@xiongzubiao/memex-darwin-arm64": "0.1.1",
+    "@xiongzubiao/memex-darwin-x64": "0.1.1",
+    "@xiongzubiao/memex-linux-x64": "0.1.1",
+    "@xiongzubiao/memex-linux-arm64": "0.1.1"
+  },
   "files": [
-    "bin/",
-    "hooks/",
+    "bin/memex-wrapper.js",
+    "hooks/hooks.json",
+    "hooks/claude-code.json",
+    "hooks/codex.json",
+    "hooks/gemini-cli.json",
+    "hooks/README.md",
     "skills/",
     "postinstall.js",
     "AGENTS.md",
@@ -20,13 +30,13 @@
     ".codex-plugin/",
     ".cursor-plugin/",
     ".codex/",
+    ".openclaw-plugin/",
+    ".hermes-plugin/",
     "gemini-extension.json"
   ],
-  "os": ["darwin", "linux", "win32"],
-  "cpu": ["x64", "arm64"],
   "repository": {
     "type": "git",
-    "url": "https://github.com/memverge/memex"
+    "url": "git+https://github.com/xiongzubiao/memex.git"
   },
-  "author": "MemVerge"
+  "author": "Zubiao Xiong"
 }

@@ -42,6 +42,8 @@ pub enum TranscriptAgent {
     ClaudeCode,
     Codex,
     GeminiCli,
+    OpenClaw,
+    Hermes,
 }
 
 impl TranscriptAgent {
@@ -50,6 +52,8 @@ impl TranscriptAgent {
             TranscriptAgent::ClaudeCode => "claude-code",
             TranscriptAgent::Codex => "codex",
             TranscriptAgent::GeminiCli => "gemini-cli",
+            TranscriptAgent::OpenClaw => "openclaw",
+            TranscriptAgent::Hermes => "hermes",
         }
     }
 }
@@ -489,31 +493,38 @@ pub fn parse_codex_session(reader: impl BufRead) -> Result<CleanedTranscript, St
 }
 
 // ---------------------------------------------------------------------------
-// Parser 3: Gemini CLI  (single JSON object, NOT JSONL)
+// Parser 3: Gemini CLI
+//
+// Two on-disk formats coexist:
+//   Old (.json):  a single JSON object: {sessionId, messages: [...]}
+//   New (.jsonl): line-delimited — first non-$set line is the session
+//                 header (with sessionId), subsequent non-$set lines are
+//                 individual messages with the same per-message shape as
+//                 the old format. `{"$set": {...}}` lines are mutation
+//                 markers and ignored.
+//
+// We detect by shape: if the whole string parses as one object with a
+// `messages` array, it's the old format; otherwise treat as JSON-Lines.
 // ---------------------------------------------------------------------------
 
 pub fn parse_gemini_cli_session(json_str: &str) -> Result<CleanedTranscript, String> {
-    let root: Value = serde_json::from_str(json_str).map_err(|e| {
-        format!(
-            "Gemini JSON parse error: {e}. \
-             Expected a single JSON object with \"sessionId\" and \"messages\"."
-        )
-    })?;
-
-    let session_id = root
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    let messages = root
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            "Gemini JSON missing \"messages\" array. \
-             Expected top-level {\"sessionId\": ..., \"messages\": [...]}."
-                .to_string()
-        })?;
+    let (session_id, messages_owned) = match serde_json::from_str::<Value>(json_str) {
+        Ok(root) if root.get("messages").map(|m| m.is_array()).unwrap_or(false) => {
+            let sid = root
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let msgs = root
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            (sid, msgs)
+        }
+        _ => parse_gemini_jsonl(json_str)?,
+    };
+    let messages = &messages_owned;
 
     let mut turns: Vec<TranscriptTurn> = Vec::new();
     let mut first_user_message = String::new();
@@ -593,6 +604,250 @@ pub fn parse_gemini_cli_session(json_str: &str) -> Result<CleanedTranscript, Str
     })
 }
 
+/// New Gemini CLI format: header on line 1 ({sessionId, kind, ...}), messages
+/// on subsequent lines (same per-message shape as the old array entries),
+/// plus `{"$set": ...}` mutation markers that we skip.
+fn parse_gemini_jsonl(text: &str) -> Result<(String, Vec<Value>), String> {
+    let mut session_id = String::new();
+    let mut messages: Vec<Value> = Vec::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "Gemini JSON-Lines parse error at line {}: {e}. \
+                 Expected either {{sessionId, kind, ...}} (header) or a per-message object.",
+                idx + 1
+            )
+        })?;
+        if v.get("$set").is_some() {
+            continue;
+        }
+        if session_id.is_empty()
+            && v.get("kind").is_some()
+            && let Some(sid) = v.get("sessionId").and_then(Value::as_str)
+        {
+            session_id = sid.to_string();
+            continue;
+        }
+        if v.get("type").is_some() {
+            messages.push(v);
+        }
+    }
+    Ok((session_id, messages))
+}
+
+// ---------------------------------------------------------------------------
+// Parser 4: OpenClaw
+//
+// JSON-Lines:
+//   Line 1: {type: "session", version: 3, id, timestamp, cwd}
+//   Then:   {type: "model_change"|"thinking_level_change"|"custom"|...} — meta
+//           {type: "message", id, parentId, timestamp,
+//                  message: {role: "user"|"assistant", content: [...]}}
+//   Content blocks: {type: "text", text} (keep), {type: "thinking", ...} (skip).
+// ---------------------------------------------------------------------------
+
+pub fn parse_openclaw_session(text: &str) -> Result<CleanedTranscript, String> {
+    let mut session_id = String::new();
+    let mut turns: Vec<TranscriptTurn> = Vec::new();
+    let mut first_user_message = String::new();
+    let mut has_user = false;
+    let mut has_assistant = false;
+
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "OpenClaw JSON-Lines parse error at line {}: {e}. \
+                 Expected per-line records with `type` field.",
+                idx + 1
+            )
+        })?;
+        let record_type = v.get("type").and_then(Value::as_str).unwrap_or("");
+
+        if record_type == "session" {
+            if let Some(id) = v.get("id").and_then(Value::as_str) {
+                session_id = id.to_string();
+            }
+            continue;
+        }
+        if record_type != "message" {
+            continue; // skip model_change, thinking_level_change, custom, custom_message
+        }
+
+        let msg = match v.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let timestamp = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        // content is an array of blocks; concatenate the text-type ones.
+        let mut text_parts: Vec<String> = Vec::new();
+        if let Some(content) = msg.get("content").and_then(Value::as_array) {
+            for block in content {
+                let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
+                if btype == "text"
+                    && let Some(t) = block.get("text").and_then(Value::as_str)
+                {
+                    text_parts.push(t.to_string());
+                }
+                // Intentionally skipped: thinking blocks, tool_use, tool_result.
+            }
+        } else if let Some(s) = msg.get("content").and_then(Value::as_str) {
+            // Fallback: some clients may emit content as a plain string.
+            text_parts.push(s.to_string());
+        }
+
+        if text_parts.is_empty() {
+            continue;
+        }
+        let raw_text = text_parts.join("\n");
+        let cleaned = strip_tags(&raw_text);
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        if role == "user" {
+            has_user = true;
+            if first_user_message.is_empty() {
+                first_user_message = cleaned.to_string();
+            }
+        } else {
+            has_assistant = true;
+        }
+
+        turns.push(TranscriptTurn {
+            role: role.to_string(),
+            timestamp,
+            text: cleaned.to_string(),
+        });
+    }
+
+    let filter = classify(has_user, has_assistant, &first_user_message);
+
+    Ok(CleanedTranscript {
+        turns,
+        session_id,
+        agent: "openclaw".to_string(),
+        first_user_message,
+        filter,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Parser 5: Hermes
+//
+// Single JSON object:
+//   {
+//     "session_id": "...",
+//     "model": "...",
+//     "platform": "cli"|"telegram"|...,
+//     "session_start": "ISO",
+//     "last_updated": "ISO",
+//     "message_count": N,
+//     "messages": [
+//       {"role": "user"|"assistant"|"system"|"tool", "content": "..." | [...]}
+//     ],
+//     ...
+//   }
+//   Content blocks (when array): {"type":"text","text": "..."} (keep), other
+//   types skipped. We ignore `reasoning` siblings on assistant turns.
+// ---------------------------------------------------------------------------
+
+pub fn parse_hermes_session(text: &str) -> Result<CleanedTranscript, String> {
+    let v: Value =
+        serde_json::from_str(text).map_err(|e| format!("Hermes JSON parse error: {e}"))?;
+
+    let session_id = v
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let messages = v
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Hermes session missing `messages` array".to_string())?;
+
+    let mut turns: Vec<TranscriptTurn> = Vec::new();
+    let mut first_user_message = String::new();
+    let mut has_user = false;
+    let mut has_assistant = false;
+
+    for msg in messages {
+        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+        if role != "user" && role != "assistant" {
+            continue; // skip system, tool, function — not conversation content
+        }
+
+        let mut text_parts: Vec<String> = Vec::new();
+        match msg.get("content") {
+            Some(Value::String(s)) => text_parts.push(s.clone()),
+            Some(Value::Array(blocks)) => {
+                for block in blocks {
+                    let btype = block.get("type").and_then(Value::as_str).unwrap_or("");
+                    if btype == "text"
+                        && let Some(t) = block.get("text").and_then(Value::as_str)
+                    {
+                        text_parts.push(t.to_string());
+                    }
+                    // Skipped: image, tool_use, tool_result, etc.
+                }
+            }
+            _ => continue,
+        }
+
+        if text_parts.is_empty() {
+            continue;
+        }
+        let raw_text = text_parts.join("\n");
+        let cleaned = strip_tags(&raw_text);
+        let cleaned = cleaned.trim();
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        if role == "user" {
+            has_user = true;
+            if first_user_message.is_empty() {
+                first_user_message = cleaned.to_string();
+            }
+        } else {
+            has_assistant = true;
+        }
+
+        turns.push(TranscriptTurn {
+            role: role.to_string(),
+            timestamp: None,
+            text: cleaned.to_string(),
+        });
+    }
+
+    let filter = classify(has_user, has_assistant, &first_user_message);
+
+    Ok(CleanedTranscript {
+        turns,
+        session_id,
+        agent: "hermes".to_string(),
+        first_user_message,
+        filter,
+    })
+}
+
 /// Inspect a file's content to determine which agent's transcript format it
 /// matches, if any. Returns None if the file doesn't look like a transcript
 /// (extension mismatch, malformed JSON, no recognizable signature keys).
@@ -605,15 +860,20 @@ pub fn detect_transcript_agent(path: &std::path::Path) -> Option<TranscriptAgent
 
     match ext {
         "json" => {
-            // Gemini: single JSON object with `messages` field.
             let raw = std::fs::read_to_string(path).ok()?;
             let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-            if v.is_object()
-                && v.get("messages").map(|m| m.is_array()).unwrap_or(false)
+            if !v.is_object() || !v.get("messages").map(|m| m.is_array()).unwrap_or(false) {
+                return None;
+            }
+            // Hermes vs Gemini-old share the `messages` shape; discriminate by
+            // sibling keys. Hermes uses snake_case session_id + message_count;
+            // Gemini's old format uses camelCase sessionId.
+            if v.get("session_id").is_some()
+                && (v.get("message_count").is_some() || v.get("session_start").is_some())
             {
-                Some(TranscriptAgent::GeminiCli)
+                Some(TranscriptAgent::Hermes)
             } else {
-                None
+                Some(TranscriptAgent::GeminiCli)
             }
         }
         "jsonl" => {
@@ -637,6 +897,18 @@ pub fn detect_transcript_agent(path: &std::path::Path) -> Option<TranscriptAgent
                 }
                 if v.get("event_msg").is_some() || v.get("response_id").is_some() {
                     return Some(TranscriptAgent::Codex);
+                }
+                // Gemini's new .jsonl format: first non-empty line is a header
+                // with sessionId + kind. Distinct from Claude Code/Codex above.
+                if v.get("kind").is_some() && v.get("sessionId").is_some() {
+                    return Some(TranscriptAgent::GeminiCli);
+                }
+                // OpenClaw: first non-empty line is {type: "session", version, id, ...}.
+                if v.get("type").and_then(Value::as_str) == Some("session")
+                    && v.get("version").is_some()
+                    && v.get("id").is_some()
+                {
+                    return Some(TranscriptAgent::OpenClaw);
                 }
                 return None;
             }
@@ -693,6 +965,167 @@ mod tests {
             r#"{"messages": [{"role": "user", "parts": [{"text": "hi"}]}]}"#,
         ).unwrap();
         assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+    }
+
+    #[test]
+    fn detect_gemini_jsonl() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"sessionId":"abc","projectHash":"h","startTime":"t","lastUpdated":"t","kind":"main"}
+{"id":"m1","timestamp":"t","type":"user","content":[{"text":"hi"}]}
+"#,
+        ).unwrap();
+        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+    }
+
+    #[test]
+    fn parse_gemini_jsonl_format() {
+        let text = r#"{"sessionId":"sess-abc","projectHash":"h","startTime":"2026-05-13T03:54:55Z","lastUpdated":"2026-05-13T03:54:55Z","kind":"main"}
+{"id":"m1","timestamp":"2026-05-13T03:54:56Z","type":"user","content":[{"text":"what is a bloom filter?"}]}
+{"$set":{"lastUpdated":"2026-05-13T03:54:56Z"}}
+{"id":"m2","timestamp":"2026-05-13T03:54:58Z","type":"gemini","content":"A bloom filter is a probabilistic set membership data structure."}
+"#;
+        let parsed = parse_gemini_cli_session(text).unwrap();
+        assert_eq!(parsed.session_id, "sess-abc");
+        assert_eq!(parsed.turns.len(), 2);
+        assert_eq!(parsed.turns[0].role, "user");
+        assert_eq!(parsed.turns[0].text, "what is a bloom filter?");
+        assert_eq!(parsed.turns[1].role, "assistant");
+        assert!(parsed.turns[1].text.contains("probabilistic"));
+        assert_eq!(parsed.first_user_message, "what is a bloom filter?");
+    }
+
+    #[test]
+    fn parse_gemini_old_json_format_still_works() {
+        let text = r#"{
+            "sessionId": "old-sess",
+            "messages": [
+                {"type": "user", "content": [{"text": "hello"}]},
+                {"type": "gemini", "content": "hi there"}
+            ]
+        }"#;
+        let parsed = parse_gemini_cli_session(text).unwrap();
+        assert_eq!(parsed.session_id, "old-sess");
+        assert_eq!(parsed.turns.len(), 2);
+        assert_eq!(parsed.turns[0].role, "user");
+        assert_eq!(parsed.turns[1].role, "assistant");
+    }
+
+    #[test]
+    fn detect_openclaw_jsonl() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/x"}
+{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
+"#,
+        ).unwrap();
+        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::OpenClaw));
+    }
+
+    #[test]
+    fn parse_openclaw_minimal_conversation() {
+        let text = r#"{"type":"session","version":3,"id":"sess-abc","timestamp":"2026-05-13T17:54:38Z","cwd":"/root"}
+{"type":"model_change","provider":"openai-codex","modelId":"gpt-5.4-mini"}
+{"type":"message","id":"m1","timestamp":"2026-05-13T17:54:40Z","message":{"role":"user","content":[{"type":"text","text":"what is a merkle tree?"}]}}
+{"type":"message","id":"m2","timestamp":"2026-05-13T17:54:42Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"..."},{"type":"text","text":"A merkle tree is a hash tree where each leaf stores the hash of a block."}]}}
+{"type":"custom","customType":"model-snapshot","data":{}}
+"#;
+        let parsed = parse_openclaw_session(text).unwrap();
+        assert_eq!(parsed.session_id, "sess-abc");
+        assert_eq!(parsed.agent, "openclaw");
+        assert_eq!(parsed.turns.len(), 2, "expected user + assistant turns");
+        assert_eq!(parsed.turns[0].role, "user");
+        assert_eq!(parsed.turns[0].text, "what is a merkle tree?");
+        assert_eq!(parsed.turns[1].role, "assistant");
+        // Thinking block stripped; only text content kept.
+        assert!(parsed.turns[1].text.contains("hash tree"));
+        assert!(!parsed.turns[1].text.contains("..."));
+        assert_eq!(parsed.first_user_message, "what is a merkle tree?");
+    }
+
+    #[test]
+    fn detect_hermes_json() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session_abc.json");
+        std::fs::write(
+            &path,
+            r#"{"session_id":"abc","platform":"cli","model":"gpt-5.4-mini","session_start":"2026-05-13T22:45:45","last_updated":"2026-05-13T22:46:00","message_count":2,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::Hermes));
+    }
+
+    #[test]
+    fn parse_hermes_minimal_conversation() {
+        let text = r#"{
+            "session_id": "20260513_224545_a54c5b",
+            "model": "gpt-5.4-mini",
+            "platform": "cli",
+            "session_start": "2026-05-13T22:45:45",
+            "last_updated": "2026-05-13T22:45:50",
+            "message_count": 2,
+            "messages": [
+                {"role": "user", "content": "Define paxos in one sentence"},
+                {"role": "assistant", "content": "Paxos is a consensus protocol.", "reasoning": "..."}
+            ]
+        }"#;
+        let parsed = parse_hermes_session(text).unwrap();
+        assert_eq!(parsed.session_id, "20260513_224545_a54c5b");
+        assert_eq!(parsed.agent, "hermes");
+        assert_eq!(parsed.turns.len(), 2);
+        assert_eq!(parsed.turns[0].role, "user");
+        assert_eq!(parsed.turns[0].text, "Define paxos in one sentence");
+        assert_eq!(parsed.turns[1].role, "assistant");
+        assert_eq!(parsed.turns[1].text, "Paxos is a consensus protocol.");
+        assert_eq!(parsed.first_user_message, "Define paxos in one sentence");
+    }
+
+    #[test]
+    fn parse_hermes_handles_content_blocks_and_skips_non_chat_roles() {
+        let text = r#"{
+            "session_id": "x",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "image", "url": "x"}]},
+                {"role": "tool", "content": "result"},
+                {"role": "assistant", "content": [{"type": "text", "text": "hi back"}]}
+            ]
+        }"#;
+        let parsed = parse_hermes_session(text).unwrap();
+        // System + tool roles dropped; only user + assistant turns kept.
+        assert_eq!(parsed.turns.len(), 2);
+        assert_eq!(parsed.turns[0].text, "hello");
+        assert_eq!(parsed.turns[1].text, "hi back");
+    }
+
+    #[test]
+    fn detect_gemini_json_still_wins_when_session_id_is_camelcase() {
+        // Regression guard: Gemini's old single-JSON format uses sessionId
+        // (camel) — it must NOT be misdetected as Hermes.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(
+            &path,
+            r#"{"sessionId":"x","messages":[{"type":"user","content":[{"text":"hi"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+    }
+
+    #[test]
+    fn parse_openclaw_skips_meta_records() {
+        let text = r#"{"type":"session","version":3,"id":"sess"}
+{"type":"thinking_level_change","thinkingLevel":"medium"}
+{"type":"custom","customType":"model-snapshot"}
+{"type":"custom_message","data":{}}
+{"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
+"#;
+        let parsed = parse_openclaw_session(text).unwrap();
+        assert_eq!(parsed.turns.len(), 1, "only the message record should produce a turn");
     }
 
     #[test]

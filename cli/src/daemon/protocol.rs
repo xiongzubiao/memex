@@ -8,6 +8,8 @@ pub enum TranscriptAgent {
     ClaudeCode,
     Codex,
     GeminiCli,
+    OpenClaw,
+    Hermes,
 }
 
 impl TranscriptAgent {
@@ -16,6 +18,20 @@ impl TranscriptAgent {
             TranscriptAgent::ClaudeCode => "claude-code",
             TranscriptAgent::Codex => "codex",
             TranscriptAgent::GeminiCli => "gemini-cli",
+            TranscriptAgent::OpenClaw => "openclaw",
+            TranscriptAgent::Hermes => "hermes",
+        }
+    }
+}
+
+impl From<memex_core::transcript::TranscriptAgent> for TranscriptAgent {
+    fn from(value: memex_core::transcript::TranscriptAgent) -> Self {
+        match value {
+            memex_core::transcript::TranscriptAgent::ClaudeCode => Self::ClaudeCode,
+            memex_core::transcript::TranscriptAgent::Codex => Self::Codex,
+            memex_core::transcript::TranscriptAgent::GeminiCli => Self::GeminiCli,
+            memex_core::transcript::TranscriptAgent::OpenClaw => Self::OpenClaw,
+            memex_core::transcript::TranscriptAgent::Hermes => Self::Hermes,
         }
     }
 }
@@ -26,6 +42,15 @@ pub enum IngestSource {
     Transcript {
         path: String,
         agent: TranscriptAgent,
+    },
+    /// Transcript content piped in-band (no file read on the daemon side).
+    /// Used by gateway hook handlers that have the bytes in memory and want
+    /// to avoid a temp-file dance. `source_label` is the original on-disk
+    /// path (or any identifier) — recorded as the source for citations.
+    TranscriptInline {
+        content: String,
+        agent: TranscriptAgent,
+        source_label: String,
     },
     Document {
         source_path: String,
@@ -438,6 +463,29 @@ mod tests {
                 }
                 assert!(collections.is_empty());
             }
+            _ => panic!("expected Ingest"),
+        }
+    }
+
+    #[test]
+    fn ingest_request_transcript_inline_deserializes() {
+        let r: Request = serde_json::from_str(
+            r##"{"op":"ingest","source":{"kind":"transcript_inline","content":"{\"session_id\":\"x\"}","agent":"hermes","source_label":"/tmp/x.json"}}"##,
+        )
+        .unwrap();
+        match r {
+            Request::Ingest { source, .. } => match source {
+                IngestSource::TranscriptInline {
+                    content,
+                    agent,
+                    source_label,
+                } => {
+                    assert_eq!(content, r#"{"session_id":"x"}"#);
+                    assert_eq!(agent, TranscriptAgent::Hermes);
+                    assert_eq!(source_label, "/tmp/x.json");
+                }
+                _ => panic!("expected TranscriptInline"),
+            },
             _ => panic!("expected Ingest"),
         }
     }

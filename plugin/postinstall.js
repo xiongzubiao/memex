@@ -1,61 +1,42 @@
+#!/usr/bin/env node
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 const { execSync } = require("child_process");
 
-const VERSION = "0.1.0";
-// ort 2.0.0-rc.12 with api-23 targets ORT 1.23.x. Version 1.24 drops x86_64
-// macOS, so 1.23.x is the last minor with full platform coverage.
+const VERSION = require("./package.json").version;
+// ort 2.0.0-rc.12 with api-23 targets ORT 1.23.x; 1.24 dropped x86_64 macOS.
 const ORT_VERSION = "1.23.2";
 const MODEL_URL = "https://huggingface.co/LeePark/gemma-embedding-300M-onnx-int8/resolve/main/model_int8.onnx";
-// HuggingFace tokenizer.json for embeddinggemma-300m. Hosted in onnx-community
-// because the upstream `google/embeddinggemma-300m` repo is gated; the
-// onnx-community mirror has the same tokenizer.
 const TOKENIZER_URL = "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main/tokenizer.json";
-const RELEASE_BASE = `https://github.com/memverge/memex/releases/download/v${VERSION}`;
 const ORT_RELEASE_BASE = `https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}`;
 
-function getPlatformBinary() {
-  const platform = os.platform();
-  const arch = os.arch();
-  const ext = platform === "win32" ? ".exe" : "";
-
-  const key = `${platform}-${arch}`;
-  const supported = {
-    "darwin-arm64": `memex-darwin-arm64${ext}`,
-    "darwin-x64": `memex-darwin-x64${ext}`,
-    "linux-x64": `memex-linux-x64${ext}`,
-    "win32-x64": `memex-windows-x64${ext}`,
-  };
-
-  const filename = supported[key];
-  if (!filename) {
-    console.error(`Unsupported platform: ${key}`);
-    process.exit(1);
-  }
-  return filename;
-}
+// Pinned SHA256 of the model + tokenizer at the URLs above. Bump together with the
+// URLs when changing model versions; mismatch causes the file to be deleted and the
+// install to fail. Set to placeholder values until the v0.1.0 publish — when unset,
+// verification is skipped with a warning.
+const EXPECTED_SHA = {
+  model:     "daa9fb37fa1d6f793bf100c7bb42be7839592d380b4f2188a8dadb1d88c6222e",
+  tokenizer: "4dda02faaf32bc91031dc8c88457ac272b00c1016cc679757d1c441b248b9c47",
+};
 
 function getOrtArchive() {
-  const platform = os.platform();
-  const arch = os.arch();
-  const key = `${platform}-${arch}`;
-
+  const key = `${os.platform()}-${os.arch()}`;
   const archives = {
-    "darwin-arm64": { file: `onnxruntime-osx-arm64-${ORT_VERSION}.tgz`, lib: "libonnxruntime.dylib" },
-    "darwin-x64":  { file: `onnxruntime-osx-x86_64-${ORT_VERSION}.tgz`, lib: "libonnxruntime.dylib" },
-    "linux-x64":   { file: `onnxruntime-linux-x64-${ORT_VERSION}.tgz`, lib: "libonnxruntime.so" },
-    "win32-x64":   { file: `onnxruntime-win-x64-${ORT_VERSION}.zip`, lib: "onnxruntime.dll" },
+    "darwin-arm64": { file: `onnxruntime-osx-arm64-${ORT_VERSION}.tgz`,     lib: "libonnxruntime.dylib" },
+    "darwin-x64":   { file: `onnxruntime-osx-x86_64-${ORT_VERSION}.tgz`,    lib: "libonnxruntime.dylib" },
+    "linux-x64":    { file: `onnxruntime-linux-x64-${ORT_VERSION}.tgz`,     lib: "libonnxruntime.so"    },
+    "linux-arm64":  { file: `onnxruntime-linux-aarch64-${ORT_VERSION}.tgz`, lib: "libonnxruntime.so"    },
   };
-
-  return archives[key];
+  return archives[key] || null;
 }
 
 function download(url, dest) {
   return new Promise((resolve, reject) => {
     https.get(url, (res) => {
-      if (res.statusCode === 302 || res.statusCode === 301) {
+      if (res.statusCode === 301 || res.statusCode === 302) {
         res.resume();
         return download(res.headers.location, dest).then(resolve).catch(reject);
       }
@@ -71,48 +52,65 @@ function download(url, dest) {
   });
 }
 
-/** Recursively find files matching a prefix and copy them to dest. */
+// Stream the hash so we don't load the whole file (model is ~329MB) into RAM.
+function sha256(filepath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    fs.createReadStream(filepath)
+      .on("data", (chunk) => hash.update(chunk))
+      .on("end", () => resolve(hash.digest("hex")))
+      .on("error", reject);
+  });
+}
+
+function shaIsPinned(value) {
+  return typeof value === "string" && value.length === 64 && /^[0-9a-f]+$/.test(value);
+}
+
+async function downloadVerified(url, dest, expected, label) {
+  await download(url, dest);
+  if (shaIsPinned(expected)) {
+    const got = await sha256(dest);
+    if (got !== expected) {
+      fs.unlinkSync(dest);
+      throw new Error(
+        `SHA256 mismatch on ${label}\n  url:      ${url}\n  expected: ${expected}\n  got:      ${got}\n` +
+        `Refusing to use a download that does not match the version pinned in this plugin.`
+      );
+    }
+  } else {
+    console.log(`(${label}: SHA256 verification skipped — no pinned digest)`);
+  }
+}
+
+/// Download (or re-download if cached + checksum mismatch) one pinned asset.
+async function ensureAsset({ dest, url, expectedSha, label, sizeHint }) {
+  if (!fs.existsSync(dest)) {
+    console.log(`Downloading ${label}${sizeHint ? ` (${sizeHint})` : ""}...`);
+    await downloadVerified(url, dest, expectedSha, label);
+    console.log(`${label} downloaded.`);
+    return;
+  }
+  if (shaIsPinned(expectedSha) && (await sha256(dest)) !== expectedSha) {
+    console.log(`Cached ${label} checksum mismatch; re-downloading...`);
+    fs.unlinkSync(dest);
+    await downloadVerified(url, dest, expectedSha, label);
+  }
+}
+
 function copyLibFiles(dir, dest, prefix) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      copyLibFiles(full, dest, prefix);
-    } else if (entry.name.startsWith(prefix)) {
-      fs.copyFileSync(full, path.join(dest, entry.name));
-    }
+    if (entry.isDirectory()) copyLibFiles(full, dest, prefix);
+    else if (entry.name.startsWith(prefix)) fs.copyFileSync(full, path.join(dest, entry.name));
   }
 }
 
-/** Rewrite ${MEMEX_PLUGIN_DIR} placeholders in a hooks JSON to absolute path. */
-function rewriteHooksFile(hooksPath, pluginDir) {
-  if (!fs.existsSync(hooksPath)) return;
-  const raw = fs.readFileSync(hooksPath, "utf8");
-  const rewritten = raw.replace(/\$\{MEMEX_PLUGIN_DIR\}/g, pluginDir);
-  if (rewritten !== raw) {
-    fs.writeFileSync(hooksPath, rewritten);
-  }
-}
-
-/** Check common system locations for an existing ONNX Runtime install. */
 function findSystemOrt(libName) {
-  // Respect explicit env var.
   if (process.env.ORT_DYLIB_PATH && fs.existsSync(process.env.ORT_DYLIB_PATH)) {
     return process.env.ORT_DYLIB_PATH;
   }
-  const candidates = os.platform() === "win32"
-    ? [
-        // nuget / vcpkg / manual installs
-        path.join(process.env.ProgramFiles || "C:\\Program Files", "onnxruntime", "lib"),
-        path.join(process.env.LOCALAPPDATA || "", "onnxruntime", "lib"),
-      ]
-    : [
-        // brew (macOS arm64 / x64)
-        "/opt/homebrew/lib",
-        "/usr/local/lib",
-        // linux system
-        "/usr/lib",
-        "/usr/lib/x86_64-linux-gnu",
-      ];
+  const candidates = ["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib", "/usr/lib/x86_64-linux-gnu"];
   for (const dir of candidates) {
     const p = path.join(dir, libName);
     if (fs.existsSync(p)) return p;
@@ -121,90 +119,111 @@ function findSystemOrt(libName) {
 }
 
 async function main() {
-  const binDir = path.join(__dirname, "bin");
-  const modelDir = path.join(os.homedir(), ".memex", "models");
-  const libDir = path.join(os.homedir(), ".memex", "lib");
+  const status = { version: VERSION, timestamp: new Date().toISOString(), model: false, tokenizer: false, ort: null };
+  const memexHome = path.join(os.homedir(), ".memex");
+  const modelDir = path.join(memexHome, "models");
+  const libDir = path.join(memexHome, "lib");
 
-  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(memexHome, { recursive: true });
   fs.mkdirSync(modelDir, { recursive: true });
   fs.mkdirSync(libDir, { recursive: true });
 
-  // 1. Download memex binary.
-  const binaryName = getPlatformBinary();
-  const ext = os.platform() === "win32" ? ".exe" : "";
-  const binaryDest = path.join(binDir, `memex${ext}`);
-
-  if (!fs.existsSync(binaryDest)) {
-    console.log(`Downloading memex binary (${binaryName})...`);
-    await download(`${RELEASE_BASE}/${binaryName}`, binaryDest);
-    if (os.platform() !== "win32") {
-      fs.chmodSync(binaryDest, 0o755);
-    }
-    console.log("Binary downloaded.");
-  }
-
-  // 2. Download embedding model.
   const modelDest = path.join(modelDir, "embedding-gemma-300m.onnx");
-  if (!fs.existsSync(modelDest)) {
-    console.log("Downloading embedding model (~329MB)...");
-    await download(MODEL_URL, modelDest);
-    console.log("Model downloaded.");
-  }
+  await ensureAsset({
+    dest: modelDest,
+    url: MODEL_URL,
+    expectedSha: EXPECTED_SHA.model,
+    label: "embedding model",
+    sizeHint: "~329MB",
+  });
+  status.model = fs.existsSync(modelDest);
 
-  // 2b. Download tokenizer.json for the embedding model. Without it,
-  // memex falls back to a chars-as-tokens encoding that is ~4× slower
-  // and produces lower-quality embeddings. Existing memex installs
-  // upgrading from older versions should re-run this postinstall to
-  // fetch the tokenizer.
   const tokenizerDest = path.join(modelDir, "embedding-gemma-300m-tokenizer.json");
-  if (!fs.existsSync(tokenizerDest)) {
-    console.log("Downloading tokenizer.json (~20MB)...");
-    await download(TOKENIZER_URL, tokenizerDest);
-    console.log("Tokenizer downloaded.");
-  }
+  await ensureAsset({
+    dest: tokenizerDest,
+    url: TOKENIZER_URL,
+    expectedSha: EXPECTED_SHA.tokenizer,
+    label: "tokenizer",
+    sizeHint: "~20MB",
+  });
+  status.tokenizer = fs.existsSync(tokenizerDest);
 
-  // 3. Download ONNX Runtime shared library (skip if already installed).
+  // ONNX Runtime.
   const ortInfo = getOrtArchive();
   if (ortInfo) {
     const libDest = path.join(libDir, ortInfo.lib);
     const systemOrt = findSystemOrt(ortInfo.lib);
     if (systemOrt) {
       console.log(`ONNX Runtime found at ${systemOrt} — skipping download.`);
+      status.ort = true;
     } else if (!fs.existsSync(libDest)) {
       const archiveDest = path.join(libDir, ortInfo.file);
       console.log(`Downloading ONNX Runtime v${ORT_VERSION}...`);
       await download(`${ORT_RELEASE_BASE}/${ortInfo.file}`, archiveDest);
-
-      // Extract the shared library from the archive.
       console.log("Extracting ONNX Runtime...");
       const tmpDir = path.join(libDir, "_ort_tmp");
       fs.mkdirSync(tmpDir, { recursive: true });
-      if (ortInfo.file.endsWith(".tgz")) {
-        execSync(`tar xzf "${archiveDest}" -C "${tmpDir}"`, { stdio: "pipe" });
-      } else {
-        // Windows: use PowerShell to extract .zip
-        execSync(`powershell -Command "Expand-Archive -Path '${archiveDest}' -DestinationPath '${tmpDir}'"`, { stdio: "pipe" });
-      }
-      // Walk the temp dir and copy matching library files (cross-platform).
+      // --no-same-owner: don't preserve UID/GID from the tarball. The ORT
+      // archive's tar headers carry the build-machine's UID (cloudtest, UID
+      // 1000) which would otherwise stick when extracting as root, leaving
+      // files owned by whichever local user happens to share UID 1000.
+      execSync(`tar xzf "${archiveDest}" -C "${tmpDir}" --no-same-owner`, { stdio: "pipe" });
       copyLibFiles(tmpDir, libDir, ortInfo.lib);
       fs.rmSync(tmpDir, { recursive: true, force: true });
       fs.rmSync(archiveDest, { force: true });
       console.log("ONNX Runtime ready.");
+      status.ort = fs.existsSync(libDest);
+    } else {
+      status.ort = true;
     }
   }
 
-  // 4. Rewrite ${MEMEX_PLUGIN_DIR} placeholders in hooks JSON to absolute paths.
-  const PLUGIN_DIR = __dirname;
-  rewriteHooksFile(path.join(PLUGIN_DIR, "hooks", "claude-code.json"), PLUGIN_DIR);
-  rewriteHooksFile(path.join(PLUGIN_DIR, "hooks", "codex.json"), PLUGIN_DIR);
-  rewriteHooksFile(path.join(PLUGIN_DIR, "hooks", "gemini-cli.json"), PLUGIN_DIR);
+  // Write install status for the wrapper to surface postinstall failures at startup.
+  fs.writeFileSync(path.join(memexHome, ".install-status"), JSON.stringify(status, null, 2));
 
-  // 5. Stop any running memex daemon so the next request loads the new binary.
+  // Daemon-stop on upgrade: if the previously-installed binary lives at a
+  // different path AND is still on disk, stop its daemon before the user's
+  // next invocation hits the new binary. Then update the stamp.
+  // Used to live in the wrapper (every-invocation cost); now once at install.
   try {
-    execSync(`${JSON.stringify(binaryDest)} daemon stop`, { stdio: "pipe" });
-    console.log("Stopped any running memex daemon (will relaunch on next CLI use)");
-  } catch (e) {
-    // No-op: daemon wasn't running, or stop failed harmlessly.
+    const platformPkg = `@xiongzubiao/memex-${os.platform()}-${os.arch()}`;
+    const newBinaryPath = path.join(
+      path.dirname(require.resolve(`${platformPkg}/package.json`)),
+      "bin", "memex"
+    );
+    const stamp = path.join(memexHome, ".last-binary");
+    let prev = "";
+    try { prev = fs.readFileSync(stamp, "utf8").trim(); } catch {}
+    if (prev && prev !== newBinaryPath && fs.existsSync(prev)) {
+      try {
+        execSync(`${JSON.stringify(prev)} daemon stop`, { stdio: "pipe", timeout: 5000 });
+      } catch { /* old daemon wasn't running, or refused — ignore */ }
+    }
+    fs.writeFileSync(stamp, newBinaryPath);
+  } catch {
+    // Platform package not resolvable (unsupported arch). Leave stamp untouched
+    // so a subsequent install on a supported arch picks up cleanly.
+  }
+
+  // Global install (`npm install -g`) → also register hooks with detected
+  // agents so the user gets the full "one command" install. Skip otherwise
+  // (the marketplace path runs npm in `~/.claude/plugins/npm-cache/` with
+  // `npm_config_global` unset, and Claude Code already registers the plugin
+  // for that path).
+  if (process.env.npm_config_global === "true" || process.env.npm_config_global === "1") {
+    try {
+      execSync("memex install", { stdio: "inherit", timeout: 30000 });
+    } catch {
+      console.warn("memex install: not run automatically. Run `memex install` to register hooks.");
+    }
+    // npm 11 no longer fires `preuninstall`/`uninstall`/`postuninstall`, so we
+    // can't auto-strip on `npm uninstall -g`. Surface the manual flow here so
+    // the user knows to run `memex uninstall` BEFORE removing the binary.
+    console.log("");
+    console.log("memex ready. To uninstall later, run:");
+    console.log("  memex uninstall                       # stop daemon, strip hooks/skills");
+    console.log("  npm uninstall -g @xiongzubiao/memex   # remove the binary");
+    return;
   }
 
   console.log("memex ready.");
@@ -212,5 +231,11 @@ async function main() {
 
 main().catch((err) => {
   console.error("postinstall failed:", err.message);
+  try {
+    fs.writeFileSync(
+      path.join(os.homedir(), ".memex", ".install-status"),
+      JSON.stringify({ version: VERSION, timestamp: new Date().toISOString(), error: err.message }, null, 2),
+    );
+  } catch {}
   process.exit(1);
 });

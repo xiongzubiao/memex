@@ -11,7 +11,7 @@ static LOADED_DYLIB: OnceLock<libloading::Library> = OnceLock::new();
 
 /// Candidate dylib paths, in priority order. First `~/.memex/lib/` (where
 /// the postinstall places it), then platform-standard install locations.
-fn candidate_dylib_paths() -> Vec<PathBuf> {
+pub fn candidate_dylib_paths() -> Vec<PathBuf> {
     let lib_name = if cfg!(target_os = "windows") {
         "onnxruntime.dll"
     } else if cfg!(target_os = "macos") {

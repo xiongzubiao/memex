@@ -6,15 +6,15 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${MEMEX_PLUGIN_DIR}/hooks/codex-stop.js",
-            "timeout": 10
+            "command": "memex hook ingest codex",
+            "timeout": 120
           }
         ]
       }
     ],
     "SessionStart": [
       {
-        "matcher": "startup|resume",
+        "matcher": "startup|resume|clear",
         "hooks": [
           {
             "type": "command",

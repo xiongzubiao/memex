@@ -1,4 +1,6 @@
 pub mod daemon;
+pub mod hook;
+pub mod install;
 pub mod plan_show;
 
 #[cfg(feature = "test-harness")]

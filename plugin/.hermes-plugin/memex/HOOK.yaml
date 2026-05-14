@@ -1,0 +1,6 @@
+name: memex
+description: Auto-ingest the previous Hermes session into your memex wiki on session:end / session:reset
+events:
+  - session:start
+  - session:end
+  - session:reset
