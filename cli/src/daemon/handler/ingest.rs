@@ -75,6 +75,9 @@ pub(super) async fn handle_ingest_transcript_content(
         TranscriptAgent::GeminiCli => memex_core::transcript::parse_gemini_cli_session(&raw_content),
         TranscriptAgent::OpenClaw => memex_core::transcript::parse_openclaw_session(&raw_content),
         TranscriptAgent::Hermes => memex_core::transcript::parse_hermes_session(&raw_content),
+        TranscriptAgent::OpenCode => memex_core::transcript::parse_opencode_session(
+            std::io::BufReader::new(raw_content.as_bytes()),
+        ),
     };
     let agent_str = agent.as_str();
 

@@ -39,6 +39,8 @@ const OPENCLAW_HANDLER_JS: &str = include_str!("../../plugin/.openclaw-plugin/me
 const HERMES_HOOK_YAML: &str = include_str!("../../plugin/.hermes-plugin/memex/HOOK.yaml");
 const HERMES_HANDLER_PY: &str = include_str!("../../plugin/.hermes-plugin/memex/handler.py");
 
+const OPENCODE_PLUGIN_TS: &str = include_str!("../../plugin/.opencode-plugin/memex.ts");
+
 const MEMEX_SENTINELS: &[&str] = &[
     "memex daemon",
     "memex hook",
@@ -47,12 +49,14 @@ const MEMEX_SENTINELS: &[&str] = &[
 ];
 
 /// Single source of truth for which directory under `~` indicates each agent.
+/// OpenCode lives under `~/.config/opencode/` (XDG-style), not `~/.opencode/`.
 const PROBE_DIRS: &[(&str, InstallTarget)] = &[
     (".claude", InstallTarget::ClaudeCode),
     (".codex", InstallTarget::Codex),
     (".gemini", InstallTarget::GeminiCli),
     (".openclaw", InstallTarget::OpenClaw),
     (".hermes", InstallTarget::Hermes),
+    (".config/opencode", InstallTarget::OpenCode),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -64,6 +68,8 @@ pub enum InstallTarget {
     OpenClaw,
     #[value(name = "hermes")]
     Hermes,
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 impl InstallTarget {
@@ -74,6 +80,7 @@ impl InstallTarget {
             InstallTarget::GeminiCli => "Gemini CLI",
             InstallTarget::OpenClaw => "OpenClaw",
             InstallTarget::Hermes => "Hermes",
+            InstallTarget::OpenCode => "OpenCode",
         }
     }
 }
@@ -93,7 +100,7 @@ pub fn run(home: &Path, targets: &[InstallTarget], dry_run: bool) -> Result<()> 
             .collect();
         eprintln!("no agent CLIs detected (looked for {})", probed.join(", "));
         eprintln!(
-            "install at least one of: Claude Code, Codex, Gemini CLI, OpenClaw, Hermes, then retry"
+            "install at least one of: Claude Code, Codex, Gemini CLI, OpenClaw, Hermes, OpenCode, then retry"
         );
         bail!("no agents detected");
     }
@@ -106,6 +113,7 @@ pub fn run(home: &Path, targets: &[InstallTarget], dry_run: bool) -> Result<()> 
         match target {
             InstallTarget::OpenClaw => install_openclaw(home, dry_run)?,
             InstallTarget::Hermes => install_hermes(home, dry_run)?,
+            InstallTarget::OpenCode => install_opencode(home, dry_run)?,
             _ => unreachable!("file_agent_spec covers all other variants"),
         }
     }
@@ -256,6 +264,27 @@ fn install_hermes_hook(home: &Path, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// OpenCode auto-loads any `.ts`/`.js` file under `~/.config/opencode/plugins/`,
+/// so install is a single file drop. Skills live alongside under
+/// `~/.config/opencode/skills/`. Restart any open opencode session for the
+/// plugin to take effect.
+fn install_opencode(home: &Path, dry_run: bool) -> Result<()> {
+    println!("✓ {}: skills + plugin", InstallTarget::OpenCode.display());
+    let plugins_dir = home.join(".config").join("opencode").join("plugins");
+    let plugin_file = plugins_dir.join("memex.ts");
+    if dry_run {
+        println!("  would write plugin: {}", plugin_file.display());
+    } else {
+        fs::create_dir_all(&plugins_dir)
+            .with_context(|| format!("create {}", plugins_dir.display()))?;
+        fs::write(&plugin_file, OPENCODE_PLUGIN_TS)
+            .with_context(|| format!("write {}", plugin_file.display()))?;
+        println!("  plugin → {} (restart opencode to load)", plugin_file.display());
+    }
+    install_skills(&home.join(".config").join("opencode").join("skills"), dry_run)?;
+    Ok(())
+}
+
 fn install_skills(skills_dir: &Path, dry_run: bool) -> Result<()> {
     for (name, body) in SKILLS {
         let dir = skills_dir.join(name);
@@ -386,14 +415,11 @@ pub fn run_uninstall(
     }
 
     if selected.is_empty() {
-        eprintln!(
-            "no agent CLIs detected (looked for {}/.claude, {}/.codex, {}/.gemini, {}/.openclaw, {}/.hermes)",
-            home.display(),
-            home.display(),
-            home.display(),
-            home.display(),
-            home.display(),
-        );
+        let probed: Vec<String> = PROBE_DIRS
+            .iter()
+            .map(|(d, _)| format!("{}/{d}", home.display()))
+            .collect();
+        eprintln!("no agent CLIs detected (looked for {})", probed.join(", "));
         // Not an error — the daemon was still stopped above, and `--purge`
         // may still be the user's reason for running this.
     }
@@ -406,6 +432,7 @@ pub fn run_uninstall(
         match target {
             InstallTarget::OpenClaw => uninstall_openclaw(home, dry_run)?,
             InstallTarget::Hermes => uninstall_hermes(home, dry_run)?,
+            InstallTarget::OpenCode => uninstall_opencode(home, dry_run)?,
             _ => unreachable!("file_agent_spec covers all other variants"),
         }
     }
@@ -467,6 +494,28 @@ fn uninstall_hermes(home: &Path, dry_run: bool) -> Result<()> {
             fs::remove_dir_all(&hook_dir)
                 .with_context(|| format!("remove {}", hook_dir.display()))?;
             println!("  hook ← {}", hook_dir.display());
+        }
+    }
+    Ok(())
+}
+
+fn uninstall_opencode(home: &Path, dry_run: bool) -> Result<()> {
+    let oc_root = home.join(".config").join("opencode");
+    let plugin_file = oc_root.join("plugins").join("memex.ts");
+    let skills_dir = oc_root.join("skills");
+    remove_skills(&skills_dir, dry_run)?;
+    println!(
+        "✓ {}: skills ← {}",
+        InstallTarget::OpenCode.display(),
+        skills_dir.display()
+    );
+    if plugin_file.exists() {
+        if dry_run {
+            println!("  would remove: {}", plugin_file.display());
+        } else {
+            fs::remove_file(&plugin_file)
+                .with_context(|| format!("remove {}", plugin_file.display()))?;
+            println!("  plugin ← {}", plugin_file.display());
         }
     }
     Ok(())
@@ -691,6 +740,50 @@ mod tests {
         // Re-running should be idempotent (no panic, files still there).
         run(t.path(), &[InstallTarget::Hermes], false).unwrap();
         assert!(hook.join("HOOK.yaml").exists());
+    }
+
+    #[test]
+    fn install_opencode_writes_plugin_and_skills() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join(".config/opencode")).unwrap();
+        run(t.path(), &[InstallTarget::OpenCode], false).unwrap();
+
+        let plugin = t.path().join(".config/opencode/plugins/memex.ts");
+        assert!(plugin.exists(), "missing plugin file: {}", plugin.display());
+        let body = fs::read_to_string(&plugin).unwrap();
+        assert!(body.contains("session.idle"), "plugin body missing session.idle wiring");
+        assert!(body.contains("memex"), "plugin body missing memex command");
+
+        for name in ["memex-query", "memex-ingest", "memex-brainstorm"] {
+            let skill = t.path().join(".config/opencode/skills").join(name).join("SKILL.md");
+            assert!(skill.exists(), "opencode skill not written: {}", skill.display());
+        }
+
+        // Idempotent: re-running just rewrites the same file.
+        run(t.path(), &[InstallTarget::OpenCode], false).unwrap();
+        assert!(plugin.exists());
+    }
+
+    #[test]
+    fn detect_picks_up_opencode() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join(".config/opencode")).unwrap();
+        let found = detect(t.path());
+        assert_eq!(found, vec![InstallTarget::OpenCode]);
+    }
+
+    #[test]
+    fn uninstall_opencode_removes_plugin_and_skills() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join(".config/opencode")).unwrap();
+        run(t.path(), &[InstallTarget::OpenCode], false).unwrap();
+        let plugin = t.path().join(".config/opencode/plugins/memex.ts");
+        let skill = t.path().join(".config/opencode/skills/memex-query/SKILL.md");
+        assert!(plugin.exists() && skill.exists());
+
+        run_uninstall(t.path(), &[InstallTarget::OpenCode], false, false).unwrap();
+        assert!(!plugin.exists(), "plugin not removed");
+        assert!(!skill.exists(), "skill not removed");
     }
 
     #[test]

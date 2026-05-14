@@ -10,6 +10,7 @@ pub enum TranscriptAgent {
     GeminiCli,
     OpenClaw,
     Hermes,
+    OpenCode,
 }
 
 impl TranscriptAgent {
@@ -20,6 +21,7 @@ impl TranscriptAgent {
             TranscriptAgent::GeminiCli => "gemini-cli",
             TranscriptAgent::OpenClaw => "openclaw",
             TranscriptAgent::Hermes => "hermes",
+            TranscriptAgent::OpenCode => "opencode",
         }
     }
 }
@@ -32,6 +34,7 @@ impl From<memex_core::transcript::TranscriptAgent> for TranscriptAgent {
             memex_core::transcript::TranscriptAgent::GeminiCli => Self::GeminiCli,
             memex_core::transcript::TranscriptAgent::OpenClaw => Self::OpenClaw,
             memex_core::transcript::TranscriptAgent::Hermes => Self::Hermes,
+            memex_core::transcript::TranscriptAgent::OpenCode => Self::OpenCode,
         }
     }
 }

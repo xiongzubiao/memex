@@ -80,9 +80,9 @@ No `--collection` behavior:
 
 - **Unix**: macOS or Linux. Windows is not yet supported in v0.1.0 — the daemon requires Unix sockets and flock. Run inside WSL2 as a workaround.
 - **Rust toolchain**: 1.80 or newer (https://rustup.rs).
-- **At least one agent CLI**: Claude Code, Codex, or Gemini CLI. Required
-  for synthesis and session ingestion. `memex query --raw` and
-  `memex search` work without an agent.
+- **At least one agent CLI**: Claude Code, Codex, Gemini CLI, OpenClaw,
+  Hermes, or OpenCode. Required for synthesis and session ingestion.
+  `memex query --raw` and `memex search` work without an agent.
 - **Optional**: ONNX embedding model at
   `~/.memex/models/embedding-gemma-300m.onnx` plus its companion
   tokenizer `~/.memex/models/embedding-gemma-300m-tokenizer.json`.

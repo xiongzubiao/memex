@@ -303,6 +303,56 @@ pub fn status() -> Result<i32> {
     }
 }
 
+/// Async ingest for OpenCode sessions. Reads the session from the user's
+/// opencode SQLite DB on the CLI side, ships the canonical envelope to the
+/// daemon via TranscriptInline. Mirrors `ingest_async` but session-id-keyed.
+pub async fn ingest_opencode_async(
+    session_id: &str,
+    db_path: &std::path::Path,
+    collections: Vec<String>,
+) -> Result<i32> {
+    let envelope = memex_core::transcript::extract_opencode_session(db_path, session_id)
+        .map_err(|e| anyhow::anyhow!("read OpenCode session {session_id}: {e}"))?;
+    let paths = DaemonPaths::default_under(&memex_root());
+    let stream = client::connect_or_spawn(
+        &paths.socket,
+        &paths.lock,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await?;
+    let events = client::request(
+        stream,
+        &protocol::Request::Ingest {
+            source: protocol::IngestSource::TranscriptInline {
+                content: envelope,
+                agent: protocol::TranscriptAgent::OpenCode,
+                source_label: format!("opencode://session/{session_id}"),
+            },
+            collections,
+        },
+    )
+    .await?;
+
+    let mut status_code = 1;
+    for ev in &events {
+        match ev {
+            protocol::Event::Queued { job_id, .. } => {
+                if !job_id.is_empty() {
+                    eprintln!("memex: queued {job_id}");
+                }
+            }
+            protocol::Event::Error { code, message, .. } => {
+                eprintln!("memex ingest error ({code}): {message}");
+            }
+            protocol::Event::Done { status } => {
+                status_code = *status;
+            }
+            _ => {}
+        }
+    }
+    Ok(status_code)
+}
+
 /// Async core of the ingest client. Callable concurrently from one runtime.
 /// Returns exit code (0 = queued, 1 = error/skipped).
 pub async fn ingest_async(
@@ -323,6 +373,7 @@ pub async fn ingest_async(
         "gemini-cli" => protocol::TranscriptAgent::GeminiCli,
         "openclaw" => protocol::TranscriptAgent::OpenClaw,
         "hermes" => protocol::TranscriptAgent::Hermes,
+        "opencode" => protocol::TranscriptAgent::OpenCode,
         other => anyhow::bail!("unknown agent: {other}"),
     };
     let events = client::request(
