@@ -140,7 +140,7 @@ const FILE_AGENTS: &[FileAgentSpec] = &[
     FileAgentSpec {
         target: InstallTarget::ClaudeCode,
         agent_dir: ".claude",
-        hooks_file: "hooks.json",
+        hooks_file: "settings.json",
         template: CLAUDE_CODE_HOOKS,
         events: &["SessionStart", "SessionEnd"],
     },
@@ -587,7 +587,7 @@ mod tests {
         let home = fake_home();
         run(home.path(), &[InstallTarget::ClaudeCode], false).unwrap();
 
-        let hooks_file = home.path().join(".claude/hooks.json");
+        let hooks_file = home.path().join(".claude/settings.json");
         assert!(hooks_file.exists());
         let v: Value = serde_json::from_str(&fs::read_to_string(&hooks_file).unwrap()).unwrap();
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -741,7 +741,7 @@ mod tests {
         let home = fake_home();
 
         // Seed an old-style memex entry that should get replaced.
-        let hooks_file = home.path().join(".claude/hooks.json");
+        let hooks_file = home.path().join(".claude/settings.json");
         let stale = json!({
             "hooks": {
                 "SessionEnd": [
@@ -785,7 +785,7 @@ mod tests {
     fn dry_run_does_not_write() {
         let home = fake_home();
         run(home.path(), &[InstallTarget::ClaudeCode], true).unwrap();
-        assert!(!home.path().join(".claude/hooks.json").exists());
+        assert!(!home.path().join(".claude/settings.json").exists());
         assert!(
             !home
                 .path()
@@ -816,7 +816,7 @@ mod tests {
         run(home.path(), &[InstallTarget::ClaudeCode], false).unwrap();
 
         // Add an unrelated user-owned hook the uninstall must NOT touch.
-        let hooks_file = home.path().join(".claude/hooks.json");
+        let hooks_file = home.path().join(".claude/settings.json");
         let mut v: Value = serde_json::from_str(&fs::read_to_string(&hooks_file).unwrap()).unwrap();
         let session_end = v["hooks"]["SessionEnd"].as_array_mut().unwrap();
         session_end.push(json!({
@@ -848,7 +848,7 @@ mod tests {
         run_uninstall(home.path(), &[InstallTarget::ClaudeCode], false, false).unwrap();
 
         let v: Value = serde_json::from_str(
-            &fs::read_to_string(home.path().join(".claude/hooks.json")).unwrap(),
+            &fs::read_to_string(home.path().join(".claude/settings.json")).unwrap(),
         )
         .unwrap();
         // No user-owned entries existed, so .hooks should be gone (not an empty object).
@@ -868,11 +868,40 @@ mod tests {
     fn uninstall_dry_run_does_not_write() {
         let home = fake_home();
         run(home.path(), &[InstallTarget::ClaudeCode], false).unwrap();
-        let before = fs::read_to_string(home.path().join(".claude/hooks.json")).unwrap();
+        let before = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
         run_uninstall(home.path(), &[InstallTarget::ClaudeCode], true, false).unwrap();
-        let after = fs::read_to_string(home.path().join(".claude/hooks.json")).unwrap();
+        let after = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
         assert_eq!(before, after, "dry-run should not have rewritten hooks");
         assert!(home.path().join(".claude/skills/memex-query").exists());
+    }
+
+    #[test]
+    fn install_preserves_unrelated_settings_keys() {
+        let home = fake_home();
+        let settings = home.path().join(".claude/settings.json");
+        let seeded = json!({
+            "permissions": {"defaultMode": "auto", "allow": ["Bash(git *)"]},
+            "enabledPlugins": {"superpowers@official": true},
+            "statusLine": {"type": "command", "command": "/bin/echo hi"}
+        });
+        fs::write(&settings, serde_json::to_string_pretty(&seeded).unwrap()).unwrap();
+
+        run(home.path(), &[InstallTarget::ClaudeCode], false).unwrap();
+
+        let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["permissions"], seeded["permissions"]);
+        assert_eq!(v["enabledPlugins"], seeded["enabledPlugins"]);
+        assert_eq!(v["statusLine"], seeded["statusLine"]);
+        let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("memex daemon"));
+
+        run_uninstall(home.path(), &[InstallTarget::ClaudeCode], false, false).unwrap();
+
+        let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["permissions"], seeded["permissions"]);
+        assert_eq!(v["enabledPlugins"], seeded["enabledPlugins"]);
+        assert_eq!(v["statusLine"], seeded["statusLine"]);
+        assert!(v.get("hooks").is_none(), "hooks should be stripped, got {v}");
     }
 
     #[test]
