@@ -31,6 +31,14 @@ impl Memex {
     /// - Dangling wiki links: `[[page-stem]]` references to pages that don't exist
     /// - Missing cross-references: body mentions an existing page title/stem without `[[link]]`
     pub fn lint(&self) -> Result<LintReport> {
+        self.lint_with_current_model(CURRENT_MODEL_NAME)
+    }
+
+    /// Detection variant that lets the caller specify which model name is
+    /// "current". Production callers want the constant; tests inject the
+    /// mock embedder's name so the post-fix detection check sees the
+    /// stamp move into the matching value without needing the real model.
+    pub(crate) fn lint_with_current_model(&self, current_model_name: &str) -> Result<LintReport> {
         let wiki_dir = self.wiki_dir();
         let mut issues = Vec::new();
 
@@ -107,13 +115,14 @@ impl Memex {
         }
 
         // Check: Outdated embeddings — chunks with a model name that differs
-        // from the current model constant.
-        let outdated_models = self.search.outdated_chunk_models(CURRENT_MODEL_NAME)?;
+        // from the caller-supplied "current" name (the constant in prod,
+        // the mock-embedder name under test).
+        let outdated_models = self.search.outdated_chunk_models(current_model_name)?;
         for (old_model, count) in &outdated_models {
             issues.push(LintIssue {
                 kind: LintIssueKind::OutdatedEmbedding,
                 page: format!("{count} chunks"),
-                target: format!("{old_model} => {CURRENT_MODEL_NAME}"),
+                target: format!("{old_model} => {current_model_name}"),
             });
         }
 
@@ -348,16 +357,24 @@ pub(crate) fn is_issue_still_present(
 ///
 /// Link issues (`DanglingLink`, `MissingLink`) are report-only — fixing
 /// them requires LLM judgment and is left to the caller.
+/// `model` is the embedder used by fixes that re-embed pages. Public callers
+/// in production pass `load_default_model()`; tests can inject `MockEmbedder`
+/// to exercise the stamp-update logic without requiring ONNX runtime or the
+/// real model file. The lint comparison uses `model.model_name()` to decide
+/// what "current" means — so `MockEmbedder` + `lint_with_current_model` lets
+/// the whole detect→fix→re-detect cycle run cleanly in environments where
+/// ONNX isn't installed.
 pub(crate) fn apply_fix_inner(
     search: &Db,
     root: &std::path::Path,
     issue: &LintIssue,
+    model: &mut dyn crate::embed::Embedder,
 ) -> crate::error::Result<()> {
     match issue.kind {
         LintIssueKind::StaleIndex | LintIssueKind::UntrackedFile => {
-            fix_wiki_reindex(search, root, issue)
+            fix_wiki_reindex(search, root, issue, model)
         }
-        LintIssueKind::OutdatedEmbedding => fix_outdated_embedding(search, root),
+        LintIssueKind::OutdatedEmbedding => fix_outdated_embedding(search, root, model),
         LintIssueKind::MissingFile => fix_missing_file(search, issue),
         LintIssueKind::RawHashMismatch => fix_raw_hash_mismatch(search, root, issue),
         // Link issues are LLM-judgment only; never auto-fixed by lint.
@@ -372,6 +389,7 @@ fn fix_wiki_reindex(
     search: &Db,
     root: &std::path::Path,
     issue: &LintIssue,
+    model: &mut dyn crate::embed::Embedder,
 ) -> crate::error::Result<()> {
     let full_path = root.join(&issue.target);
     let content = std::fs::read_to_string(&full_path)?;
@@ -396,21 +414,23 @@ fn fix_wiki_reindex(
         )
     })?;
     search.set_document_collections_by_path("wiki", &issue.target, &collections)?;
-    let mut model = crate::retrieval::load_default_model()?;
     // embed_document atomically stamps embed_model + embedded_at by
     // hash inside its own tx. Without that stamping (an earlier shape
     // had a separate UPDATE in this fn) a freshly-fixed row stayed at
     // its old embed_model and lint kept re-flagging it.
-    crate::retrieval::embed_document(search, &result.body_hash, &title, &body, &mut model)?;
+    crate::retrieval::embed_document(search, &result.body_hash, &title, &body, model)?;
     Ok(())
 }
 
 /// Re-embed every documents row whose `embed_model` differs from the
 /// current model. Iterates by hash since `chunks` are hash-keyed; one
 /// embed_document call refreshes every row that shared the body.
-fn fix_outdated_embedding(search: &Db, root: &std::path::Path) -> crate::error::Result<()> {
-    let mut model = crate::retrieval::load_default_model()?;
-    let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
+fn fix_outdated_embedding(
+    search: &Db,
+    root: &std::path::Path,
+    model: &mut dyn crate::embed::Embedder,
+) -> crate::error::Result<()> {
+    let outdated = search.outdated_chunk_hashes(model.model_name())?;
     for hash in &outdated {
         // Body lives on disk; locate the page via documents.path.
         let path = match search.path_by_hash(hash)? {
@@ -428,7 +448,7 @@ fn fix_outdated_embedding(search: &Db, root: &std::path::Path) -> crate::error::
         // embed_document stamps every row with this hash, so dedup'd
         // raw rows all get refreshed in one shot and the loop
         // terminates instead of re-flagging on the next pass.
-        crate::retrieval::embed_document(search, hash, &title, &body, &mut model)?;
+        crate::retrieval::embed_document(search, hash, &title, &body, model)?;
     }
     Ok(())
 }
@@ -1067,8 +1087,16 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             .unwrap();
         set_embed_model(search, "wiki/stale.md", "old-model");
 
+        // Use a MockEmbedder so the test exercises the stamp-update logic
+        // without requiring the real ONNX runtime + 300MB model. The lint
+        // detection compares against the mock embedder's `model_name()`,
+        // and `apply_fix_inner` re-embeds using the same mock — so the
+        // post-fix stamp matches and the issue clears.
+        let mut model = crate::embed::MockEmbedder;
+        let current = crate::embed::Embedder::model_name(&model).to_string();
+
         // Pre-fix: lint reports OutdatedEmbedding.
-        let pre = memex.lint().unwrap();
+        let pre = memex.lint_with_current_model(&current).unwrap();
         assert!(
             pre.issues
                 .iter()
@@ -1080,12 +1108,12 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         let issue = crate::types::LintIssue {
             kind: crate::types::LintIssueKind::OutdatedEmbedding,
             page: "wiki/stale.md".into(),
-            target: format!("old-model -> {}", crate::embed::CURRENT_MODEL_NAME),
+            target: format!("old-model -> {current}"),
         };
-        crate::lint::apply_fix_inner(memex.search(), &root, &issue).unwrap();
+        crate::lint::apply_fix_inner(memex.search(), &root, &issue, &mut model).unwrap();
 
         // Post-fix: embed_model is now current, lint must NOT re-flag.
-        let post = memex.lint().unwrap();
+        let post = memex.lint_with_current_model(&current).unwrap();
         let still_outdated: Vec<_> = post
             .issues
             .iter()
@@ -1284,7 +1312,10 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             page: "ghost".into(),
             target: "wiki/ghost.md".into(),
         };
-        crate::lint::apply_fix_inner(memex.search(), &root, &issue).unwrap();
+        // MissingFile fix doesn't embed, but the signature still requires
+        // an Embedder. MockEmbedder satisfies the bound without loading ONNX.
+        let mut model = crate::embed::MockEmbedder;
+        crate::lint::apply_fix_inner(memex.search(), &root, &issue, &mut model).unwrap();
         assert!(
             memex
                 .search()
@@ -1401,7 +1432,10 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             page: stale_rel.clone(),
             target: canonical_hash.clone(),
         };
-        crate::lint::apply_fix_inner(memex.search(), memex.root(), &issue).unwrap();
+        // RawHashMismatch fix doesn't embed, but the signature requires
+        // an Embedder; MockEmbedder keeps the test ONNX-free.
+        let mut model = crate::embed::MockEmbedder;
+        crate::lint::apply_fix_inner(memex.search(), memex.root(), &issue, &mut model).unwrap();
 
         // Stale file removed; canonical file untouched.
         assert!(!stale_path.exists(), "stale duplicate file removed");

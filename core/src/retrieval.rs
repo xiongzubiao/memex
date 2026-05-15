@@ -532,11 +532,11 @@ pub fn embed_document(
         // and `outdated_chunk_hashes` filters NULL out, so a future
         // model bump won't see this doc as outdated. Stamping by hash
         // is correct because chunks are hash-keyed: every row pointing
-        // at this hash shares the same chunks generated under the
-        // current model.
+        // at this hash shares the same chunks generated under this
+        // embedder.
         tx.execute(
             "UPDATE documents SET embed_model=?1, embedded_at=?2 WHERE hash=?3",
-            rusqlite::params![crate::embed::CURRENT_MODEL_NAME, &now, hash],
+            rusqlite::params![model.model_name(), &now, hash],
         )?;
         Ok(())
     })
@@ -824,9 +824,13 @@ mod tests {
 
         // Act: embed_document.
         let mut model = crate::embed::MockEmbedder;
+        let expected = crate::embed::Embedder::model_name(&model).to_string();
         crate::retrieval::embed_document(search, &hash, "Atomic", body, &mut model).unwrap();
 
-        // Post-state: embed_model is now CURRENT_MODEL_NAME.
+        // Post-state: embed_model now matches the embedder's `model_name()`.
+        // (Previously this stamped the global CURRENT_MODEL_NAME regardless
+        // of the embedder passed in, which made the lint detect→fix→re-detect
+        // cycle untestable without ONNX.)
         let post: Option<String> = search
             .with_connection(|conn| {
                 Ok(conn
@@ -840,8 +844,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             post.as_deref(),
-            Some(crate::embed::CURRENT_MODEL_NAME),
-            "embed_document must atomically stamp embed_model"
+            Some(expected.as_str()),
+            "embed_document must atomically stamp embed_model from model.model_name()"
         );
     }
 

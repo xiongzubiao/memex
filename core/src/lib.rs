@@ -222,7 +222,26 @@ impl Memex {
         if !lint::is_issue_still_present(&self.search, &self.root, issue)? {
             return Ok(FixOutcome::Stale);
         }
-        lint::apply_fix_inner(&self.search, &self.root, issue)?;
+        // Load the embedder only after the stale check: a `Stale` outcome
+        // short-circuits before any ONNX init, which lets no-op fix paths
+        // run without requiring the runtime.
+        let mut model = crate::retrieval::load_default_model()?;
+        self.apply_fix_with(issue, &mut model)
+    }
+
+    /// Writer-handle fix with an injected embedder. Tests use this with
+    /// `MockEmbedder` to exercise the fix path without ONNX; production
+    /// callers go through `apply_fix` which loads the default model.
+    pub fn apply_fix_with(
+        &self,
+        issue: &types::LintIssue,
+        model: &mut dyn embed::Embedder,
+    ) -> error::Result<FixOutcome> {
+        self.require_writer()?;
+        if !lint::is_issue_still_present(&self.search, &self.root, issue)? {
+            return Ok(FixOutcome::Stale);
+        }
+        lint::apply_fix_inner(&self.search, &self.root, issue, model)?;
         Ok(FixOutcome::Applied)
     }
 
@@ -236,6 +255,42 @@ impl Memex {
             return self.apply_fix(issue);
         }
 
+        let (_guard, fresh) = self.acquire_writer_lock_and_fresh_db()?;
+
+        if !lint::is_issue_still_present(&fresh, &self.root, issue)? {
+            return Ok(FixOutcome::Stale);
+        }
+        // Lazy model load — see the comment on `apply_fix` for why.
+        let mut model = crate::retrieval::load_default_model()?;
+        lint::apply_fix_inner(&fresh, &self.root, issue, &mut model)?;
+        Ok(FixOutcome::Applied)
+    }
+
+    /// Reader-handle fix with an injected embedder. Test-mode counterpart to
+    /// `apply_fix_locked` — same lock + fresh-connection semantics, no model
+    /// load. Production code calls `apply_fix_locked`.
+    pub fn apply_fix_locked_with(
+        &self,
+        issue: &types::LintIssue,
+        model: &mut dyn embed::Embedder,
+    ) -> error::Result<FixOutcome> {
+        if self.is_writer() {
+            return self.apply_fix_with(issue, model);
+        }
+
+        let (_guard, fresh) = self.acquire_writer_lock_and_fresh_db()?;
+
+        if !lint::is_issue_still_present(&fresh, &self.root, issue)? {
+            return Ok(FixOutcome::Stale);
+        }
+        lint::apply_fix_inner(&fresh, &self.root, issue, model)?;
+        Ok(FixOutcome::Applied)
+    }
+
+    /// Shared by `apply_fix_locked` and `apply_fix_locked_with`: take the
+    /// writer flock and open a fresh DB connection so we see committed state
+    /// instead of the reader's pinned WAL snapshot.
+    fn acquire_writer_lock_and_fresh_db(&self) -> error::Result<(WriterLock, Db)> {
         let lock_path = self.root.join(".lock");
         let lock_file =
             storage::try_acquire_lock(&lock_path, self.config.lock_timeout).map_err(|e| match e
@@ -250,17 +305,9 @@ impl Memex {
                     source: e,
                 },
             })?;
-        let _guard = WriterLock { file: lock_file };
-
-        // Fresh connection — sees the latest committed state, not the reader's
-        // pinned WAL snapshot from process start.
+        let guard = WriterLock { file: lock_file };
         let fresh = search::Db::open(&self.root.join(INDEX_DB_NAME))?;
-
-        if !lint::is_issue_still_present(&fresh, &self.root, issue)? {
-            return Ok(FixOutcome::Stale);
-        }
-        lint::apply_fix_inner(&fresh, &self.root, issue)?;
-        Ok(FixOutcome::Applied)
+        Ok((guard, fresh))
     }
 }
 
