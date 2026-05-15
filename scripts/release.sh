@@ -54,6 +54,23 @@ for (const k of Object.keys(p.optionalDependencies || {})) {
 fs.writeFileSync('plugin/package.json', JSON.stringify(p, null, 2) + '\n');
 "
 
+# Per-agent plugin manifests carry a display-only `version` field surfaced
+# in each agent's UI (Claude Code, Codex, Cursor, OpenClaw). Track the
+# release version so the UI doesn't show a stale value.
+node -e "
+const fs = require('fs');
+for (const f of [
+  'plugin/.claude-plugin/plugin.json',
+  'plugin/.codex-plugin/plugin.json',
+  'plugin/.cursor-plugin/plugin.json',
+  'plugin/.openclaw-plugin/package.json',
+]) {
+  const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+  j.version = '${NEW}';
+  fs.writeFileSync(f, JSON.stringify(j, null, 2) + '\n');
+}
+"
+
 # Refresh Cargo.lock so committed lockfile matches the new versions.
 # Without this, every release commit produces a one-line lockfile drift on
 # the next build that has to be cleaned up by hand.

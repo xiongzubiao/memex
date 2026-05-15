@@ -12,9 +12,9 @@
 //!   4. `_calculate_distances_between_sentence_groups`:
 //!      `distance[i] = 1 - similarity(combined[i], combined[i+1])`.
 //!   5. `_build_node_chunks`:
-//!        threshold = numpy.percentile(distances, percentile_threshold)
-//!        breakpoints = [i for i, d in enumerate(distances) if d > threshold]
-//!        slice sentences at each breakpoint.
+//!      threshold = numpy.percentile(distances, percentile_threshold)
+//!      breakpoints = [i for i, d in enumerate(distances) if d > threshold]
+//!      slice sentences at each breakpoint.
 //!
 //! `embed_model.similarity` defaults to cosine similarity in LlamaIndex.
 
@@ -89,13 +89,13 @@ fn build_sentence_groups(sentences: &[&str], buffer_size: usize) -> Vec<String> 
     for i in 0..n {
         let mut combined = String::new();
         let lo = i.saturating_sub(buffer_size);
-        for j in lo..i {
-            combined.push_str(sentences[j]);
+        for s in &sentences[lo..i] {
+            combined.push_str(s);
         }
         combined.push_str(sentences[i]);
         let hi = (i + 1 + buffer_size).min(n);
-        for j in (i + 1)..hi {
-            combined.push_str(sentences[j]);
+        for s in &sentences[(i + 1)..hi] {
+            combined.push_str(s);
         }
         out.push(combined);
     }
@@ -152,7 +152,11 @@ fn build_node_chunks(
         // Group: sentences[start_idx ..= bp]. Pos = first sentence's
         // start; end = next sentence's start (or text_len if last).
         let pos = spans[start_idx].0;
-        let end = if bp + 1 < n { spans[bp + 1].0 } else { text_len };
+        let end = if bp + 1 < n {
+            spans[bp + 1].0
+        } else {
+            text_len
+        };
         if end > pos {
             chunks.push(SemanticChunk {
                 pos,
@@ -363,10 +367,7 @@ mod tests {
             "Cats purr loudly.Cars are fast.Cars need fuel.".to_string(),
             vec![0.0, 1.0],
         );
-        map.insert(
-            "Cars are fast.Cars need fuel.".to_string(),
-            vec![0.0, 1.0],
-        );
+        map.insert("Cars are fast.Cars need fuel.".to_string(), vec![0.0, 1.0]);
         let mut emb = StubEmbedder { map };
         let chunks =
             build_semantic_nodes_from_text(text, &mut emb, 1, 95.0, whole_text_splitter).unwrap();

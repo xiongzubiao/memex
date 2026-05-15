@@ -14,7 +14,6 @@
 //!
 //! For those, use `e2e_harness::E2EHarness` instead.
 
-
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -266,7 +265,9 @@ impl IntegrationHarness {
         let events = self.send(&req).await?;
         for ev in &events {
             if let Event::SourceAdded { docid } = ev {
-                return Ok(SourceAddResp { docid: docid.clone() });
+                return Ok(SourceAddResp {
+                    docid: docid.clone(),
+                });
             }
         }
         Err(format!("source_add returned no SourceAdded event: {events:?}").into())
@@ -328,7 +329,9 @@ impl IntegrationHarness {
         let events = self.send(&req).await?;
         for ev in &events {
             if let Event::Written { docid, .. } = ev {
-                return Ok(WriteResp { docid: docid.clone() });
+                return Ok(WriteResp {
+                    docid: docid.clone(),
+                });
             }
         }
         Err(std::io::Error::other(format!(

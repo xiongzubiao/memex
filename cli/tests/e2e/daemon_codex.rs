@@ -16,7 +16,8 @@ fn codex_synth_returns_answer_with_citation() {
         .env("MEMEX__DAEMON__WORKER__MAX_COUNT", "1")
         .start();
 
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",
@@ -56,7 +57,8 @@ fn codex_auth_fail_surfaces_backend_unavailable_with_code() {
         .env("MOCK_CODEX_MODE", "auth_fail")
         .start();
 
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",
@@ -87,7 +89,8 @@ fn codex_crash_retries_then_surfaces_subprocess_crashed() {
         .env("MOCK_CODEX_MODE", "crash")
         .start();
 
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",

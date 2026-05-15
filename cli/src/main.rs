@@ -28,6 +28,9 @@ enum Agent {
     /// Hermes Agent sessions (~/.hermes/sessions/session_*.json)
     #[value(name = "hermes")]
     Hermes,
+    /// OpenCode sessions (SQLite at ~/.local/share/opencode/opencode.db)
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 impl Agent {
@@ -38,6 +41,7 @@ impl Agent {
             Agent::GeminiCli => "gemini-cli",
             Agent::OpenClaw => "openclaw",
             Agent::Hermes => "hermes",
+            Agent::OpenCode => "opencode",
         }
     }
 }
@@ -51,6 +55,7 @@ impl From<&Agent> for memex_cli::daemon::protocol::TranscriptAgent {
             Agent::GeminiCli => P::GeminiCli,
             Agent::OpenClaw => P::OpenClaw,
             Agent::Hermes => P::Hermes,
+            Agent::OpenCode => P::OpenCode,
         }
     }
 }
@@ -155,18 +160,25 @@ enum Commands {
         /// the original on-disk path for transcripts).
         #[arg(long)]
         source: Option<String>,
+        /// OpenCode session id. Use with `--agent opencode`: memex reads the
+        /// session from `~/.local/share/opencode/opencode.db`.
+        #[arg(long)]
+        session: Option<String>,
         /// Collections to associate with the ingested content
         #[arg(long = "collection")]
         collections: Vec<String>,
     },
     /// Bulk-ingest historical sessions via the daemon
     Backfill {
-        /// Agent type (claude-code, codex, gemini-cli)
+        /// Agent that produced the sessions to import
         agent: Agent,
         /// Restrict ingestion to one or more collections
         #[arg(long = "collection")]
         collections: Vec<String>,
-        /// Override discovery: ingest every *.jsonl under this directory (recursive)
+        /// Override default session discovery. For file-based agents (claude-code,
+        /// codex, gemini-cli, openclaw, hermes) this is a directory walked
+        /// recursively for the agent's session-file pattern. For opencode this
+        /// is the path to an alternative SQLite database file.
         #[arg(long)]
         path: Option<std::path::PathBuf>,
     },
@@ -179,8 +191,9 @@ enum Commands {
         #[command(subcommand)]
         action: SourceAction,
     },
-    /// Register memex hooks (and Claude Code skills) with detected agent CLIs.
-    /// Auto-detects `~/.claude`, `~/.codex`, `~/.gemini`; idempotent.
+    /// Register memex hooks and skills with detected agent CLIs. Auto-detects
+    /// `~/.claude`, `~/.codex`, `~/.gemini`, `~/.openclaw`, `~/.hermes`, and
+    /// `~/.config/opencode`. Idempotent.
     Install {
         /// Restrict install to specific agents (default: all detected).
         #[arg(long = "agent")]
@@ -214,9 +227,13 @@ enum Commands {
 enum HookAction {
     /// Read a session-end hook payload from stdin, extract `transcript_path`,
     /// ingest it as the given agent. Replaces the prior node shim scripts.
+    /// For OpenCode, pass `--session <id>` instead of piping a stdin payload.
     Ingest {
         /// Agent that produced the transcript.
         agent: Agent,
+        /// OpenCode session id (required when agent is `opencode`; ignored otherwise).
+        #[arg(long)]
+        session: Option<String>,
     },
 }
 
@@ -1031,6 +1048,14 @@ fn discover_session_files(
     agent: &Agent,
     root_override: Option<&std::path::Path>,
 ) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    // OpenCode stores everything in one SQLite DB — no per-session files to
+    // glob. Backfill enumerates session ids via `discover_opencode_sessions`
+    // and routes through `ingest_opencode_async` instead of this function.
+    if matches!(agent, Agent::OpenCode) {
+        anyhow::bail!(
+            "OpenCode sessions live in SQLite, not files — backfill should dispatch to the OpenCode path"
+        );
+    }
     let root = if let Some(p) = root_override {
         if !p.is_dir() {
             anyhow::bail!("{} is not a directory", p.display());
@@ -1045,6 +1070,7 @@ fn discover_session_files(
             Agent::GeminiCli => home.join(".gemini"),
             Agent::OpenClaw => home.join(".openclaw"),
             Agent::Hermes => home.join(".hermes"),
+            Agent::OpenCode => unreachable!("guarded above"),
         }
     };
     // Default discovery uses the agent's well-known directory layout. When
@@ -1060,6 +1086,7 @@ fn discover_session_files(
         (Agent::ClaudeCode | Agent::Codex | Agent::OpenClaw, true) => "**/*.jsonl",
         (Agent::GeminiCli, true) => "**/session-*.json*",
         (Agent::Hermes, true) => "**/session_*.json",
+        (Agent::OpenCode, _) => unreachable!("guarded above"),
     };
     let pattern = root.join(sub);
     let files: Vec<std::path::PathBuf> = glob::glob(&pattern.to_string_lossy())
@@ -1095,6 +1122,7 @@ fn run_ingest(
     agent: Option<&Agent>,
     path: Option<&std::path::Path>,
     source: Option<&str>,
+    session: Option<&str>,
     collections: &[String],
     quiet: bool,
 ) -> anyhow::Result<()> {
@@ -1106,6 +1134,32 @@ fn run_ingest(
     } else {
         collections.to_vec()
     };
+
+    // OpenCode is SQLite-backed: extract canonical envelope here on the CLI
+    // side, ship as TranscriptInline so the daemon code path stays uniform.
+    if let (Some(Agent::OpenCode), Some(sid)) = (agent, session) {
+        if path.is_some() || source.is_some() {
+            anyhow::bail!(
+                "--agent opencode --session ID does not take a path or --source; got conflicting flags"
+            );
+        }
+        let db = opencode_db_path()?;
+        let envelope = memex_core::transcript::extract_opencode_session(&db, sid).map_err(|e| {
+            anyhow::anyhow!("read OpenCode session {sid} from {}: {e}", db.display())
+        })?;
+        let request = memex_cli::daemon::protocol::Request::Ingest {
+            source: memex_cli::daemon::protocol::IngestSource::TranscriptInline {
+                content: envelope,
+                agent: memex_cli::daemon::protocol::TranscriptAgent::OpenCode,
+                source_label: format!("opencode://session/{sid}"),
+            },
+            collections,
+        };
+        return drive_ingest_request(request, quiet);
+    }
+    if session.is_some() {
+        anyhow::bail!("--session is only valid with --agent opencode");
+    }
 
     let request = match (agent, path, source) {
         // Transcript mode: explicit --agent + positional path
@@ -1191,6 +1245,16 @@ fn run_ingest(
         ),
     };
 
+    drive_ingest_request(request, quiet)
+}
+
+/// Submit a prebuilt Ingest request to the daemon and translate events to a
+/// terminal exit code. Extracted so the OpenCode (SQLite-fed) and the
+/// path/stdin paths share the same status-handling tail.
+fn drive_ingest_request(
+    request: memex_cli::daemon::protocol::Request,
+    quiet: bool,
+) -> anyhow::Result<()> {
     let events = send_to_daemon(request, 5)?;
     let mut exit_code = 0;
     for ev in &events {
@@ -1203,10 +1267,8 @@ fn run_ingest(
                 eprintln!("ingest error ({code}): {message}");
                 exit_code = *status;
             }
-            memex_cli::daemon::protocol::Event::Stored { wiki_pages, .. } => {
-                if !quiet {
-                    println!("stored: {} pages", wiki_pages.len());
-                }
+            memex_cli::daemon::protocol::Event::Stored { wiki_pages, .. } if !quiet => {
+                println!("stored: {} pages", wiki_pages.len());
             }
             memex_cli::daemon::protocol::Event::Done { status } if *status != 0 => {
                 exit_code = *status;
@@ -1220,6 +1282,13 @@ fn run_ingest(
     Ok(())
 }
 
+/// Default OpenCode SQLite path, `~/.local/share/opencode/opencode.db`.
+fn opencode_db_path() -> anyhow::Result<std::path::PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    Ok(home.join(".local/share/opencode/opencode.db"))
+}
+
 /// Discover session files for an agent (or a user-supplied directory) and
 /// dispatch ingestion to the daemon. All sessions are fired concurrently;
 /// the daemon's worker pool (`daemon.worker.max_count`) caps actual
@@ -1229,6 +1298,9 @@ fn run_backfill(
     collections: &[String],
     path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    if matches!(agent, Agent::OpenCode) {
+        return run_backfill_opencode(collections, path);
+    }
     let session_files = discover_session_files(agent, path)?;
     if session_files.is_empty() {
         println!("No session files found");
@@ -1278,6 +1350,77 @@ fn run_backfill(
                 Ok((_, Ok(_))) => skipped += 1,
                 Ok((path_str, Err(e))) => {
                     eprintln!("error: {path_str}: {e}");
+                    errors += 1;
+                }
+                Err(e) => {
+                    eprintln!("task join error: {e}");
+                    errors += 1;
+                }
+            }
+        }
+        (queued, skipped, errors)
+    });
+
+    println!("Queued {queued} (skipped {skipped}, errors {errors}) of {total} sessions");
+    Ok(())
+}
+
+/// OpenCode backfill: enumerate session ids from the SQLite DB and dispatch
+/// each through `ingest_opencode_async`. `path`, when supplied, overrides the
+/// default `~/.local/share/opencode/opencode.db` location.
+fn run_backfill_opencode(
+    collections: &[String],
+    path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let db_path = match path {
+        Some(p) => p.to_path_buf(),
+        None => opencode_db_path()?,
+    };
+    if !db_path.is_file() {
+        anyhow::bail!("OpenCode database not found: {}", db_path.display());
+    }
+    let session_ids = memex_core::transcript::list_opencode_sessions(&db_path)
+        .map_err(|e| anyhow::anyhow!("list OpenCode sessions: {e}"))?;
+    if session_ids.is_empty() {
+        println!("No OpenCode sessions found in {}", db_path.display());
+        return Ok(());
+    }
+    println!(
+        "Discovered {} OpenCode sessions; dispatching to daemon",
+        session_ids.len()
+    );
+
+    let collections = default_ingest_collections(collections);
+    let total = session_ids.len();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let (queued, skipped, errors) = rt.block_on(async move {
+        if let Err(e) = memex_cli::daemon::warm_up().await {
+            eprintln!("warning: daemon pre-warm failed: {e}");
+        }
+
+        let mut handles = Vec::with_capacity(total);
+        for sid in session_ids {
+            let collections = collections.clone();
+            let db = db_path.clone();
+            handles.push(tokio::spawn(async move {
+                let result = memex_cli::daemon::ingest_opencode_async(&sid, &db, collections).await;
+                (sid, result)
+            }));
+        }
+
+        let mut queued = 0u32;
+        let mut skipped = 0u32;
+        let mut errors = 0u32;
+        for h in handles {
+            match h.await {
+                Ok((sid, Ok(0))) => {
+                    queued += 1;
+                    eprintln!("queued: {sid}");
+                }
+                Ok((_, Ok(_))) => skipped += 1,
+                Ok((sid, Err(e))) => {
+                    eprintln!("error: {sid}: {e}");
                     errors += 1;
                 }
                 Err(e) => {
@@ -1422,7 +1565,9 @@ fn run_doctor() -> i32 {
     }
 
     // 4. Agent CLIs (informational only).
-    for tool in ["claude", "codex", "gemini", "openclaw", "hermes"] {
+    for tool in [
+        "claude", "codex", "gemini", "openclaw", "hermes", "opencode",
+    ] {
         let on_path = std::process::Command::new("which")
             .arg(tool)
             .output()
@@ -1468,7 +1613,10 @@ fn print_check(name: &str, ok: bool, detail: &str, had_fail: &mut bool) {
 /// degrades search quality. Skipped for `doctor` (it reports the same
 /// thing explicitly with PASS/FAIL output).
 fn warn_if_postinstall_incomplete(cmd: &Commands) {
-    if matches!(cmd, Commands::Doctor | Commands::Hook { .. } | Commands::Uninstall { .. }) {
+    if matches!(
+        cmd,
+        Commands::Doctor | Commands::Hook { .. } | Commands::Uninstall { .. }
+    ) {
         return;
     }
     let Ok(model) = memex_core::retrieval::default_model_path() else {
@@ -1558,11 +1706,13 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             agent,
             path,
             source,
+            session,
             collections,
         } => run_ingest(
             agent.as_ref(),
             path.as_deref(),
             source.as_deref(),
+            session.as_deref(),
             &collections,
             false,
         ),
@@ -1593,9 +1743,13 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             memex_cli::install::run(&home, &agents, dry_run)
         }
         Commands::Hook { action } => match action {
-            HookAction::Ingest { agent } => run_hook_ingest(&agent),
+            HookAction::Ingest { agent, session } => run_hook_ingest(&agent, session.as_deref()),
         },
-        Commands::Uninstall { agents, dry_run, purge } => {
+        Commands::Uninstall {
+            agents,
+            dry_run,
+            purge,
+        } => {
             let home = memex_cli::install::home_dir()?;
             memex_cli::install::run_uninstall(&home, &agents, dry_run, purge)
         }
@@ -1607,17 +1761,35 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
 /// the hook returns immediately rather than holding the agent's session-end
 /// open for the EXTRACT+MERGE pipeline. Mirrors the Python/JS gateway hook
 /// fire-and-forget pattern.
-fn run_hook_ingest(agent: &Agent) -> anyhow::Result<()> {
+fn run_hook_ingest(agent: &Agent, session: Option<&str>) -> anyhow::Result<()> {
     use std::process::{Command, Stdio};
 
-    let Some(path) = memex_cli::hook::read_transcript_path()? else {
-        return Ok(()); // MEMEX_INTERNAL=1 short-circuit
-    };
+    if std::env::var("MEMEX_INTERNAL").as_deref() == Ok("1") {
+        return Ok(());
+    }
     let memex_bin = std::env::current_exe()
         .map_err(|e| anyhow::anyhow!("locate self for fire-and-forget spawn: {e}"))?;
     let mut cmd = Command::new(&memex_bin);
-    cmd.args(["ingest", "--agent", agent.as_str(), &path])
-        .stdin(Stdio::null())
+
+    match agent {
+        Agent::OpenCode => {
+            // OpenCode plugin passes `--session <id>` (no stdin payload — the
+            // session id is the only piece of information needed; the CLI reads
+            // the rest from SQLite).
+            let sid = session.ok_or_else(|| {
+                anyhow::anyhow!("memex hook ingest opencode requires --session <id>")
+            })?;
+            cmd.args(["ingest", "--agent", "opencode", "--session", sid]);
+        }
+        _ => {
+            let path = match memex_cli::hook::read_transcript_path()? {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            cmd.args(["ingest", "--agent", agent.as_str(), &path]);
+        }
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 

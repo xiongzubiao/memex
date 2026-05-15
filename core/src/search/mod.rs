@@ -150,7 +150,6 @@ impl Db {
         tx.commit().map_err(sqlite_err)?;
         Ok(out)
     }
-
 }
 
 /// Test-only helpers. Kept in their own impl block so production reviewers
@@ -201,9 +200,7 @@ impl Db {
 /// fields. Returns `None` if the page has no valid frontmatter. Summary
 /// is taken from the frontmatter `summary` field if present, otherwise
 /// extracted from the first non-empty body line (truncated to 120 chars).
-pub fn parse_page_for_indexing(
-    content: &str,
-) -> Option<(String, String, String, Vec<String>)> {
+pub fn parse_page_for_indexing(content: &str) -> Option<(String, String, String, Vec<String>)> {
     let (fm, body) = crate::validate::parse_frontmatter(content).ok()?;
     if fm.title.trim().is_empty() {
         return None;

@@ -44,6 +44,7 @@ pub enum TranscriptAgent {
     GeminiCli,
     OpenClaw,
     Hermes,
+    OpenCode,
 }
 
 impl TranscriptAgent {
@@ -54,6 +55,7 @@ impl TranscriptAgent {
             TranscriptAgent::GeminiCli => "gemini-cli",
             TranscriptAgent::OpenClaw => "openclaw",
             TranscriptAgent::Hermes => "hermes",
+            TranscriptAgent::OpenCode => "opencode",
         }
     }
 }
@@ -116,6 +118,7 @@ pub fn summarize_tool_input(tool_name: &str, input: &Value) -> String {
     {
         let path = input
             .get("file_path")
+            .or_else(|| input.get("filePath"))
             .or_else(|| input.get("path"))
             .and_then(Value::as_str)
             .unwrap_or("?");
@@ -848,6 +851,193 @@ pub fn parse_hermes_session(text: &str) -> Result<CleanedTranscript, String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Parser 6: OpenCode  (SQLite — opencode.db with session/message/part tables)
+//
+// OpenCode stores everything in one SQLite database under
+// `~/.local/share/opencode/opencode.db`. There is no per-session file. We
+// therefore (1) extract the session's turns from SQLite into a canonical JSON
+// envelope on the CLI side, then (2) ship the envelope through the existing
+// TranscriptInline ingest path. `parse_opencode_session` is the daemon-side
+// parser that consumes the envelope.
+//
+// Envelope shape (also `OpenCodeEnvelope` below):
+//   {"session_id": "ses_…", "turns": [{"role": "...", "timestamp": "...", "text": "..."}]}
+//
+// Each turn corresponds to one OpenCode message; text + tool-summary parts are
+// concatenated, while `reasoning` and `step-start` parts are dropped.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpenCodeEnvelope {
+    session_id: String,
+    turns: Vec<TranscriptTurn>,
+}
+
+pub fn parse_opencode_session(reader: impl BufRead) -> Result<CleanedTranscript, String> {
+    let envelope: OpenCodeEnvelope = serde_json::from_reader(reader)
+        .map_err(|e| format!("OpenCode envelope parse error: {e}"))?;
+
+    let mut first_user_message = String::new();
+    let mut has_user = false;
+    let mut has_assistant = false;
+    for turn in &envelope.turns {
+        if turn.role == "user" {
+            has_user = true;
+            if first_user_message.is_empty() {
+                first_user_message = turn.text.clone();
+            }
+        } else if turn.role == "assistant" {
+            has_assistant = true;
+        }
+    }
+
+    let filter = classify(has_user, has_assistant, &first_user_message);
+
+    Ok(CleanedTranscript {
+        turns: envelope.turns,
+        session_id: envelope.session_id,
+        agent: "opencode".to_string(),
+        first_user_message,
+        filter,
+    })
+}
+
+/// Read one OpenCode session from `db_path` and render its turns to the
+/// canonical envelope JSON that `parse_opencode_session` consumes. Used by
+/// the CLI's ingest + backfill paths; the daemon never touches SQLite.
+///
+/// Skips `step-start` and `reasoning` parts. Summarises `tool` parts via
+/// `summarize_tool_input` so tool I/O bodies don't leak into the wiki.
+pub fn extract_opencode_session(
+    db_path: &std::path::Path,
+    session_id: &str,
+) -> Result<String, String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open {}: {e}", db_path.display()))?;
+
+    let mut msg_stmt = conn
+        .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created ASC")
+        .map_err(|e| format!("prepare message query: {e}"))?;
+    let msg_rows = msg_stmt
+        .query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("query messages: {e}"))?;
+
+    let mut part_stmt = conn
+        .prepare("SELECT data FROM part WHERE message_id = ?1 ORDER BY time_created ASC")
+        .map_err(|e| format!("prepare part query: {e}"))?;
+
+    let mut turns: Vec<TranscriptTurn> = Vec::new();
+    for msg_row in msg_rows {
+        let (msg_id, msg_data_str) = msg_row.map_err(|e| format!("read message row: {e}"))?;
+        let msg_data: Value = serde_json::from_str(&msg_data_str)
+            .map_err(|e| format!("parse message {msg_id} data: {e}"))?;
+
+        let role = msg_data
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+
+        // OpenCode stores milliseconds since epoch; render as ISO-8601 UTC.
+        let timestamp = msg_data
+            .get("time")
+            .and_then(|t| t.get("created"))
+            .and_then(Value::as_i64)
+            .and_then(|ms| {
+                let secs = ms / 1000;
+                let nanos = ((ms % 1000) * 1_000_000) as u32;
+                chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos)
+                    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            });
+
+        let part_rows = part_stmt
+            .query_map([&msg_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("query parts for {msg_id}: {e}"))?;
+
+        let mut text_parts: Vec<String> = Vec::new();
+        for part_row in part_rows {
+            let part_data_str = part_row.map_err(|e| format!("read part row: {e}"))?;
+            let part: Value = match serde_json::from_str(&part_data_str) {
+                Ok(v) => v,
+                Err(_) => continue, // skip malformed
+            };
+            let ptype = part.get("type").and_then(Value::as_str).unwrap_or("");
+            match ptype {
+                "text" => {
+                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                        let cleaned = strip_tags(t);
+                        let cleaned = cleaned.trim();
+                        if !cleaned.is_empty() {
+                            text_parts.push(cleaned.to_string());
+                        }
+                    }
+                }
+                "tool" => {
+                    let name = part
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    let input = part
+                        .get("state")
+                        .and_then(|s| s.get("input"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let summary = summarize_tool_input(name, &input);
+                    text_parts.push(format!("[Tool: {name} — {summary}]"));
+                }
+                // `reasoning` (internal thinking) and `step-start` (turn boundary
+                // markers) carry no user-visible signal — skip.
+                _ => {}
+            }
+        }
+
+        if text_parts.is_empty() {
+            continue;
+        }
+        turns.push(TranscriptTurn {
+            role,
+            timestamp,
+            text: text_parts.join("\n"),
+        });
+    }
+
+    let envelope = OpenCodeEnvelope {
+        session_id: session_id.to_string(),
+        turns,
+    };
+    serde_json::to_string(&envelope).map_err(|e| format!("serialize OpenCode envelope: {e}"))
+}
+
+/// List every OpenCode session id present in `db_path`. Used by `memex
+/// backfill opencode` to enumerate sessions for ingest.
+pub fn list_opencode_sessions(db_path: &std::path::Path) -> Result<Vec<String>, String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open {}: {e}", db_path.display()))?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM session ORDER BY time_created ASC")
+        .map_err(|e| format!("prepare session list: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("query sessions: {e}"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| format!("read session row: {e}"))?);
+    }
+    Ok(out)
+}
+
 /// Inspect a file's content to determine which agent's transcript format it
 /// matches, if any. Returns None if the file doesn't look like a transcript
 /// (extension mismatch, malformed JSON, no recognizable signature keys).
@@ -922,13 +1112,99 @@ pub fn detect_transcript_agent(path: &std::path::Path) -> Option<TranscriptAgent
 mod tests {
     use super::*;
 
+    /// Build a tiny OpenCode-shaped SQLite DB in a temp dir and return its path.
+    /// Mirrors the production schema columns the parser reads — not the full FK set.
+    fn make_fixture_opencode_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("opencode.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session (id TEXT PRIMARY KEY, time_created INTEGER NOT NULL);
+            CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+            CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+            INSERT INTO session VALUES ('ses_A', 1700000000000);
+            INSERT INTO session VALUES ('ses_B', 1700000100000);
+            INSERT INTO message VALUES ('msg_1', 'ses_A', 1700000000000,
+                '{"role":"user","time":{"created":1700000000000}}');
+            INSERT INTO message VALUES ('msg_2', 'ses_A', 1700000001000,
+                '{"role":"assistant","time":{"created":1700000001000}}');
+            INSERT INTO part VALUES ('prt_1a', 'msg_1', 'ses_A', 1700000000100,
+                '{"type":"text","text":"please read foo.rs"}');
+            INSERT INTO part VALUES ('prt_2a', 'msg_2', 'ses_A', 1700000001100,
+                '{"type":"step-start","snapshot":"x"}');
+            INSERT INTO part VALUES ('prt_2b', 'msg_2', 'ses_A', 1700000001200,
+                '{"type":"reasoning","text":"thinking about reading"}');
+            INSERT INTO part VALUES ('prt_2c', 'msg_2', 'ses_A', 1700000001300,
+                '{"type":"text","text":"on it"}');
+            INSERT INTO part VALUES ('prt_2d', 'msg_2', 'ses_A', 1700000001400,
+                '{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"/repo/foo.rs"}}}');
+            "#,
+        ).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn opencode_extract_and_parse_roundtrip() {
+        let (_d, db) = make_fixture_opencode_db();
+        let env = extract_opencode_session(&db, "ses_A").unwrap();
+        let parsed = parse_opencode_session(env.as_bytes()).unwrap();
+
+        assert_eq!(parsed.session_id, "ses_A");
+        assert_eq!(parsed.agent, "opencode");
+        assert_eq!(parsed.turns.len(), 2);
+        assert_eq!(parsed.filter, SessionFilter::Pass);
+
+        assert_eq!(parsed.turns[0].role, "user");
+        assert_eq!(parsed.turns[0].text, "please read foo.rs");
+        assert_eq!(
+            parsed.turns[0].timestamp.as_deref(),
+            Some("2023-11-14T22:13:20Z"),
+        );
+
+        assert_eq!(parsed.turns[1].role, "assistant");
+        // Assistant turn should: include text part, summarize the tool part with the
+        // camelCase filePath, and SKIP reasoning + step-start parts.
+        let asst = &parsed.turns[1].text;
+        assert!(asst.contains("on it"), "missing text part: {asst}");
+        assert!(
+            asst.contains("[Tool: read — file: /repo/foo.rs]"),
+            "tool summary missing: {asst}"
+        );
+        assert!(!asst.contains("thinking about"), "reasoning leaked: {asst}");
+        assert!(!asst.contains("snapshot"), "step-start leaked: {asst}");
+    }
+
+    #[test]
+    fn opencode_list_sessions_in_creation_order() {
+        let (_d, db) = make_fixture_opencode_db();
+        let s = list_opencode_sessions(&db).unwrap();
+        assert_eq!(s, vec!["ses_A".to_string(), "ses_B".to_string()]);
+    }
+
+    #[test]
+    fn opencode_unknown_session_returns_empty_envelope() {
+        let (_d, db) = make_fixture_opencode_db();
+        let env = extract_opencode_session(&db, "ses_does_not_exist").unwrap();
+        let parsed = parse_opencode_session(env.as_bytes()).unwrap();
+        assert!(parsed.turns.is_empty());
+        // Empty session = non-substantive (no user OR no assistant turns).
+        assert_eq!(parsed.filter, SessionFilter::NonSubstantive);
+    }
+
     #[test]
     fn redact_secrets_redacts_known_patterns() {
         let s = "key sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA bla AKIAABCDEFGHIJKLMNOP after\npassword=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let out = redact_secrets(s);
-        assert!(!out.contains("sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {out}");
+        assert!(
+            !out.contains("sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "got: {out}"
+        );
         assert!(!out.contains("AKIAABCDEFGHIJKLMNOP"), "got: {out}");
-        assert!(!out.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {out}");
+        assert!(
+            !out.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -940,8 +1216,12 @@ mod tests {
             r#"{"type":"user","uuid":"abc","message":{"role":"user","content":"hi"}}
 {"type":"assistant","parentUuid":"abc","message":{"role":"assistant","content":"hello"}}
 "#,
-        ).unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::ClaudeCode));
+        )
+        .unwrap();
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::ClaudeCode)
+        );
     }
 
     #[test]
@@ -952,7 +1232,8 @@ mod tests {
             &path,
             r#"{"event_msg":"started","response_id":"r1"}
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::Codex));
     }
 
@@ -963,8 +1244,12 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"messages": [{"role": "user", "parts": [{"text": "hi"}]}]}"#,
-        ).unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+        )
+        .unwrap();
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::GeminiCli)
+        );
     }
 
     #[test]
@@ -976,8 +1261,12 @@ mod tests {
             r#"{"sessionId":"abc","projectHash":"h","startTime":"t","lastUpdated":"t","kind":"main"}
 {"id":"m1","timestamp":"t","type":"user","content":[{"text":"hi"}]}
 "#,
-        ).unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+        )
+        .unwrap();
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::GeminiCli)
+        );
     }
 
     #[test]
@@ -1022,8 +1311,12 @@ mod tests {
             r#"{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/x"}
 {"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
 "#,
-        ).unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::OpenClaw));
+        )
+        .unwrap();
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::OpenClaw)
+        );
     }
 
     #[test]
@@ -1056,7 +1349,10 @@ mod tests {
             r#"{"session_id":"abc","platform":"cli","model":"gpt-5.4-mini","session_start":"2026-05-13T22:45:45","last_updated":"2026-05-13T22:46:00","message_count":2,"messages":[{"role":"user","content":"hi"}]}"#,
         )
         .unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::Hermes));
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::Hermes)
+        );
     }
 
     #[test]
@@ -1113,7 +1409,10 @@ mod tests {
             r#"{"sessionId":"x","messages":[{"type":"user","content":[{"text":"hi"}]}]}"#,
         )
         .unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::GeminiCli)
+        );
     }
 
     #[test]
@@ -1125,7 +1424,11 @@ mod tests {
 {"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
 "#;
         let parsed = parse_openclaw_session(text).unwrap();
-        assert_eq!(parsed.turns.len(), 1, "only the message record should produce a turn");
+        assert_eq!(
+            parsed.turns.len(),
+            1,
+            "only the message record should produce a turn"
+        );
     }
 
     #[test]

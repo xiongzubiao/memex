@@ -2,7 +2,7 @@
 //! RRF fusion → MIN_SCORE filter. Used by the `memex search` command and by
 //! the daemon's query path.
 
-use crate::embed::{EmbeddingModel, Embedder, catch_unwind_silent, load_model};
+use crate::embed::{Embedder, EmbeddingModel, catch_unwind_silent, load_model};
 use crate::error::Result;
 use crate::search::{self, Db, MIN_SCORE, SearchResult};
 use crate::vector::vector_search_collapsed;
@@ -234,6 +234,7 @@ pub fn hybrid_retrieve_expanded(
 /// `src/store.ts:4131`. Short common tokens like "the", "did", "to"
 /// would contribute uniform noise to chunk scores; dropping them
 /// keeps the signal-bearing nouns and verbs in charge.
+#[allow(clippy::too_many_arguments)] // body cache + retrieval signals are genuinely independent inputs
 fn populate_bodies(
     results: &mut Vec<SearchResult>,
     search: &Db,
@@ -338,10 +339,7 @@ fn populate_bodies(
         let (best_pos, best_len) = if let Some(seq) = r.chunk_seq {
             // Result was retrieved at chunk granularity, so use that
             // specific chunk's bytes rather than re-running a per-chunk pick.
-            chunks
-                .get(seq as usize)
-                .copied()
-                .unwrap_or((0, body.len()))
+            chunks.get(seq as usize).copied().unwrap_or((0, body.len()))
         } else if chunks.is_empty() {
             (0, body.len())
         } else {
@@ -376,11 +374,9 @@ fn populate_bodies(
 fn memex_models_dir() -> Result<PathBuf> {
     dirs::home_dir()
         .map(|h| h.join(".memex/models"))
-        .ok_or_else(|| {
-            crate::error::MemexError::EmbeddingUnavailable {
-                path: PathBuf::from("~/.memex/models"),
-                reason: "cannot resolve home directory ($HOME unset?)".into(),
-            }
+        .ok_or_else(|| crate::error::MemexError::EmbeddingUnavailable {
+            path: PathBuf::from("~/.memex/models"),
+            reason: "cannot resolve home directory ($HOME unset?)".into(),
         })
 }
 
@@ -525,7 +521,9 @@ pub fn embed_document(
         crate::vector::delete_chunks(tx, hash)?;
         for (seq, (chunk, emb)) in chunks.iter().zip(all_embeds.iter()).enumerate() {
             let chunk_text = &body[chunk.pos..chunk.pos + chunk.len];
-            crate::vector::store_chunk(tx, hash, seq as i32, chunk.pos, chunk.len, chunk_text, emb)?;
+            crate::vector::store_chunk(
+                tx, hash, seq as i32, chunk.pos, chunk.len, chunk_text, emb,
+            )?;
         }
         // Stamp embed_model atomically with chunk write. Without this,
         // a tx-then-stamp split races: chunks land but the stamp lands
@@ -534,11 +532,11 @@ pub fn embed_document(
         // and `outdated_chunk_hashes` filters NULL out, so a future
         // model bump won't see this doc as outdated. Stamping by hash
         // is correct because chunks are hash-keyed: every row pointing
-        // at this hash shares the same chunks generated under the
-        // current model.
+        // at this hash shares the same chunks generated under this
+        // embedder.
         tx.execute(
             "UPDATE documents SET embed_model=?1, embedded_at=?2 WHERE hash=?3",
-            rusqlite::params![crate::embed::CURRENT_MODEL_NAME, &now, hash],
+            rusqlite::params![model.model_name(), &now, hash],
         )?;
         Ok(())
     })
@@ -826,9 +824,13 @@ mod tests {
 
         // Act: embed_document.
         let mut model = crate::embed::MockEmbedder;
+        let expected = crate::embed::Embedder::model_name(&model).to_string();
         crate::retrieval::embed_document(search, &hash, "Atomic", body, &mut model).unwrap();
 
-        // Post-state: embed_model is now CURRENT_MODEL_NAME.
+        // Post-state: embed_model now matches the embedder's `model_name()`.
+        // (Previously this stamped the global CURRENT_MODEL_NAME regardless
+        // of the embedder passed in, which made the lint detect→fix→re-detect
+        // cycle untestable without ONNX.)
         let post: Option<String> = search
             .with_connection(|conn| {
                 Ok(conn
@@ -842,8 +844,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             post.as_deref(),
-            Some(crate::embed::CURRENT_MODEL_NAME),
-            "embed_document must atomically stamp embed_model"
+            Some(expected.as_str()),
+            "embed_document must atomically stamp embed_model from model.model_name()"
         );
     }
 
@@ -893,16 +895,14 @@ mod tests {
         // Index a wiki document (the on-disk content + DB row + mtime/size).
         std::fs::write(
             memex.wiki_dir().join("auth.md"),
-            format!("---\ntitle: Auth
-sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body}"),
+            format!(
+                "---\ntitle: Auth
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body}"
+            ),
         )
         .unwrap();
-        crate::index_wiki::index_wiki_file(
-            &memex,
-            &memex.wiki_dir().join("auth.md"),
-            None,
-        )
-        .unwrap();
+        crate::index_wiki::index_wiki_file(&memex, &memex.wiki_dir().join("auth.md"), None)
+            .unwrap();
         let body_hash = crate::storage::content_hash(body.as_bytes());
 
         // Manually wire a single chunk_vec row with a fixture vector.
@@ -960,16 +960,14 @@ sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\
         let body = "Working with the linux kernel internals requires deep knowledge.";
         std::fs::write(
             memex.wiki_dir().join("kernel-notes.md"),
-            format!("---\ntitle: Kernel Notes
-sources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\n---\n\n{body}"),
+            format!(
+                "---\ntitle: Kernel Notes
+sources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\n---\n\n{body}"
+            ),
         )
         .unwrap();
-        crate::index_wiki::index_wiki_file(
-            &memex,
-            &memex.wiki_dir().join("kernel-notes.md"),
-            None,
-        )
-        .unwrap();
+        crate::index_wiki::index_wiki_file(&memex, &memex.wiki_dir().join("kernel-notes.md"), None)
+            .unwrap();
 
         let collections: [String; 0] = [];
         let exp = Expansion::default();
@@ -1055,4 +1053,3 @@ sources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\
         );
     }
 }
-

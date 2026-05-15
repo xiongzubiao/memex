@@ -30,7 +30,7 @@ pub fn forward_link(
     // Sort by title length descending so longer (more specific) titles match
     // before their substrings (e.g. "Rust Borrow Checker" before "Rust").
     let mut sorted_pages: Vec<&(String, String)> = existing_pages.iter().collect();
-    sorted_pages.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted_pages.sort_by_key(|p| std::cmp::Reverse(p.1.len()));
 
     for (stem, title) in sorted_pages {
         // Never self-link.
@@ -178,8 +178,7 @@ pub fn maintain_backlinks_batch(
             if other_stem == *new_stem {
                 continue;
             }
-            let (next, was_linked) =
-                backward_link_page(&body, new_stem, new_title, &other_stem);
+            let (next, was_linked) = backward_link_page(&body, new_stem, new_title, &other_stem);
             if was_linked {
                 body = next;
                 touched = true;
@@ -496,7 +495,10 @@ sources: []\n\
         let mut model = crate::embed::MockEmbedder;
         let backlinked = maintain_backlinks_batch(
             &memex,
-            &[("auth-tokens", "Auth Tokens"), ("rest-patterns", "REST Patterns")],
+            &[
+                ("auth-tokens", "Auth Tokens"),
+                ("rest-patterns", "REST Patterns"),
+            ],
             &mut model,
         )
         .unwrap();
@@ -534,12 +536,9 @@ sources: []\n\
         std::fs::write(wiki_dir.join("auth-tokens.md"), body).unwrap();
 
         let mut model = crate::embed::MockEmbedder;
-        let backlinked = maintain_backlinks_batch(
-            &memex,
-            &[("auth-tokens", "Auth Tokens")],
-            &mut model,
-        )
-        .unwrap();
+        let backlinked =
+            maintain_backlinks_batch(&memex, &[("auth-tokens", "Auth Tokens")], &mut model)
+                .unwrap();
         assert!(
             backlinked.is_empty(),
             "self-page must not be rewritten, got: {backlinked:?}"

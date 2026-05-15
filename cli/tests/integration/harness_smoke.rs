@@ -1,4 +1,3 @@
-
 use crate::integration_harness::IntegrationHarness;
 use memex_cli::daemon::protocol::{Event, Request};
 

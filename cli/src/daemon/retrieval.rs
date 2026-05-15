@@ -238,9 +238,7 @@ impl RetrievalActor {
         }
         Ok(RetrievalResp { entries, signal })
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {

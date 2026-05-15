@@ -9,8 +9,8 @@ pub mod index;
 pub mod index_raw;
 pub mod index_wiki;
 pub mod ingest_jobs;
-pub mod llm_cache;
 pub mod lint;
+pub mod llm_cache;
 pub mod model;
 pub mod node_parser;
 pub mod raw;
@@ -108,14 +108,13 @@ impl Memex {
         // Migration hint: if DB is empty but wiki/ has .md files, suggest rebuild.
         // Spec Section 7 — r1 auto-rebuilt here; we moved that to open_writer to
         // eliminate the two-reader rebuild race. Now hint instead.
-        if search.is_empty()?
-            && wiki_dir.is_dir() && any_md_file(&wiki_dir) {
-                eprintln!(
-                    "note: search index is empty but `{}` contains markdown files; \
+        if search.is_empty()? && wiki_dir.is_dir() && any_md_file(&wiki_dir) {
+            eprintln!(
+                "note: search index is empty but `{}` contains markdown files; \
                      run `memex lint --fix` or any write command to rebuild.",
-                    wiki_dir.display()
-                );
-            }
+                wiki_dir.display()
+            );
+        }
 
         Ok(Self {
             root,
@@ -223,7 +222,26 @@ impl Memex {
         if !lint::is_issue_still_present(&self.search, &self.root, issue)? {
             return Ok(FixOutcome::Stale);
         }
-        lint::apply_fix_inner(&self.search, &self.root, issue)?;
+        // Load the embedder only after the stale check: a `Stale` outcome
+        // short-circuits before any ONNX init, which lets no-op fix paths
+        // run without requiring the runtime.
+        let mut model = crate::retrieval::load_default_model()?;
+        self.apply_fix_with(issue, &mut model)
+    }
+
+    /// Writer-handle fix with an injected embedder. Tests use this with
+    /// `MockEmbedder` to exercise the fix path without ONNX; production
+    /// callers go through `apply_fix` which loads the default model.
+    pub fn apply_fix_with(
+        &self,
+        issue: &types::LintIssue,
+        model: &mut dyn embed::Embedder,
+    ) -> error::Result<FixOutcome> {
+        self.require_writer()?;
+        if !lint::is_issue_still_present(&self.search, &self.root, issue)? {
+            return Ok(FixOutcome::Stale);
+        }
+        lint::apply_fix_inner(&self.search, &self.root, issue, model)?;
         Ok(FixOutcome::Applied)
     }
 
@@ -237,6 +255,42 @@ impl Memex {
             return self.apply_fix(issue);
         }
 
+        let (_guard, fresh) = self.acquire_writer_lock_and_fresh_db()?;
+
+        if !lint::is_issue_still_present(&fresh, &self.root, issue)? {
+            return Ok(FixOutcome::Stale);
+        }
+        // Lazy model load — see the comment on `apply_fix` for why.
+        let mut model = crate::retrieval::load_default_model()?;
+        lint::apply_fix_inner(&fresh, &self.root, issue, &mut model)?;
+        Ok(FixOutcome::Applied)
+    }
+
+    /// Reader-handle fix with an injected embedder. Test-mode counterpart to
+    /// `apply_fix_locked` — same lock + fresh-connection semantics, no model
+    /// load. Production code calls `apply_fix_locked`.
+    pub fn apply_fix_locked_with(
+        &self,
+        issue: &types::LintIssue,
+        model: &mut dyn embed::Embedder,
+    ) -> error::Result<FixOutcome> {
+        if self.is_writer() {
+            return self.apply_fix_with(issue, model);
+        }
+
+        let (_guard, fresh) = self.acquire_writer_lock_and_fresh_db()?;
+
+        if !lint::is_issue_still_present(&fresh, &self.root, issue)? {
+            return Ok(FixOutcome::Stale);
+        }
+        lint::apply_fix_inner(&fresh, &self.root, issue, model)?;
+        Ok(FixOutcome::Applied)
+    }
+
+    /// Shared by `apply_fix_locked` and `apply_fix_locked_with`: take the
+    /// writer flock and open a fresh DB connection so we see committed state
+    /// instead of the reader's pinned WAL snapshot.
+    fn acquire_writer_lock_and_fresh_db(&self) -> error::Result<(WriterLock, Db)> {
         let lock_path = self.root.join(".lock");
         let lock_file =
             storage::try_acquire_lock(&lock_path, self.config.lock_timeout).map_err(|e| match e
@@ -251,17 +305,9 @@ impl Memex {
                     source: e,
                 },
             })?;
-        let _guard = WriterLock { file: lock_file };
-
-        // Fresh connection — sees the latest committed state, not the reader's
-        // pinned WAL snapshot from process start.
+        let guard = WriterLock { file: lock_file };
         let fresh = search::Db::open(&self.root.join(INDEX_DB_NAME))?;
-
-        if !lint::is_issue_still_present(&fresh, &self.root, issue)? {
-            return Ok(FixOutcome::Stale);
-        }
-        lint::apply_fix_inner(&fresh, &self.root, issue)?;
-        Ok(FixOutcome::Applied)
+        Ok((guard, fresh))
     }
 }
 
@@ -368,8 +414,7 @@ sources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\
         std::fs::write(root.join("wiki/p.md"), content).unwrap();
 
         let from_disk = read_body_from_disk(&root, "wiki", "wiki/p.md").unwrap();
-        let from_writer =
-            storage::split_frontmatter(content).map_or(content, |(_, b)| b);
+        let from_writer = storage::split_frontmatter(content).map_or(content, |(_, b)| b);
         assert_eq!(
             from_disk, from_writer,
             "read_body_from_disk must match commit_doc's body so chunk pos/len align"
@@ -476,13 +521,20 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("config.toml"),
-            format!("[storage]\nwiki = {:?}\nraw = {:?}\n", custom_wiki, custom_raw),
-        ).unwrap();
+            format!(
+                "[storage]\nwiki = {:?}\nraw = {:?}\n",
+                custom_wiki, custom_raw
+            ),
+        )
+        .unwrap();
         let memex = Memex::open(root.clone()).unwrap();
         assert_eq!(memex.wiki_dir(), custom_wiki);
         assert_eq!(memex.raw_dir(), custom_raw);
         assert!(custom_wiki.is_dir());
         assert!(custom_raw.is_dir());
-        assert!(!root.join("wiki").exists(), "default wiki dir must not be auto-created when wiki is configured elsewhere");
+        assert!(
+            !root.join("wiki").exists(),
+            "default wiki dir must not be auto-created when wiki is configured elsewhere"
+        );
     }
 }

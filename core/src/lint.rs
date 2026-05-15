@@ -31,19 +31,24 @@ impl Memex {
     /// - Dangling wiki links: `[[page-stem]]` references to pages that don't exist
     /// - Missing cross-references: body mentions an existing page title/stem without `[[link]]`
     pub fn lint(&self) -> Result<LintReport> {
+        self.lint_with_current_model(CURRENT_MODEL_NAME)
+    }
+
+    /// Detection variant that lets the caller specify which model name is
+    /// "current". Production callers want the constant; tests inject the
+    /// mock embedder's name so the post-fix detection check sees the
+    /// stamp move into the matching value without needing the real model.
+    pub(crate) fn lint_with_current_model(&self, current_model_name: &str) -> Result<LintReport> {
         let wiki_dir = self.wiki_dir();
         let mut issues = Vec::new();
 
         // Collect DB state: all wiki documents, keyed by slug.
         let db_docs = self.search.all_wiki_documents()?;
-        let db_slugs: std::collections::HashSet<String> = db_docs
-            .iter()
-            .map(|d| slug_of_db_path(&d.path))
-            .collect();
+        let db_slugs: std::collections::HashSet<String> =
+            db_docs.iter().map(|d| slug_of_db_path(&d.path)).collect();
 
         // Collect disk state: slug of every .md file in wiki/.
-        let mut disk_slugs: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut disk_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
         if wiki_dir.exists() {
             for entry in std::fs::read_dir(&wiki_dir)? {
                 let entry = entry?;
@@ -66,19 +71,20 @@ impl Memex {
             let slug = slug_of_db_path(&doc.path);
             let full_path = crate::wiki::wiki_path_for_slug(&wiki_dir, &slug);
             if full_path.exists()
-                && let Ok(content) = std::fs::read_to_string(&full_path) {
-                    let disk_body_hash = match validate::parse_frontmatter(&content) {
-                        Ok((_, body)) => crate::storage::content_hash(body.as_bytes()),
-                        Err(_) => crate::storage::content_hash(content.as_bytes()),
-                    };
-                    if disk_body_hash != doc.hash {
-                        issues.push(LintIssue {
-                            kind: LintIssueKind::StaleIndex,
-                            page: slug,
-                            target: doc.path.clone(),
-                        });
-                    }
+                && let Ok(content) = std::fs::read_to_string(&full_path)
+            {
+                let disk_body_hash = match validate::parse_frontmatter(&content) {
+                    Ok((_, body)) => crate::storage::content_hash(body.as_bytes()),
+                    Err(_) => crate::storage::content_hash(content.as_bytes()),
+                };
+                if disk_body_hash != doc.hash {
+                    issues.push(LintIssue {
+                        kind: LintIssueKind::StaleIndex,
+                        page: slug,
+                        target: doc.path.clone(),
+                    });
                 }
+            }
         }
 
         // Check: Untracked file — on disk but no DB row. `page` carries
@@ -109,13 +115,14 @@ impl Memex {
         }
 
         // Check: Outdated embeddings — chunks with a model name that differs
-        // from the current model constant.
-        let outdated_models = self.search.outdated_chunk_models(CURRENT_MODEL_NAME)?;
+        // from the caller-supplied "current" name (the constant in prod,
+        // the mock-embedder name under test).
+        let outdated_models = self.search.outdated_chunk_models(current_model_name)?;
         for (old_model, count) in &outdated_models {
             issues.push(LintIssue {
                 kind: LintIssueKind::OutdatedEmbedding,
                 page: format!("{count} chunks"),
-                target: format!("{old_model} => {CURRENT_MODEL_NAME}"),
+                target: format!("{old_model} => {current_model_name}"),
             });
         }
 
@@ -225,8 +232,7 @@ impl Memex {
             // Dedupe per (page, target) since stem-pattern and
             // title-pattern can both match the same target.
             if let Some(set) = &cross_link_set {
-                let mut seen: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
                 for idx in set.matches(body).iter() {
                     let target = pattern_target[idx];
                     if target == stem.as_str() {
@@ -351,16 +357,24 @@ pub(crate) fn is_issue_still_present(
 ///
 /// Link issues (`DanglingLink`, `MissingLink`) are report-only — fixing
 /// them requires LLM judgment and is left to the caller.
+/// `model` is the embedder used by fixes that re-embed pages. Public callers
+/// in production pass `load_default_model()`; tests can inject `MockEmbedder`
+/// to exercise the stamp-update logic without requiring ONNX runtime or the
+/// real model file. The lint comparison uses `model.model_name()` to decide
+/// what "current" means — so `MockEmbedder` + `lint_with_current_model` lets
+/// the whole detect→fix→re-detect cycle run cleanly in environments where
+/// ONNX isn't installed.
 pub(crate) fn apply_fix_inner(
     search: &Db,
     root: &std::path::Path,
     issue: &LintIssue,
+    model: &mut dyn crate::embed::Embedder,
 ) -> crate::error::Result<()> {
     match issue.kind {
         LintIssueKind::StaleIndex | LintIssueKind::UntrackedFile => {
-            fix_wiki_reindex(search, root, issue)
+            fix_wiki_reindex(search, root, issue, model)
         }
-        LintIssueKind::OutdatedEmbedding => fix_outdated_embedding(search, root),
+        LintIssueKind::OutdatedEmbedding => fix_outdated_embedding(search, root, model),
         LintIssueKind::MissingFile => fix_missing_file(search, issue),
         LintIssueKind::RawHashMismatch => fix_raw_hash_mismatch(search, root, issue),
         // Link issues are LLM-judgment only; never auto-fixed by lint.
@@ -375,14 +389,13 @@ fn fix_wiki_reindex(
     search: &Db,
     root: &std::path::Path,
     issue: &LintIssue,
+    model: &mut dyn crate::embed::Embedder,
 ) -> crate::error::Result<()> {
     let full_path = root.join(&issue.target);
     let content = std::fs::read_to_string(&full_path)?;
-    let (title, body, _summary, collections) =
-        crate::search::parse_page_for_indexing(&content).ok_or_else(|| {
-            crate::error::MemexError::ValidationFailure {
-                details: format!("page {} has no valid frontmatter", issue.target),
-            }
+    let (title, body, _summary, collections) = crate::search::parse_page_for_indexing(&content)
+        .ok_or_else(|| crate::error::MemexError::ValidationFailure {
+            details: format!("page {} has no valid frontmatter", issue.target),
         })?;
     let mtime = std::fs::metadata(&full_path)?.modified()?;
     let size = content.len() as i64;
@@ -401,12 +414,11 @@ fn fix_wiki_reindex(
         )
     })?;
     search.set_document_collections_by_path("wiki", &issue.target, &collections)?;
-    let mut model = crate::retrieval::load_default_model()?;
     // embed_document atomically stamps embed_model + embedded_at by
     // hash inside its own tx. Without that stamping (an earlier shape
     // had a separate UPDATE in this fn) a freshly-fixed row stayed at
     // its old embed_model and lint kept re-flagging it.
-    crate::retrieval::embed_document(search, &result.body_hash, &title, &body, &mut model)?;
+    crate::retrieval::embed_document(search, &result.body_hash, &title, &body, model)?;
     Ok(())
 }
 
@@ -416,9 +428,9 @@ fn fix_wiki_reindex(
 fn fix_outdated_embedding(
     search: &Db,
     root: &std::path::Path,
+    model: &mut dyn crate::embed::Embedder,
 ) -> crate::error::Result<()> {
-    let mut model = crate::retrieval::load_default_model()?;
-    let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
+    let outdated = search.outdated_chunk_hashes(model.model_name())?;
     for hash in &outdated {
         // Body lives on disk; locate the page via documents.path.
         let path = match search.path_by_hash(hash)? {
@@ -436,7 +448,7 @@ fn fix_outdated_embedding(
         // embed_document stamps every row with this hash, so dedup'd
         // raw rows all get refreshed in one shot and the loop
         // terminates instead of re-flagging on the next pass.
-        crate::retrieval::embed_document(search, hash, &title, &body, &mut model)?;
+        crate::retrieval::embed_document(search, hash, &title, &body, model)?;
     }
     Ok(())
 }
@@ -445,10 +457,7 @@ fn fix_outdated_embedding(
 /// is path-keyed; `issue.target` preserves the DB-stored path so this
 /// matches whichever convention the row used (`<slug>` or
 /// `wiki/<slug>.md`).
-fn fix_missing_file(
-    search: &Db,
-    issue: &LintIssue,
-) -> crate::error::Result<()> {
+fn fix_missing_file(search: &Db, issue: &LintIssue) -> crate::error::Result<()> {
     search.delete_document_with_cleanup(&issue.target)?;
     Ok(())
 }
@@ -490,9 +499,22 @@ fn fix_raw_hash_mismatch(
     if new_abs.exists() {
         return fix_raw_hash_duplicate(search, old_rel, &old_abs);
     }
-    let title = fm.as_ref().and_then(|f| f.title.clone()).unwrap_or_default();
+    let title = fm
+        .as_ref()
+        .and_then(|f| f.title.clone())
+        .unwrap_or_default();
     let source = fm.as_ref().and_then(|f| f.source.clone());
-    fix_raw_hash_rename(search, root, old_rel, &old_abs, &new_abs, new_hash, &title, source.as_deref(), &body)
+    fix_raw_hash_rename(
+        search,
+        root,
+        old_rel,
+        &old_abs,
+        &new_abs,
+        new_hash,
+        &title,
+        source.as_deref(),
+        &body,
+    )
 }
 
 /// `new_abs` already exists — the body is canonical under another
@@ -543,9 +565,7 @@ fn fix_raw_hash_rename(
     body: &str,
 ) -> crate::error::Result<()> {
     std::fs::rename(old_abs, new_abs)?;
-    let new_rel = crate::storage::rel_path_string(
-        new_abs.strip_prefix(root).unwrap_or(new_abs),
-    );
+    let new_rel = crate::storage::rel_path_string(new_abs.strip_prefix(root).unwrap_or(new_abs));
     let meta = std::fs::metadata(new_abs)?;
     let mtime = meta.modified()?;
     let size = meta.len() as i64;
@@ -592,9 +612,9 @@ fn fix_raw_hash_rename(
     // itself failed.
     match crate::retrieval::load_default_model() {
         Ok(mut model) => {
-            if let Err(e) = crate::retrieval::embed_document(
-                search, new_hash, title, body, &mut model,
-            ) {
+            if let Err(e) =
+                crate::retrieval::embed_document(search, new_hash, title, body, &mut model)
+            {
                 tracing::warn!(
                     path = %new_rel,
                     error = %e,
@@ -625,10 +645,7 @@ fn fix_raw_hash_rename(
 /// have no FK cascade from documents, so the hash-keyed sweep is
 /// explicit. The reference count guards against wiping a sibling row's
 /// chunks when two docs share a body.
-fn drop_raw_row_and_chunks(
-    tx: &rusqlite::Connection,
-    old_rel: &str,
-) -> crate::error::Result<()> {
+fn drop_raw_row_and_chunks(tx: &rusqlite::Connection, old_rel: &str) -> crate::error::Result<()> {
     let prior: Option<(i64, String, String)> = tx
         .query_row(
             "SELECT id, title, hash FROM documents WHERE doc_type='raw' AND path=?1",
@@ -926,8 +943,14 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             .iter()
             .filter(|i| i.kind == crate::types::LintIssueKind::MissingFile)
             .count();
-        assert_eq!(untracked, 0, "DB row exists for the file; nothing should be untracked");
-        assert_eq!(missing, 0, "file exists for the DB row; nothing should be missing");
+        assert_eq!(
+            untracked, 0,
+            "DB row exists for the file; nothing should be untracked"
+        );
+        assert_eq!(
+            missing, 0,
+            "file exists for the DB row; nothing should be missing"
+        );
     }
 
     #[test]
@@ -1064,8 +1087,16 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             .unwrap();
         set_embed_model(search, "wiki/stale.md", "old-model");
 
+        // Use a MockEmbedder so the test exercises the stamp-update logic
+        // without requiring the real ONNX runtime + 300MB model. The lint
+        // detection compares against the mock embedder's `model_name()`,
+        // and `apply_fix_inner` re-embeds using the same mock — so the
+        // post-fix stamp matches and the issue clears.
+        let mut model = crate::embed::MockEmbedder;
+        let current = crate::embed::Embedder::model_name(&model).to_string();
+
         // Pre-fix: lint reports OutdatedEmbedding.
-        let pre = memex.lint().unwrap();
+        let pre = memex.lint_with_current_model(&current).unwrap();
         assert!(
             pre.issues
                 .iter()
@@ -1077,12 +1108,12 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         let issue = crate::types::LintIssue {
             kind: crate::types::LintIssueKind::OutdatedEmbedding,
             page: "wiki/stale.md".into(),
-            target: format!("old-model -> {}", crate::embed::CURRENT_MODEL_NAME),
+            target: format!("old-model -> {current}"),
         };
-        crate::lint::apply_fix_inner(memex.search(), &root, &issue).unwrap();
+        crate::lint::apply_fix_inner(memex.search(), &root, &issue, &mut model).unwrap();
 
         // Post-fix: embed_model is now current, lint must NOT re-flag.
-        let post = memex.lint().unwrap();
+        let post = memex.lint_with_current_model(&current).unwrap();
         let still_outdated: Vec<_> = post
             .issues
             .iter()
@@ -1150,7 +1181,11 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             .get_document_hash("wiki/current-page.md")
             .unwrap()
             .expect("document should have a hash");
-        set_embed_model(search, "wiki/current-page.md", crate::embed::CURRENT_MODEL_NAME);
+        set_embed_model(
+            search,
+            "wiki/current-page.md",
+            crate::embed::CURRENT_MODEL_NAME,
+        );
 
         let _ = fixture_embedding();
 
@@ -1221,7 +1256,9 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         };
         std::fs::write(&raw_path, assemble_raw_file(&fm, body)).unwrap();
         crate::index_raw::index_raw_file(&memex, &raw_path, None).unwrap();
-        let rel = raw_path.strip_prefix(memex.root()).unwrap_or(&raw_path)
+        let rel = raw_path
+            .strip_prefix(memex.root())
+            .unwrap_or(&raw_path)
             .to_string_lossy()
             .to_string();
 
@@ -1260,7 +1297,11 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         let memex = open_and_reindex(&root);
         // Confirm the row exists.
         assert!(
-            memex.search().get_document_hash("wiki/ghost.md").unwrap().is_some(),
+            memex
+                .search()
+                .get_document_hash("wiki/ghost.md")
+                .unwrap()
+                .is_some(),
             "row should exist post-reindex"
         );
         // Delete the file off disk.
@@ -1271,9 +1312,16 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             page: "ghost".into(),
             target: "wiki/ghost.md".into(),
         };
-        crate::lint::apply_fix_inner(memex.search(), &root, &issue).unwrap();
+        // MissingFile fix doesn't embed, but the signature still requires
+        // an Embedder. MockEmbedder satisfies the bound without loading ONNX.
+        let mut model = crate::embed::MockEmbedder;
+        crate::lint::apply_fix_inner(memex.search(), &root, &issue, &mut model).unwrap();
         assert!(
-            memex.search().get_document_hash("wiki/ghost.md").unwrap().is_none(),
+            memex
+                .search()
+                .get_document_hash("wiki/ghost.md")
+                .unwrap()
+                .is_none(),
             "row should be gone after MissingFile fix"
         );
 
@@ -1317,7 +1365,9 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         )
         .unwrap();
         crate::index_raw::index_raw_file(&memex, &canonical_path, None).unwrap();
-        let canonical_rel = canonical_path.strip_prefix(memex.root()).unwrap_or(&canonical_path)
+        let canonical_rel = canonical_path
+            .strip_prefix(memex.root())
+            .unwrap_or(&canonical_path)
             .to_string_lossy()
             .to_string();
 
@@ -1342,7 +1392,9 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         // hash (the hash before the manual edit). commit_doc recomputes
         // hash from body, so use raw SQL to capture the production state
         // where the row's hash column is stale relative to disk content.
-        let stale_rel_for_insert = stale_path.strip_prefix(memex.root()).unwrap_or(&stale_path)
+        let stale_rel_for_insert = stale_path
+            .strip_prefix(memex.root())
+            .unwrap_or(&stale_path)
             .to_string_lossy()
             .to_string();
         let old_body_hash = "feedface".to_string() + &"de".repeat(28);
@@ -1357,12 +1409,22 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
                 // Seed a chunk at the OLD hash so the test can verify
                 // the chunks-leak fix actually deletes it.
                 let dummy_embedding = vec![0.0f32; 768];
-                crate::vector::store_chunk(tx, &old_body_hash, 0, 0, body.len(), "", &dummy_embedding)?;
+                crate::vector::store_chunk(
+                    tx,
+                    &old_body_hash,
+                    0,
+                    0,
+                    body.len(),
+                    "",
+                    &dummy_embedding,
+                )?;
                 Ok(())
             })
             .unwrap();
 
-        let stale_rel = stale_path.strip_prefix(memex.root()).unwrap_or(&stale_path)
+        let stale_rel = stale_path
+            .strip_prefix(memex.root())
+            .unwrap_or(&stale_path)
             .to_string_lossy()
             .to_string();
         let issue = LintIssue {
@@ -1370,14 +1432,21 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             page: stale_rel.clone(),
             target: canonical_hash.clone(),
         };
-        crate::lint::apply_fix_inner(memex.search(), memex.root(), &issue).unwrap();
+        // RawHashMismatch fix doesn't embed, but the signature requires
+        // an Embedder; MockEmbedder keeps the test ONNX-free.
+        let mut model = crate::embed::MockEmbedder;
+        crate::lint::apply_fix_inner(memex.search(), memex.root(), &issue, &mut model).unwrap();
 
         // Stale file removed; canonical file untouched.
         assert!(!stale_path.exists(), "stale duplicate file removed");
         assert!(canonical_path.exists(), "canonical file preserved");
         // Stale row gone.
         assert!(
-            memex.search().get_document_hash(&stale_rel).unwrap().is_none(),
+            memex
+                .search()
+                .get_document_hash(&stale_rel)
+                .unwrap()
+                .is_none(),
             "stale row removed"
         );
         // Canonical row still has its ORIGINAL title — not clobbered by
@@ -1439,14 +1508,12 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             target: "wiki/orphan.md".into(),
         };
         // Before indexing: issue is present.
-        let before =
-            crate::lint::is_issue_still_present(memex.search(), &root, &issue).unwrap();
+        let before = crate::lint::is_issue_still_present(memex.search(), &root, &issue).unwrap();
         assert!(before, "untracked file pre-index => issue present");
 
         // After reindex: row exists, issue is gone.
         memex.reindex().unwrap();
-        let after =
-            crate::lint::is_issue_still_present(memex.search(), &root, &issue).unwrap();
+        let after = crate::lint::is_issue_still_present(memex.search(), &root, &issue).unwrap();
         assert!(!after, "indexed file => issue gone");
     }
 }

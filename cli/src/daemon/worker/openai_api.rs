@@ -5,6 +5,8 @@
 
 use super::{TaskKind, TurnOutcome, WORKER_PROMPT};
 use crate::daemon::config::WorkerConfig;
+use anyhow::{Context, Result, bail};
+use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
@@ -12,8 +14,6 @@ use async_openai::types::chat::{
     CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
     FinishReason, ResponseFormat, ResponseFormatJsonSchema,
 };
-use async_openai::Client;
-use anyhow::{Context, Result, bail};
 use serde_json::json;
 use tokio::time::{Duration, sleep};
 
@@ -157,7 +157,11 @@ fn usage_total_tokens(usage: Option<&CompletionUsage>) -> Option<u64> {
     usage.map(|u| u.total_tokens as u64)
 }
 
-fn build_request(model: &str, user_text: &str, task_kind: TaskKind) -> Result<CreateChatCompletionRequest> {
+fn build_request(
+    model: &str,
+    user_text: &str,
+    task_kind: TaskKind,
+) -> Result<CreateChatCompletionRequest> {
     let mut request = CreateChatCompletionRequestArgs::default();
     request.model(model);
     request.messages([
@@ -234,7 +238,10 @@ impl OpenAiApiSubprocess {
                             // fall back to the error type. Without this the
                             // full diagnostic is buried inside the message.
                             let code = api.code.clone().or_else(|| api.r#type.clone());
-                            return Ok(TurnOutcome::BackendError { message: e.to_string(), code });
+                            return Ok(TurnOutcome::BackendError {
+                                message: e.to_string(),
+                                code,
+                            });
                         }
                         OpenAIError::InvalidArgument(_) => {
                             return Ok(TurnOutcome::backend_err(e.to_string(), "invalid_argument"));
@@ -243,7 +250,9 @@ impl OpenAiApiSubprocess {
                             return Ok(TurnOutcome::backend_err(e.to_string(), "json_deserialize"));
                         }
                         _ => {
-                            last_err = Some(anyhow::anyhow!(e.to_string()).context("openai request failed"));
+                            last_err = Some(
+                                anyhow::anyhow!(e.to_string()).context("openai request failed"),
+                            );
                         }
                     }
                     if transient && attempt < 2 {
@@ -293,7 +302,8 @@ impl OpenAiApiSubprocess {
                     code: Some("refusal".into()),
                 });
             }
-            let finish_reason = finish_reason_str(response.choices.first().and_then(|c| c.finish_reason));
+            let finish_reason =
+                finish_reason_str(response.choices.first().and_then(|c| c.finish_reason));
             return Ok(TurnOutcome::BackendError {
                 message: format!(
                     "openai returned empty assistant message (model={}, task={task_kind:?}, prompt_tokens={:?}, completion_tokens={:?}, reasoning_tokens={:?}, total_tokens={:?})",
@@ -374,7 +384,10 @@ mod tests {
     fn finish_reason_str_formats_expected_names() {
         assert_eq!(finish_reason_str(Some(FinishReason::Stop)), "stop");
         assert_eq!(finish_reason_str(Some(FinishReason::Length)), "length");
-        assert_eq!(finish_reason_str(Some(FinishReason::ToolCalls)), "tool_calls");
+        assert_eq!(
+            finish_reason_str(Some(FinishReason::ToolCalls)),
+            "tool_calls"
+        );
         assert_eq!(
             finish_reason_str(Some(FinishReason::ContentFilter)),
             "content_filter"
@@ -385,5 +398,4 @@ mod tests {
         );
         assert_eq!(finish_reason_str(None), "unknown");
     }
-
 }

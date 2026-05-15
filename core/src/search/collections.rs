@@ -49,9 +49,7 @@ pub fn validate_collection_names(names: &[String]) -> std::result::Result<(), St
             ));
         }
         if trimmed.len() > 64 {
-            return Err(format!(
-                "collection name {trimmed:?} exceeds 64 chars"
-            ));
+            return Err(format!("collection name {trimmed:?} exceeds 64 chars"));
         }
     }
     Ok(())

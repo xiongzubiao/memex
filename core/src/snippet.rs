@@ -8,12 +8,13 @@
 pub const INTENT_WEIGHT_CHUNK: f64 = 0.5;
 
 pub(crate) const INTENT_STOP_WORDS: &[&str] = &[
-    "the","a","an","and","or","but","if","then","else","when","is","are","was","were","be","been",
-    "being","have","has","had","do","does","did","of","in","on","at","to","for","with","by",
-    "about","as","into","through","during","before","after","above","below","up","down","out",
-    "off","over","under","again","further","once","this","that","these","those","i","you","he",
-    "she","it","we","they","them","my","your","his","her","its","our","their","what","which",
-    "who","whom","how","why","not","no","so","than","too","very","just",
+    "the", "a", "an", "and", "or", "but", "if", "then", "else", "when", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did", "of", "in", "on", "at", "to",
+    "for", "with", "by", "about", "as", "into", "through", "during", "before", "after", "above",
+    "below", "up", "down", "out", "off", "over", "under", "again", "further", "once", "this",
+    "that", "these", "those", "i", "you", "he", "she", "it", "we", "they", "them", "my", "your",
+    "his", "her", "its", "our", "their", "what", "which", "who", "whom", "how", "why", "not", "no",
+    "so", "than", "too", "very", "just",
 ];
 
 pub fn extract_intent_terms(intent: &str) -> Vec<String> {
@@ -23,8 +24,12 @@ pub fn extract_intent_terms(intent: &str) -> Vec<String> {
         let trimmed: String = lower
             .trim_matches(|c: char| !c.is_alphanumeric())
             .to_string();
-        if trimmed.chars().count() <= 1 { continue; }
-        if INTENT_STOP_WORDS.contains(&trimmed.as_str()) { continue; }
+        if trimmed.chars().count() <= 1 {
+            continue;
+        }
+        if INTENT_STOP_WORDS.contains(&trimmed.as_str()) {
+            continue;
+        }
         out.push(trimmed);
     }
     out
@@ -122,7 +127,10 @@ mod tests {
         let q = vec!["foo".to_string()];
         let s_once = score_chunk("foo once", &q, &[]);
         let s_many = score_chunk("foo foo foo foo foo", &q, &[]);
-        assert_eq!(s_once, s_many, "score must be binary per term, not term-frequency");
+        assert_eq!(
+            s_once, s_many,
+            "score must be binary per term, not term-frequency"
+        );
         assert_eq!(s_once, 1.0);
     }
 
@@ -132,5 +140,4 @@ mod tests {
         let i = vec!["y".to_string()];
         assert_eq!(score_chunk("nothing here", &q, &i), 0.0);
     }
-
 }

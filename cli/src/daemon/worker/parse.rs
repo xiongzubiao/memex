@@ -478,7 +478,11 @@ mod tests {
     #[test]
     fn parse_reply_plain_prose_no_citations_errors() {
         let e = parse_synthesis("Just a sentence with no markers.").unwrap_err();
-        assert!(e.reason.contains("[[id]] citations"), "reason: {}", e.reason);
+        assert!(
+            e.reason.contains("[[id]] citations"),
+            "reason: {}",
+            e.reason
+        );
     }
 
     #[test]

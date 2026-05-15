@@ -6,6 +6,14 @@ uplinks:
   npmjs:
     url: https://registry.npmjs.org/
 packages:
+  # Packages under test: never proxy. The published 0.1.1 lives on
+  # public npmjs; if Verdaccio proxied, every PR-time rehearsal would
+  # 409 against the already-published upstream version. Bypassing
+  # upstream entirely lets the rehearsal publish AND install against
+  # a clean local registry, independent of any release state.
+  '@xiongzubiao/*':
+    access: $all
+    publish: $all
   '@*/*':
     access: $all
     publish: $all

@@ -5,11 +5,11 @@
 use std::path::Path;
 
 use crate::daemon::error::DaemonError;
+use crate::daemon::handler::source::derive_source_title;
 use crate::daemon::handler::{
     HandlerState, acquire_slug_lock, async_atomic_write, error_events, get_or_open_memex,
     read_file_capped, run_worker_job, validate_and_redact_inbound_content, validate_source_path,
 };
-use crate::daemon::handler::source::derive_source_title;
 use crate::daemon::protocol::Event;
 
 /// Path-based transcript ingest: read the file, dispatch to the shared body.
@@ -32,8 +32,7 @@ pub(super) async fn handle_ingest_transcript(
             Ok(c) => c,
             Err(e) => return error_events(e),
         };
-    handle_ingest_transcript_content(raw_content, transcript_path, agent, collections, state)
-        .await
+    handle_ingest_transcript_content(raw_content, transcript_path, agent, collections, state).await
 }
 
 /// Shared body: parse content for `agent`, run dedup → Extract → Merge → store.
@@ -72,9 +71,14 @@ pub(super) async fn handle_ingest_transcript_content(
         TranscriptAgent::Codex => memex_core::transcript::parse_codex_session(
             std::io::BufReader::new(raw_content.as_bytes()),
         ),
-        TranscriptAgent::GeminiCli => memex_core::transcript::parse_gemini_cli_session(&raw_content),
+        TranscriptAgent::GeminiCli => {
+            memex_core::transcript::parse_gemini_cli_session(&raw_content)
+        }
         TranscriptAgent::OpenClaw => memex_core::transcript::parse_openclaw_session(&raw_content),
         TranscriptAgent::Hermes => memex_core::transcript::parse_hermes_session(&raw_content),
+        TranscriptAgent::OpenCode => memex_core::transcript::parse_opencode_session(
+            std::io::BufReader::new(raw_content.as_bytes()),
+        ),
     };
     let agent_str = agent.as_str();
 
@@ -176,9 +180,7 @@ pub(super) async fn handle_ingest_transcript_content(
     let fm = memex_core::raw::RawFrontmatter {
         source: Some(source_label.clone()),
         source_kind: Some("transcript".into()),
-        ingested_at: Some(
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        ),
+        ingested_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         converter: None,
         title: Some(title.clone()),
     };
@@ -255,9 +257,7 @@ pub(super) async fn handle_ingest_document(
     // ─── Job ID + persist job row (pre-Extract) ────
     let job_id = format!(
         "doc-{}",
-        memex_core::storage::content_hash(
-            format!("{source_path}\0{content_hash}").as_bytes()
-        )
+        memex_core::storage::content_hash(format!("{source_path}\0{content_hash}").as_bytes())
     );
     if let Err(e) = search.insert_ingest_job(
         &job_id,
@@ -306,9 +306,7 @@ pub(super) async fn handle_ingest_document(
     let fm = memex_core::raw::RawFrontmatter {
         source: Some(source_path.clone()),
         source_kind: Some(kind.into()),
-        ingested_at: Some(
-            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        ),
+        ingested_at: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
         converter: None,
         title: Some(source_title.clone()),
     };
@@ -401,12 +399,7 @@ async fn store_extracted_pages(
     // tens of milliseconds per page.
     let dedup_slugs = {
         let mut model_guard = state.writer.embed_model().lock().await;
-        match find_dedup_slugs(
-            search,
-            &valid_pages,
-            model_guard.as_mut(),
-            memex.root(),
-        ) {
+        match find_dedup_slugs(search, &valid_pages, model_guard.as_mut(), memex.root()) {
             Ok(s) => s,
             Err(e) => {
                 let _ = search.update_ingest_job_status(job_id, "failed", Some(&e.to_string()));
@@ -440,11 +433,7 @@ async fn store_extracted_pages(
     let titled_pool: Vec<(String, String)> = existing_titled
         .iter()
         .cloned()
-        .chain(
-            new_pages
-                .iter()
-                .map(|p| (p.slug.clone(), p.title.clone())),
-        )
+        .chain(new_pages.iter().map(|p| (p.slug.clone(), p.title.clone())))
         .filter(|(s, _)| memex_core::crosslink::auto_link_eligible(s))
         .collect();
     let mut known_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -520,8 +509,7 @@ async fn store_extracted_pages(
     ) {
         Ok(h) => h,
         Err(e) => {
-            let _ =
-                search.update_ingest_job_status(job_id, "failed", Some(&e.to_string()));
+            let _ = search.update_ingest_job_status(job_id, "failed", Some(&e.to_string()));
             return Err(error_events(DaemonError::Internal(format!(
                 "raw source commit failed: {e}"
             ))));
@@ -969,7 +957,7 @@ async fn materialize_dedup_pairs(
 ) {
     let mut new_pages = Vec::new();
     let mut merge_pairs = Vec::new();
-    for (page, slug) in valid_pages.iter().zip(slugs.into_iter()) {
+    for (page, slug) in valid_pages.iter().zip(slugs) {
         match slug {
             Some(slug) => {
                 let existing_path = memex_core::wiki::wiki_path_for_slug(wiki_dir, &slug);
@@ -1022,7 +1010,8 @@ fn embed_and_mark(
 ) {
     let rel = disk_path.strip_prefix(ctx.memex_root).unwrap_or(disk_path);
     let rel_str = memex_core::storage::rel_path_string(rel);
-    if let Err(e) = memex_core::retrieval::embed_document(ctx.search, hash, title, body, ctx.model) {
+    if let Err(e) = memex_core::retrieval::embed_document(ctx.search, hash, title, body, ctx.model)
+    {
         tracing::warn!(error = ?e, %doc_type, path = %rel_str, "embed_document failed");
     }
 }
@@ -1040,8 +1029,18 @@ fn is_bad_slug(slug: &str) -> bool {
     }
     // Month names as segments.
     const MONTHS: &[&str] = &[
-        "january", "february", "march", "april", "may", "june",
-        "july", "august", "september", "october", "november", "december",
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
     ];
     if slug.split('-').any(|seg| MONTHS.contains(&seg)) {
         return true;
@@ -1075,7 +1074,11 @@ mod tests {
             ("rest-patterns", false, "clean subject"),
             ("oauth-migration", false, "subject with dash"),
             ("performance-tuning", false, "subject"),
-            ("january-effect", true, "month segment, even as concept name"),
+            (
+                "january-effect",
+                true,
+                "month segment, even as concept name",
+            ),
             ("summary-march-meeting", true, "month segment internal"),
             ("annual-2023-review", true, "4-digit year segment"),
             ("2023", true, "bare year"),
@@ -1084,7 +1087,11 @@ mod tests {
             ("episode-12", true, "episode marker — episode"),
             // Edge: 4 digits that aren't a year — still flagged.
             // The regex doesn't try to distinguish; cheap, false-positive-tolerant.
-            ("port-8080-config", true, "4-digit segment matches year heuristic"),
+            (
+                "port-8080-config",
+                true,
+                "4-digit segment matches year heuristic",
+            ),
             // Edge: empty.
             ("", false, "empty slug — no segments to flag"),
         ];
@@ -1096,5 +1103,4 @@ mod tests {
             );
         }
     }
-
 }

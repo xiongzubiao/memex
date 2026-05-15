@@ -50,4 +50,3 @@ fn cleanup_ignores_non_memex_dotfiles() {
     assert!(ds_store.exists());
     assert!(swp.exists());
 }
-

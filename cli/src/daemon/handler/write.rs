@@ -27,8 +27,7 @@ pub(super) async fn handle_write(
     // refuse at the request boundary than write an orphan file.
     if title.chars().any(|c| c.is_control()) {
         return error_events(DaemonError::BadRequest(
-            "title contains control characters (newline, tab, etc.); strip them and retry"
-                .into(),
+            "title contains control characters (newline, tab, etc.); strip them and retry".into(),
         ));
     }
 
@@ -103,8 +102,7 @@ pub(super) async fn handle_write(
         .filter(|(stem, _)| memex_core::crosslink::auto_link_eligible(stem))
         .cloned()
         .collect();
-    let (linked_body, linked) =
-        memex_core::crosslink::forward_link(&body, &eligible_pages, &slug);
+    let (linked_body, linked) = memex_core::crosslink::forward_link(body, &eligible_pages, &slug);
 
     // suggest_create: any [[stem]] left in the body whose target
     // page doesn't exist (after forward_link's pass).
@@ -124,9 +122,8 @@ pub(super) async fn handle_write(
         Some(s) => format!("sources:\n  - \"#{s}\"\n"),
         None => "sources: []\n".to_string(),
     };
-    let frontmatter_yaml = format!(
-        "title: {title}\ncreated_at: {now}\nupdated_at: {now}\n{yaml_sources}",
-    );
+    let frontmatter_yaml =
+        format!("title: {title}\ncreated_at: {now}\nupdated_at: {now}\n{yaml_sources}",);
     let file = format!("---\n{frontmatter_yaml}---\n\n{linked_body}");
 
     if let Err(e) = tokio::fs::create_dir_all(memex.wiki_dir()).await {

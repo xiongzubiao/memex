@@ -4,8 +4,8 @@
 //! expansion-bypass even with obvious BM25 hits.
 
 use memex_core::Memex;
-use memex_core::retrieval::{hybrid_retrieve_expanded, Expansion, Signal};
-use memex_core::search::{commit_doc, DocSpec};
+use memex_core::retrieval::{Expansion, Signal, hybrid_retrieve_expanded};
+use memex_core::search::{DocSpec, commit_doc};
 use tempfile::TempDir;
 
 /// Seed a document via `commit_doc` so chunks + chunks_fts get
@@ -28,14 +28,46 @@ fn upsert(memex: &Memex, doc: DocSpec) {
 /// corpus" setup the comparison test used.
 fn insert_decoys(memex: &Memex) {
     let decoys = [
-        ("decoy-pasta", "Pasta Cooking", "Boil pasta in salted water until al dente."),
-        ("decoy-coffee", "Coffee Brewing", "Pour over methods give clean cups; espresso uses pressure."),
-        ("decoy-dna", "DNA Replication", "Helicase unwinds the helix; polymerase synthesizes new strands."),
-        ("decoy-photo", "Photosynthesis", "Chlorophyll absorbs light and drives the Calvin cycle."),
-        ("decoy-rust", "Rust Ownership", "Each value has one owner; references must be shared XOR mutable."),
-        ("decoy-git", "Git Rebase", "Rebase rewrites history by replaying commits onto a new base."),
-        ("decoy-sql", "SQL Indexing", "B-tree indexes let queries find rows without scanning the table."),
-        ("decoy-tcp", "TCP Handshake", "SYN, SYN-ACK, ACK establishes a reliable connection."),
+        (
+            "decoy-pasta",
+            "Pasta Cooking",
+            "Boil pasta in salted water until al dente.",
+        ),
+        (
+            "decoy-coffee",
+            "Coffee Brewing",
+            "Pour over methods give clean cups; espresso uses pressure.",
+        ),
+        (
+            "decoy-dna",
+            "DNA Replication",
+            "Helicase unwinds the helix; polymerase synthesizes new strands.",
+        ),
+        (
+            "decoy-photo",
+            "Photosynthesis",
+            "Chlorophyll absorbs light and drives the Calvin cycle.",
+        ),
+        (
+            "decoy-rust",
+            "Rust Ownership",
+            "Each value has one owner; references must be shared XOR mutable.",
+        ),
+        (
+            "decoy-git",
+            "Git Rebase",
+            "Rebase rewrites history by replaying commits onto a new base.",
+        ),
+        (
+            "decoy-sql",
+            "SQL Indexing",
+            "B-tree indexes let queries find rows without scanning the table.",
+        ),
+        (
+            "decoy-tcp",
+            "TCP Handshake",
+            "SYN, SYN-ACK, ACK establishes a reliable connection.",
+        ),
     ];
     for (slug, title, body) in decoys.iter() {
         upsert(
@@ -100,7 +132,11 @@ fn strong_signal_fires_on_source_only_match() {
     )
     .unwrap();
 
-    assert_eq!(result.signal, Signal::Strong, "expected strong signal from clean source-only BM25 hit");
+    assert_eq!(
+        result.signal,
+        Signal::Strong,
+        "expected strong signal from clean source-only BM25 hit"
+    );
 }
 
 #[test]
@@ -152,4 +188,3 @@ fn weak_signal_when_no_clean_winner() {
         "expected weak signal when two source docs tie on BM25"
     );
 }
-

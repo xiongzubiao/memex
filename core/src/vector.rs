@@ -198,7 +198,10 @@ pub fn list_chunks_by_hash(conn: &Connection, hash: &str) -> Result<Vec<(usize, 
     let mut stmt = conn.prepare("SELECT pos, len FROM chunks WHERE hash = ?1 ORDER BY seq")?;
     let rows = stmt
         .query_map([hash], |row| {
-            Ok((row.get::<_, i64>(0)? as usize, row.get::<_, i64>(1)? as usize))
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+            ))
         })?
         .filter_map(|r| r.ok())
         .collect();

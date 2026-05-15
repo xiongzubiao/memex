@@ -257,7 +257,9 @@ pub fn load_model(
 /// If the model's input names are unrecognised, returns an error.
 pub fn embed_text(model: &mut EmbeddingModel, text: &str) -> crate::error::Result<Vec<f32>> {
     let v = embed_batch(model, &[text])?;
-    Ok(v.into_iter().next().expect("embed_batch returns at least one row"))
+    Ok(v.into_iter()
+        .next()
+        .expect("embed_batch returns at least one row"))
 }
 
 /// Embed multiple texts in a single ONNX inference call.
@@ -344,17 +346,14 @@ pub fn embed_batch(
     }
 
     // Step 3: build tensors and run inference.
-    let input_ids_tensor =
-        Tensor::from_array(([batch, padded_len], input_ids.into_boxed_slice()))?;
+    let input_ids_tensor = Tensor::from_array(([batch, padded_len], input_ids.into_boxed_slice()))?;
     let attn_tensor = Tensor::from_array(([batch, padded_len], attn.into_boxed_slice()))?;
 
     let has_token_type_ids = model.input_names.iter().any(|n| n == "token_type_ids");
     let outputs = if has_token_type_ids {
         let token_type_ids_data: Vec<i64> = vec![0i64; batch * padded_len];
-        let token_type_ids_tensor = Tensor::from_array((
-            [batch, padded_len],
-            token_type_ids_data.into_boxed_slice(),
-        ))?;
+        let token_type_ids_tensor =
+            Tensor::from_array(([batch, padded_len], token_type_ids_data.into_boxed_slice()))?;
         model.session.run(ort::inputs! {
             "input_ids" => input_ids_tensor,
             "attention_mask" => attn_tensor,
@@ -423,7 +422,6 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
     dot / (norm_a * norm_b)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -506,5 +504,4 @@ mod tests {
             "expected nearby text to be closer than unrelated text"
         );
     }
-
 }

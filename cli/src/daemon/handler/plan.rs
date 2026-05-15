@@ -113,31 +113,23 @@ pub(super) async fn handle_source_plan(source_id: String, state: &HandlerState) 
             })
         });
         let merge_results = futures::future::join_all(merge_futs).await;
-        for ((idx, page, existing_body), result) in
-            overlap_inputs.into_iter().zip(merge_results)
-        {
+        for ((idx, page, existing_body), result) in overlap_inputs.into_iter().zip(merge_results) {
             match result {
-                Ok(reply) => {
-                    match reply.merged_pages.into_iter().find(|p| p.slug == page.slug) {
-                        Some(merged) => {
-                            let target_hash =
-                                memex_core::storage::content_hash(existing_body.as_bytes());
-                            let merge_diff = compute_unified_diff(&existing_body, &merged.body);
-                            let mut p = Proposal::new_for_page(idx, page);
-                            p.title = merged.title;
-                            p.body = merged.body;
-                            p.merge_target_slug = Some(p.slug.clone());
-                            p.merge_target_hash = Some(target_hash);
-                            p.merge_diff = Some(merge_diff);
-                            proposals.push(p);
-                        }
-                        None => proposals.push(merge_failure_proposal(
-                            idx,
-                            page,
-                            "merge omitted slug",
-                        )),
+                Ok(reply) => match reply.merged_pages.into_iter().find(|p| p.slug == page.slug) {
+                    Some(merged) => {
+                        let target_hash =
+                            memex_core::storage::content_hash(existing_body.as_bytes());
+                        let merge_diff = compute_unified_diff(&existing_body, &merged.body);
+                        let mut p = Proposal::new_for_page(idx, page);
+                        p.title = merged.title;
+                        p.body = merged.body;
+                        p.merge_target_slug = Some(p.slug.clone());
+                        p.merge_target_hash = Some(target_hash);
+                        p.merge_diff = Some(merge_diff);
+                        proposals.push(p);
                     }
-                }
+                    None => proposals.push(merge_failure_proposal(idx, page, "merge omitted slug")),
+                },
                 Err(e) => {
                     proposals.push(merge_failure_proposal(idx, page, &e.message()));
                 }
@@ -233,8 +225,7 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
             continue;
         }
         let target = plan.proposals[i].slug.clone();
-        let _slug_guard =
-            crate::daemon::handler::acquire_slug_lock(&state.writer, &target).await;
+        let _slug_guard = crate::daemon::handler::acquire_slug_lock(&state.writer, &target).await;
 
         let target_path = memex_core::wiki::wiki_path_for_slug(&wiki_dir, &target);
         if !target_path.exists() {
@@ -277,8 +268,8 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
             };
         let existing_hash = memex_core::storage::content_hash(existing_body.as_bytes());
 
-        let hash_matches = plan.proposals[i].merge_target_hash.as_deref()
-            == Some(existing_hash.as_str());
+        let hash_matches =
+            plan.proposals[i].merge_target_hash.as_deref() == Some(existing_hash.as_str());
         let slug_matches = plan.proposals[i].merge_target_slug.as_deref() == Some(target.as_str());
 
         if hash_matches && slug_matches {
@@ -331,23 +322,21 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
         {
             let target = plan.proposals[i].slug.clone();
             match result {
-                Ok(reply) => {
-                    match reply.merged_pages.into_iter().find(|p| p.slug == target) {
-                        Some(merged) => {
-                            plan.proposals[i].title = merged.title;
-                            plan.proposals[i].merge_diff =
-                                Some(compute_unified_diff(&existing_body, &merged.body));
-                            plan.proposals[i].body = merged.body;
-                            plan.proposals[i].merge_target_slug = Some(target);
-                            plan.proposals[i].merge_target_hash = Some(existing_hash);
-                            any_rereview = true;
-                        }
-                        None => {
-                            plan.proposals[i].error = Some("merge omitted slug".into());
-                            any_failed = true;
-                        }
+                Ok(reply) => match reply.merged_pages.into_iter().find(|p| p.slug == target) {
+                    Some(merged) => {
+                        plan.proposals[i].title = merged.title;
+                        plan.proposals[i].merge_diff =
+                            Some(compute_unified_diff(&existing_body, &merged.body));
+                        plan.proposals[i].body = merged.body;
+                        plan.proposals[i].merge_target_slug = Some(target);
+                        plan.proposals[i].merge_target_hash = Some(existing_hash);
+                        any_rereview = true;
                     }
-                }
+                    None => {
+                        plan.proposals[i].error = Some("merge omitted slug".into());
+                        any_failed = true;
+                    }
+                },
                 Err(e) => {
                     plan.proposals[i].error = Some(e.message());
                     any_failed = true;
@@ -362,20 +351,32 @@ pub(super) async fn handle_plan_apply(plan_json: String, state: &HandlerState) -
             Ok(s) => s,
             Err(e) => return error_events(DaemonError::Internal(format!("serialize: {e}"))),
         };
-        return vec![Event::PlanContent { json }, Event::Done { status: crate::daemon::plan::APPLY_NEEDS_REREVIEW }];
+        return vec![
+            Event::PlanContent { json },
+            Event::Done {
+                status: crate::daemon::plan::APPLY_NEEDS_REREVIEW,
+            },
+        ];
     }
     if any_failed {
         let json = match serde_json::to_string(&plan) {
             Ok(s) => s,
             Err(e) => return error_events(DaemonError::Internal(format!("serialize: {e}"))),
         };
-        return vec![Event::PlanContent { json }, Event::Done { status: crate::daemon::plan::APPLY_PARTIAL_FAILURE }];
+        return vec![
+            Event::PlanContent { json },
+            Event::Done {
+                status: crate::daemon::plan::APPLY_PARTIAL_FAILURE,
+            },
+        ];
     }
     vec![
         Event::PlanApplied {
             committed: committed_slugs,
         },
-        Event::Done { status: crate::daemon::plan::APPLY_OK },
+        Event::Done {
+            status: crate::daemon::plan::APPLY_OK,
+        },
     ]
 }
 
@@ -632,7 +633,6 @@ created_at: 2024-01-01T00:00:00Z\nupdated_at: 2024-01-01T00:00:00Z\nsources: {ya
             fm.title
         );
     }
-
 
     #[tokio::test]
     async fn plan_apply_rejects_invalid_version() {

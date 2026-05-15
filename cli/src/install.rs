@@ -39,6 +39,8 @@ const OPENCLAW_HANDLER_JS: &str = include_str!("../../plugin/.openclaw-plugin/me
 const HERMES_HOOK_YAML: &str = include_str!("../../plugin/.hermes-plugin/memex/HOOK.yaml");
 const HERMES_HANDLER_PY: &str = include_str!("../../plugin/.hermes-plugin/memex/handler.py");
 
+const OPENCODE_PLUGIN_TS: &str = include_str!("../../plugin/.opencode-plugin/memex.ts");
+
 const MEMEX_SENTINELS: &[&str] = &[
     "memex daemon",
     "memex hook",
@@ -47,12 +49,14 @@ const MEMEX_SENTINELS: &[&str] = &[
 ];
 
 /// Single source of truth for which directory under `~` indicates each agent.
+/// OpenCode lives under `~/.config/opencode/` (XDG-style), not `~/.opencode/`.
 const PROBE_DIRS: &[(&str, InstallTarget)] = &[
     (".claude", InstallTarget::ClaudeCode),
     (".codex", InstallTarget::Codex),
     (".gemini", InstallTarget::GeminiCli),
     (".openclaw", InstallTarget::OpenClaw),
     (".hermes", InstallTarget::Hermes),
+    (".config/opencode", InstallTarget::OpenCode),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -64,6 +68,8 @@ pub enum InstallTarget {
     OpenClaw,
     #[value(name = "hermes")]
     Hermes,
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 impl InstallTarget {
@@ -74,6 +80,7 @@ impl InstallTarget {
             InstallTarget::GeminiCli => "Gemini CLI",
             InstallTarget::OpenClaw => "OpenClaw",
             InstallTarget::Hermes => "Hermes",
+            InstallTarget::OpenCode => "OpenCode",
         }
     }
 }
@@ -93,7 +100,7 @@ pub fn run(home: &Path, targets: &[InstallTarget], dry_run: bool) -> Result<()> 
             .collect();
         eprintln!("no agent CLIs detected (looked for {})", probed.join(", "));
         eprintln!(
-            "install at least one of: Claude Code, Codex, Gemini CLI, OpenClaw, Hermes, then retry"
+            "install at least one of: Claude Code, Codex, Gemini CLI, OpenClaw, Hermes, OpenCode, then retry"
         );
         bail!("no agents detected");
     }
@@ -106,6 +113,7 @@ pub fn run(home: &Path, targets: &[InstallTarget], dry_run: bool) -> Result<()> 
         match target {
             InstallTarget::OpenClaw => install_openclaw(home, dry_run)?,
             InstallTarget::Hermes => install_hermes(home, dry_run)?,
+            InstallTarget::OpenCode => install_opencode(home, dry_run)?,
             _ => unreachable!("file_agent_spec covers all other variants"),
         }
     }
@@ -140,7 +148,7 @@ const FILE_AGENTS: &[FileAgentSpec] = &[
     FileAgentSpec {
         target: InstallTarget::ClaudeCode,
         agent_dir: ".claude",
-        hooks_file: "hooks.json",
+        hooks_file: "settings.json",
         template: CLAUDE_CODE_HOOKS,
         events: &["SessionStart", "SessionEnd"],
     },
@@ -176,7 +184,10 @@ fn install_file_agent(spec: &FileAgentSpec, home: &Path, dry_run: bool) -> Resul
 /// source root). The hook pack is `~/.openclaw/hook-packs/memex/` linked via
 /// `openclaw plugins install --link`.
 fn install_openclaw(home: &Path, dry_run: bool) -> Result<()> {
-    println!("✓ {}: skills + hook pack", InstallTarget::OpenClaw.display());
+    println!(
+        "✓ {}: skills + hook pack",
+        InstallTarget::OpenClaw.display()
+    );
     install_skills(&home.join(".agents").join("skills"), dry_run)?;
     install_openclaw_hook_pack(home, dry_run)?;
     Ok(())
@@ -187,11 +198,13 @@ fn install_openclaw_hook_pack(home: &Path, dry_run: bool) -> Result<()> {
     let hook_dir = pack_dir.join("memex");
     if dry_run {
         println!("  would write hook pack: {}", pack_dir.display());
-        println!("  would run: openclaw plugins install --link {}", pack_dir.display());
+        println!(
+            "  would run: openclaw plugins install --link {}",
+            pack_dir.display()
+        );
         return Ok(());
     }
-    fs::create_dir_all(&hook_dir)
-        .with_context(|| format!("create {}", hook_dir.display()))?;
+    fs::create_dir_all(&hook_dir).with_context(|| format!("create {}", hook_dir.display()))?;
     fs::write(pack_dir.join("package.json"), OPENCLAW_PACKAGE_JSON)
         .with_context(|| format!("write {}/package.json", pack_dir.display()))?;
     fs::write(hook_dir.join("HOOK.md"), OPENCLAW_HOOK_MD)
@@ -221,11 +234,17 @@ fn install_openclaw_hook_pack(home: &Path, dry_run: bool) -> Result<()> {
                 .find(|l| l.contains("Error") || l.contains("fail"))
                 .unwrap_or_else(|| err.trim().lines().last().unwrap_or("(no detail)"));
             eprintln!("  warning: openclaw plugins install failed: {detail}");
-            eprintln!("  to retry: openclaw plugins install --link {}", pack_dir.display());
+            eprintln!(
+                "  to retry: openclaw plugins install --link {}",
+                pack_dir.display()
+            );
         }
         Err(_) => {
             eprintln!("  note: `openclaw` not on PATH — skipped plugin registration.");
-            eprintln!("        to enable later: openclaw plugins install --link {}", pack_dir.display());
+            eprintln!(
+                "        to enable later: openclaw plugins install --link {}",
+                pack_dir.display()
+            );
         }
     }
     Ok(())
@@ -252,7 +271,37 @@ fn install_hermes_hook(home: &Path, dry_run: bool) -> Result<()> {
         .with_context(|| format!("write {}/HOOK.yaml", hook_dir.display()))?;
     fs::write(hook_dir.join("handler.py"), HERMES_HANDLER_PY)
         .with_context(|| format!("write {}/handler.py", hook_dir.display()))?;
-    println!("  hook → {} (restart `hermes gateway` to load)", hook_dir.display());
+    println!(
+        "  hook → {} (restart `hermes gateway` to load)",
+        hook_dir.display()
+    );
+    Ok(())
+}
+
+/// OpenCode auto-loads any `.ts`/`.js` file under `~/.config/opencode/plugins/`,
+/// so install is a single file drop. Skills live alongside under
+/// `~/.config/opencode/skills/`. Restart any open opencode session for the
+/// plugin to take effect.
+fn install_opencode(home: &Path, dry_run: bool) -> Result<()> {
+    println!("✓ {}: skills + plugin", InstallTarget::OpenCode.display());
+    let plugins_dir = home.join(".config").join("opencode").join("plugins");
+    let plugin_file = plugins_dir.join("memex.ts");
+    if dry_run {
+        println!("  would write plugin: {}", plugin_file.display());
+    } else {
+        fs::create_dir_all(&plugins_dir)
+            .with_context(|| format!("create {}", plugins_dir.display()))?;
+        fs::write(&plugin_file, OPENCODE_PLUGIN_TS)
+            .with_context(|| format!("write {}", plugin_file.display()))?;
+        println!(
+            "  plugin → {} (restart opencode to load)",
+            plugin_file.display()
+        );
+    }
+    install_skills(
+        &home.join(".config").join("opencode").join("skills"),
+        dry_run,
+    )?;
     Ok(())
 }
 
@@ -386,14 +435,11 @@ pub fn run_uninstall(
     }
 
     if selected.is_empty() {
-        eprintln!(
-            "no agent CLIs detected (looked for {}/.claude, {}/.codex, {}/.gemini, {}/.openclaw, {}/.hermes)",
-            home.display(),
-            home.display(),
-            home.display(),
-            home.display(),
-            home.display(),
-        );
+        let probed: Vec<String> = PROBE_DIRS
+            .iter()
+            .map(|(d, _)| format!("{}/{d}", home.display()))
+            .collect();
+        eprintln!("no agent CLIs detected (looked for {})", probed.join(", "));
         // Not an error — the daemon was still stopped above, and `--purge`
         // may still be the user's reason for running this.
     }
@@ -406,6 +452,7 @@ pub fn run_uninstall(
         match target {
             InstallTarget::OpenClaw => uninstall_openclaw(home, dry_run)?,
             InstallTarget::Hermes => uninstall_hermes(home, dry_run)?,
+            InstallTarget::OpenCode => uninstall_opencode(home, dry_run)?,
             _ => unreachable!("file_agent_spec covers all other variants"),
         }
     }
@@ -414,7 +461,10 @@ pub fn run_uninstall(
         let memex_root = home.join(".memex");
         if memex_root.is_dir() {
             if dry_run {
-                println!("would delete {} (wiki, models, daemon state)", memex_root.display());
+                println!(
+                    "would delete {} (wiki, models, daemon state)",
+                    memex_root.display()
+                );
             } else {
                 fs::remove_dir_all(&memex_root)
                     .with_context(|| format!("remove {}", memex_root.display()))?;
@@ -472,6 +522,28 @@ fn uninstall_hermes(home: &Path, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+fn uninstall_opencode(home: &Path, dry_run: bool) -> Result<()> {
+    let oc_root = home.join(".config").join("opencode");
+    let plugin_file = oc_root.join("plugins").join("memex.ts");
+    let skills_dir = oc_root.join("skills");
+    remove_skills(&skills_dir, dry_run)?;
+    println!(
+        "✓ {}: skills ← {}",
+        InstallTarget::OpenCode.display(),
+        skills_dir.display()
+    );
+    if plugin_file.exists() {
+        if dry_run {
+            println!("  would remove: {}", plugin_file.display());
+        } else {
+            fs::remove_file(&plugin_file)
+                .with_context(|| format!("remove {}", plugin_file.display()))?;
+            println!("  plugin ← {}", plugin_file.display());
+        }
+    }
+    Ok(())
+}
+
 fn uninstall_openclaw_hook_pack(home: &Path, dry_run: bool) {
     let pack_dir = home.join(".openclaw").join("hook-packs").join("memex");
     if dry_run {
@@ -504,8 +576,7 @@ fn remove_skills(skills_dir: &Path, dry_run: bool) -> Result<()> {
             removed_any = true;
             continue;
         }
-        fs::remove_dir_all(&dir)
-            .with_context(|| format!("remove {}", dir.display()))?;
+        fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
         removed_any = true;
     }
     if removed_any && !dry_run {
@@ -587,7 +658,7 @@ mod tests {
         let home = fake_home();
         run(home.path(), &[InstallTarget::ClaudeCode], false).unwrap();
 
-        let hooks_file = home.path().join(".claude/hooks.json");
+        let hooks_file = home.path().join(".claude/settings.json");
         assert!(hooks_file.exists());
         let v: Value = serde_json::from_str(&fs::read_to_string(&hooks_file).unwrap()).unwrap();
         let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -613,12 +684,21 @@ mod tests {
         assert!(hooks_file.exists());
         let v: Value = serde_json::from_str(&fs::read_to_string(&hooks_file).unwrap()).unwrap();
         // Codex uses Stop, not SessionEnd.
-        let stop_cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(stop_cmd.contains("memex hook ingest codex"), "got {stop_cmd}");
+        let stop_cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            stop_cmd.contains("memex hook ingest codex"),
+            "got {stop_cmd}"
+        );
 
         for name in ["memex-query", "memex-ingest", "memex-brainstorm"] {
             let skill = t.path().join(".codex/skills").join(name).join("SKILL.md");
-            assert!(skill.exists(), "codex skill not written: {}", skill.display());
+            assert!(
+                skill.exists(),
+                "codex skill not written: {}",
+                skill.display()
+            );
         }
     }
 
@@ -631,12 +711,21 @@ mod tests {
         let settings_file = t.path().join(".gemini/settings.json");
         assert!(settings_file.exists());
         let v: Value = serde_json::from_str(&fs::read_to_string(&settings_file).unwrap()).unwrap();
-        let end_cmd = v["hooks"]["SessionEnd"][0]["hooks"][0]["command"].as_str().unwrap();
-        assert!(end_cmd.contains("memex hook ingest gemini-cli"), "got {end_cmd}");
+        let end_cmd = v["hooks"]["SessionEnd"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            end_cmd.contains("memex hook ingest gemini-cli"),
+            "got {end_cmd}"
+        );
 
         for name in ["memex-query", "memex-ingest", "memex-brainstorm"] {
             let skill = t.path().join(".gemini/skills").join(name).join("SKILL.md");
-            assert!(skill.exists(), "gemini skill not written: {}", skill.display());
+            assert!(
+                skill.exists(),
+                "gemini skill not written: {}",
+                skill.display()
+            );
         }
     }
 
@@ -649,7 +738,11 @@ mod tests {
         // Skills land in ~/.agents/skills/ (OpenClaw's cross-agent location).
         for name in ["memex-query", "memex-ingest", "memex-brainstorm"] {
             let skill = t.path().join(".agents/skills").join(name).join("SKILL.md");
-            assert!(skill.exists(), "openclaw skill not at expected path: {}", skill.display());
+            assert!(
+                skill.exists(),
+                "openclaw skill not at expected path: {}",
+                skill.display()
+            );
         }
 
         // Hook pack written to ~/.openclaw/hook-packs/memex/ with the nested
@@ -657,7 +750,10 @@ mod tests {
         let pack = t.path().join(".openclaw/hook-packs/memex");
         assert!(pack.join("package.json").exists(), "missing package.json");
         assert!(pack.join("memex/HOOK.md").exists(), "missing memex/HOOK.md");
-        assert!(pack.join("memex/handler.js").exists(), "missing memex/handler.js");
+        assert!(
+            pack.join("memex/handler.js").exists(),
+            "missing memex/handler.js"
+        );
         // The `openclaw plugins install --link` step is best-effort and only
         // tries `openclaw` on PATH; not asserted here (the binary may be
         // absent in the test sandbox).
@@ -680,7 +776,11 @@ mod tests {
         // Skills land in ~/.agents/skills/ (shared with OpenClaw).
         for name in ["memex-query", "memex-ingest", "memex-brainstorm"] {
             let skill = t.path().join(".agents/skills").join(name).join("SKILL.md");
-            assert!(skill.exists(), "hermes skill not at expected path: {}", skill.display());
+            assert!(
+                skill.exists(),
+                "hermes skill not at expected path: {}",
+                skill.display()
+            );
         }
 
         // Hook files at ~/.hermes/hooks/memex/{HOOK.yaml,handler.py}.
@@ -691,6 +791,63 @@ mod tests {
         // Re-running should be idempotent (no panic, files still there).
         run(t.path(), &[InstallTarget::Hermes], false).unwrap();
         assert!(hook.join("HOOK.yaml").exists());
+    }
+
+    #[test]
+    fn install_opencode_writes_plugin_and_skills() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join(".config/opencode")).unwrap();
+        run(t.path(), &[InstallTarget::OpenCode], false).unwrap();
+
+        let plugin = t.path().join(".config/opencode/plugins/memex.ts");
+        assert!(plugin.exists(), "missing plugin file: {}", plugin.display());
+        let body = fs::read_to_string(&plugin).unwrap();
+        assert!(
+            body.contains("session.idle"),
+            "plugin body missing session.idle wiring"
+        );
+        assert!(body.contains("memex"), "plugin body missing memex command");
+
+        for name in ["memex-query", "memex-ingest", "memex-brainstorm"] {
+            let skill = t
+                .path()
+                .join(".config/opencode/skills")
+                .join(name)
+                .join("SKILL.md");
+            assert!(
+                skill.exists(),
+                "opencode skill not written: {}",
+                skill.display()
+            );
+        }
+
+        // Idempotent: re-running just rewrites the same file.
+        run(t.path(), &[InstallTarget::OpenCode], false).unwrap();
+        assert!(plugin.exists());
+    }
+
+    #[test]
+    fn detect_picks_up_opencode() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join(".config/opencode")).unwrap();
+        let found = detect(t.path());
+        assert_eq!(found, vec![InstallTarget::OpenCode]);
+    }
+
+    #[test]
+    fn uninstall_opencode_removes_plugin_and_skills() {
+        let t = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t.path().join(".config/opencode")).unwrap();
+        run(t.path(), &[InstallTarget::OpenCode], false).unwrap();
+        let plugin = t.path().join(".config/opencode/plugins/memex.ts");
+        let skill = t
+            .path()
+            .join(".config/opencode/skills/memex-query/SKILL.md");
+        assert!(plugin.exists() && skill.exists());
+
+        run_uninstall(t.path(), &[InstallTarget::OpenCode], false, false).unwrap();
+        assert!(!plugin.exists(), "plugin not removed");
+        assert!(!skill.exists(), "skill not removed");
     }
 
     #[test]
@@ -741,7 +898,7 @@ mod tests {
         let home = fake_home();
 
         // Seed an old-style memex entry that should get replaced.
-        let hooks_file = home.path().join(".claude/hooks.json");
+        let hooks_file = home.path().join(".claude/settings.json");
         let stale = json!({
             "hooks": {
                 "SessionEnd": [
@@ -785,7 +942,7 @@ mod tests {
     fn dry_run_does_not_write() {
         let home = fake_home();
         run(home.path(), &[InstallTarget::ClaudeCode], true).unwrap();
-        assert!(!home.path().join(".claude/hooks.json").exists());
+        assert!(!home.path().join(".claude/settings.json").exists());
         assert!(
             !home
                 .path()
@@ -816,7 +973,7 @@ mod tests {
         run(home.path(), &[InstallTarget::ClaudeCode], false).unwrap();
 
         // Add an unrelated user-owned hook the uninstall must NOT touch.
-        let hooks_file = home.path().join(".claude/hooks.json");
+        let hooks_file = home.path().join(".claude/settings.json");
         let mut v: Value = serde_json::from_str(&fs::read_to_string(&hooks_file).unwrap()).unwrap();
         let session_end = v["hooks"]["SessionEnd"].as_array_mut().unwrap();
         session_end.push(json!({
@@ -848,7 +1005,7 @@ mod tests {
         run_uninstall(home.path(), &[InstallTarget::ClaudeCode], false, false).unwrap();
 
         let v: Value = serde_json::from_str(
-            &fs::read_to_string(home.path().join(".claude/hooks.json")).unwrap(),
+            &fs::read_to_string(home.path().join(".claude/settings.json")).unwrap(),
         )
         .unwrap();
         // No user-owned entries existed, so .hooks should be gone (not an empty object).
@@ -868,11 +1025,45 @@ mod tests {
     fn uninstall_dry_run_does_not_write() {
         let home = fake_home();
         run(home.path(), &[InstallTarget::ClaudeCode], false).unwrap();
-        let before = fs::read_to_string(home.path().join(".claude/hooks.json")).unwrap();
+        let before = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
         run_uninstall(home.path(), &[InstallTarget::ClaudeCode], true, false).unwrap();
-        let after = fs::read_to_string(home.path().join(".claude/hooks.json")).unwrap();
+        let after = fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
         assert_eq!(before, after, "dry-run should not have rewritten hooks");
         assert!(home.path().join(".claude/skills/memex-query").exists());
+    }
+
+    #[test]
+    fn install_preserves_unrelated_settings_keys() {
+        let home = fake_home();
+        let settings = home.path().join(".claude/settings.json");
+        let seeded = json!({
+            "permissions": {"defaultMode": "auto", "allow": ["Bash(git *)"]},
+            "enabledPlugins": {"superpowers@official": true},
+            "statusLine": {"type": "command", "command": "/bin/echo hi"}
+        });
+        fs::write(&settings, serde_json::to_string_pretty(&seeded).unwrap()).unwrap();
+
+        run(home.path(), &[InstallTarget::ClaudeCode], false).unwrap();
+
+        let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["permissions"], seeded["permissions"]);
+        assert_eq!(v["enabledPlugins"], seeded["enabledPlugins"]);
+        assert_eq!(v["statusLine"], seeded["statusLine"]);
+        let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("memex daemon"));
+
+        run_uninstall(home.path(), &[InstallTarget::ClaudeCode], false, false).unwrap();
+
+        let v: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["permissions"], seeded["permissions"]);
+        assert_eq!(v["enabledPlugins"], seeded["enabledPlugins"]);
+        assert_eq!(v["statusLine"], seeded["statusLine"]);
+        assert!(
+            v.get("hooks").is_none(),
+            "hooks should be stripped, got {v}"
+        );
     }
 
     #[test]
@@ -896,6 +1087,9 @@ mod tests {
 
         run_uninstall(home.path(), &[InstallTarget::ClaudeCode], false, false).unwrap();
 
-        assert!(memex_root.join("wiki/test.md").exists(), "wiki must survive without --purge");
+        assert!(
+            memex_root.join("wiki/test.md").exists(),
+            "wiki must survive without --purge"
+        );
     }
 }

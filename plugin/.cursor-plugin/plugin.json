@@ -1,10 +1,16 @@
 {
   "name": "memex",
   "description": "Personal wiki storage and search engine for AI agents",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "Zubiao Xiong"
   },
   "repository": "https://github.com/xiongzubiao/memex",
-  "keywords": ["wiki", "knowledge", "search", "brainstorm", "memex"]
+  "keywords": [
+    "wiki",
+    "knowledge",
+    "search",
+    "brainstorm",
+    "memex"
+  ]
 }

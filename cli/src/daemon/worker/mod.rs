@@ -313,9 +313,7 @@ impl WorkerPool {
         let pool = Self::empty(WorkerConfig::default(), MemexHandle::new());
         pool.live.store(pool.cfg.max_count, Ordering::Release);
         let rx = pool.rx.clone();
-        tokio::spawn(async move {
-            while rx.recv().await.is_ok() {}
-        });
+        tokio::spawn(async move { while rx.recv().await.is_ok() {} });
         pool
     }
 
@@ -324,10 +322,7 @@ impl WorkerPool {
     /// would call merge return an error if no closure is supplied). Expand
     /// and Synth jobs are unsupported — return Backend errors.
     #[cfg(any(test, feature = "test-harness"))]
-    pub fn new_with_mock(
-        extract: MockPromptFn,
-        merge: Option<MockPromptFn>,
-    ) -> Self {
+    pub fn new_with_mock(extract: MockPromptFn, merge: Option<MockPromptFn>) -> Self {
         let pool = Self::empty(WorkerConfig::default(), MemexHandle::new());
         // Pretend max-count workers are already alive so `submit()`'s
         // autoscale path never spawns a real subprocess worker. Without
@@ -459,7 +454,8 @@ async fn run(
             jobs_done = 0;
         }
 
-        let (outcome, input_tokens) = run_job_with_retry(&mut subprocess, &cfg, &memex_handle, &job).await;
+        let (outcome, input_tokens) =
+            run_job_with_retry(&mut subprocess, &cfg, &memex_handle, &job).await;
 
         // Count any turn that actually ran to a terminal event. Only skip
         // Crash / Timeout — the subprocess didn't complete a turn. New
@@ -578,7 +574,8 @@ async fn run_job_with_retry(
 
     // Compute the cache key from (model, task, system_prompt, user_prompt).
     // WORKER_PROMPT is the system prompt shared by all backends.
-    let cache_key = memex_core::llm_cache::cache_key(model_name, task_label, WORKER_PROMPT, &prompt);
+    let cache_key =
+        memex_core::llm_cache::cache_key(model_name, task_label, WORKER_PROMPT, &prompt);
 
     // Try to find a cached result. The MemexHandle is single-root and
     // pre-populated by the handler before any jobs are enqueued, so
@@ -586,30 +583,45 @@ async fn run_job_with_retry(
     let cached_memex: Option<std::sync::Arc<memex_core::Memex>> = memex_handle.get();
 
     if let Some(ref mx) = cached_memex
-        && let Ok(Some(cached_text)) = mx.search().with_connection(|c| {
-            memex_core::llm_cache::lookup_cache(c, &cache_key)
-        }) {
-            tracing::debug!(task_label, "llm_cache hit");
-            let outcome = match kind {
-                TaskKind::Expand => JobOutcome::Expand(
-                    parse::parse_expansion(&cached_text)
-                        .map_err(|e| WorkerError::Backend { message: e.raw, code: None }),
-                ),
-                TaskKind::Synthesize => JobOutcome::Synth(
-                    parse::parse_synthesis(&cached_text)
-                        .map_err(|e| WorkerError::Backend { message: e.raw, code: None }),
-                ),
-                TaskKind::Extract => JobOutcome::Ingest(
-                    parse::parse_ingest(&cached_text)
-                        .map_err(|e| WorkerError::Backend { message: e.raw, code: None }),
-                ),
-                TaskKind::Merge => JobOutcome::Merge(
-                    parse::parse_merge(&cached_text)
-                        .map_err(|e| WorkerError::Backend { message: e.raw, code: None }),
-                ),
-            };
-            return (outcome, 0);
-        }
+        && let Ok(Some(cached_text)) = mx
+            .search()
+            .with_connection(|c| memex_core::llm_cache::lookup_cache(c, &cache_key))
+    {
+        tracing::debug!(task_label, "llm_cache hit");
+        let outcome = match kind {
+            TaskKind::Expand => {
+                JobOutcome::Expand(parse::parse_expansion(&cached_text).map_err(|e| {
+                    WorkerError::Backend {
+                        message: e.raw,
+                        code: None,
+                    }
+                }))
+            }
+            TaskKind::Synthesize => {
+                JobOutcome::Synth(parse::parse_synthesis(&cached_text).map_err(|e| {
+                    WorkerError::Backend {
+                        message: e.raw,
+                        code: None,
+                    }
+                }))
+            }
+            TaskKind::Extract => {
+                JobOutcome::Ingest(parse::parse_ingest(&cached_text).map_err(|e| {
+                    WorkerError::Backend {
+                        message: e.raw,
+                        code: None,
+                    }
+                }))
+            }
+            TaskKind::Merge => JobOutcome::Merge(parse::parse_merge(&cached_text).map_err(|e| {
+                WorkerError::Backend {
+                    message: e.raw,
+                    code: None,
+                }
+            })),
+        };
+        return (outcome, 0);
+    }
 
     let timeout = std::time::Duration::from_secs(cfg.timeout_sec);
     let mut last_err: WorkerError = WorkerError::Crash("no attempt completed".into());
@@ -698,7 +710,9 @@ async fn run_job_with_retry(
             }
             Err(_elapsed) => {
                 tracing::warn!(attempt, secs = cfg.timeout_sec, "turn timed out; retrying");
-                last_err = WorkerError::Timeout { secs: cfg.timeout_sec };
+                last_err = WorkerError::Timeout {
+                    secs: cfg.timeout_sec,
+                };
                 *subprocess = None;
             }
         }
@@ -838,7 +852,10 @@ mod tests {
         assert!(p.contains("\"role\":\"assistant\""));
         assert!(p.contains("\"timestamp\":\"2026-04-23T12:00:00Z\""));
         assert!(p.contains("\"source\":\"/tmp/transcript.jsonl\""));
-        assert!(!p.contains("\"chunk_index\""), "transcript prompt must not include chunk metadata");
+        assert!(
+            !p.contains("\"chunk_index\""),
+            "transcript prompt must not include chunk metadata"
+        );
     }
 
     #[test]
@@ -862,7 +879,10 @@ mod tests {
         );
         let p = build_extract_prompt(&job);
         assert!(p.starts_with("[TASK: EXTRACT]"));
-        assert!(!p.contains("\"role\""), "document segment must not emit role: {p}");
+        assert!(
+            !p.contains("\"role\""),
+            "document segment must not emit role: {p}"
+        );
         assert!(p.contains("\"text\":\"# Heading"));
         assert!(p.contains("\"source\":\"https://example.com/doc\""));
     }
@@ -881,7 +901,10 @@ mod tests {
         );
         let p = build_extract_prompt(&job);
         assert!(p.starts_with("[TASK: EXTRACT]"));
-        assert!(p.contains("\"chunk_index\":1"), "expected chunk_index=1: {p}");
+        assert!(
+            p.contains("\"chunk_index\":1"),
+            "expected chunk_index=1: {p}"
+        );
         assert!(p.contains("\"total_chunks\":3"));
     }
 
@@ -940,10 +963,11 @@ mod tests {
             .strip_prefix("[TASK: EXTRACT]\n\n")
             .expect("missing [TASK: EXTRACT] header")
             .trim_end();
-        let parsed: Value = serde_json::from_str(body)
-            .expect("prompt body must be valid JSON");
+        let parsed: Value = serde_json::from_str(body).expect("prompt body must be valid JSON");
 
-        let segs = parsed["segments"].as_array().expect("segments must be an array");
+        let segs = parsed["segments"]
+            .as_array()
+            .expect("segments must be an array");
         assert_eq!(segs.len(), segments.len(), "all segments must be preserved");
 
         for (i, expected) in segments.iter().enumerate() {
@@ -1011,20 +1035,34 @@ mod tests {
         );
 
         // Verify cache round-trip through with_connection.
-        let key = memex_core::llm_cache::cache_key("test-model", "synth", WORKER_PROMPT, "Intent: auth\n\nwhat are tokens?");
-        let miss = memex.search().with_connection(|c| {
-            memex_core::llm_cache::lookup_cache(c, &key)
-        }).unwrap();
+        let key = memex_core::llm_cache::cache_key(
+            "test-model",
+            "synth",
+            WORKER_PROMPT,
+            "Intent: auth\n\nwhat are tokens?",
+        );
+        let miss = memex
+            .search()
+            .with_connection(|c| memex_core::llm_cache::lookup_cache(c, &key))
+            .unwrap();
         assert!(miss.is_none(), "fresh db must have no cache entry");
 
-        memex.search().with_connection(|c| {
-            memex_core::llm_cache::insert_cache(c, &key, r#"{"answer":"tokens are...","citations":[]}"#)?;
-            Ok(())
-        }).unwrap();
+        memex
+            .search()
+            .with_connection(|c| {
+                memex_core::llm_cache::insert_cache(
+                    c,
+                    &key,
+                    r#"{"answer":"tokens are...","citations":[]}"#,
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
-        let hit = memex.search().with_connection(|c| {
-            memex_core::llm_cache::lookup_cache(c, &key)
-        }).unwrap();
+        let hit = memex
+            .search()
+            .with_connection(|c| memex_core::llm_cache::lookup_cache(c, &key))
+            .unwrap();
         assert_eq!(
             hit.as_deref(),
             Some(r#"{"answer":"tokens are...","citations":[]}"#),
@@ -1032,13 +1070,17 @@ mod tests {
         );
 
         // Duplicate insert must be ignored (INSERT OR IGNORE).
-        memex.search().with_connection(|c| {
-            memex_core::llm_cache::insert_cache(c, &key, "overwrite-attempt")?;
-            Ok(())
-        }).unwrap();
-        let still_first = memex.search().with_connection(|c| {
-            memex_core::llm_cache::lookup_cache(c, &key)
-        }).unwrap();
+        memex
+            .search()
+            .with_connection(|c| {
+                memex_core::llm_cache::insert_cache(c, &key, "overwrite-attempt")?;
+                Ok(())
+            })
+            .unwrap();
+        let still_first = memex
+            .search()
+            .with_connection(|c| memex_core::llm_cache::lookup_cache(c, &key))
+            .unwrap();
         assert_eq!(
             still_first.as_deref(),
             Some(r#"{"answer":"tokens are...","citations":[]}"#),

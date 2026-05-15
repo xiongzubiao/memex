@@ -1,5 +1,6 @@
 mod common;
 
+use memex_core::embed::MockEmbedder;
 use memex_core::{FixOutcome, Memex};
 use std::time::Duration;
 
@@ -54,23 +55,27 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         })
         .unwrap();
 
-    // Concurrent writer fixes the issue.
+    // Concurrent writer fixes the issue. Use the `_with` variant +
+    // MockEmbedder so the test exercises the apply-fix code path without
+    // requiring ONNX runtime on the CI runner.
     {
         let r2 = root.clone();
         let issue = (*stale[0]).clone();
         std::thread::spawn(move || {
             let w = Memex::open_writer(r2).unwrap();
-            w.apply_fix(&issue).unwrap();
+            w.apply_fix_with(&issue, &mut MockEmbedder).unwrap();
         })
         .join()
         .unwrap();
     }
 
-    // Reader's apply_fix_locked MUST use a FRESH connection to see the fixed
-    // state. If it reused reader.search (the regression), it would see the
-    // pinned snapshot where disk=v2, DB=v1 (still stale), and attempt to
+    // Reader's apply_fix_locked_with MUST use a FRESH connection to see the
+    // fixed state. If it reused reader.search (the regression), it would see
+    // the pinned snapshot where disk=v2, DB=v1 (still stale), and attempt to
     // re-apply the fix.
-    let outcome = reader.apply_fix_locked(stale[0]).unwrap();
+    let outcome = reader
+        .apply_fix_locked_with(stale[0], &mut MockEmbedder)
+        .unwrap();
     assert!(
         matches!(outcome, FixOutcome::Stale),
         "reader must see committed state via fresh connection, got {outcome:?}"
@@ -117,7 +122,10 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
     assert_eq!(stale.len(), 1);
 
     // Apply the fix via the reader path (acquires writer lock, runs, releases).
-    let outcome = reader.apply_fix_locked(stale[0]).unwrap();
+    // Use the `_with` variant + MockEmbedder so we don't need ONNX in CI.
+    let outcome = reader
+        .apply_fix_locked_with(stale[0], &mut MockEmbedder)
+        .unwrap();
     assert!(matches!(outcome, memex_core::FixOutcome::Applied));
 
     // Immediately try to acquire the writer lock with a tight timeout.

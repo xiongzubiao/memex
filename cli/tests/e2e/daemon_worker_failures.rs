@@ -13,7 +13,8 @@ fn harness_with_mock_mode(mode: &str) -> (tempfile::TempDir, std::path::PathBuf,
         .extra_path(&extra_path)
         .env("MOCK_CLAUDE_CODE_MODE", mode)
         .start();
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",
@@ -89,7 +90,8 @@ fn timeout_retries_then_surfaces_subprocess_timeout() {
         .env("MOCK_CLAUDE_CODE_MODE", "timeout")
         .env("MEMEX__DAEMON__WORKER__TIMEOUT_SEC", "2")
         .start();
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",
@@ -120,7 +122,8 @@ fn restart_cadence_respawns_and_keeps_working() {
         .env("MEMEX__DAEMON__WORKER__MAX_COUNT", "1")
         .env("MEMEX__DAEMON__WORKER__RESTART_AFTER_JOBS", "2")
         .start();
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",

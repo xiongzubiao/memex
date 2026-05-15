@@ -42,9 +42,8 @@ pub fn index_raw_file(
     }
 
     let bytes = std::fs::read(path)?;
-    let file = String::from_utf8(bytes).map_err(|e| {
-        crate::error::MemexError::Other(anyhow::anyhow!("non-utf8 raw file: {e}"))
-    })?;
+    let file = String::from_utf8(bytes)
+        .map_err(|e| crate::error::MemexError::Other(anyhow::anyhow!("non-utf8 raw file: {e}")))?;
     // parse_raw_frontmatter gives us the schema-typed fields (source,
     // title, ...) and the body slice. The body hash here doubles as the
     // path-integrity check (raw paths encode the body hash) and as
@@ -156,7 +155,6 @@ mod tests {
             ingested_at: Some("2026-04-26T10:00:00Z".into()),
             converter: Some("markitdown".into()),
             title: Some("Auth Tokens Explained".into()),
-            ..Default::default()
         };
         std::fs::write(&raw_path, crate::raw::assemble_raw_file(&fm, body)).unwrap();
 
@@ -174,7 +172,10 @@ mod tests {
         assert_eq!(title, "Auth Tokens Explained");
         assert_eq!(source, "https://x/p");
         assert_eq!(hash_db, hash);
-        assert!(embed_model.is_none(), "model=None should leave embed_model NULL");
+        assert!(
+            embed_model.is_none(),
+            "model=None should leave embed_model NULL"
+        );
     }
 
     #[test]

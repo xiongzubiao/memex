@@ -1,7 +1,7 @@
 //! Integration tests for the daemon lifecycle.
 
-
-#[allow(unused_imports)] use crate::common;
+#[allow(unused_imports)]
+use crate::common;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};

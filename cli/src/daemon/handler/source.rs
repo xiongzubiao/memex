@@ -1,9 +1,7 @@
 //! `Request::SourceAdd` and `Request::SourceDelete` handlers.
 
 use crate::daemon::error::DaemonError;
-use crate::daemon::handler::{
-    HandlerState, error_events, get_or_open_memex, validate_source_path,
-};
+use crate::daemon::handler::{HandlerState, error_events, get_or_open_memex, validate_source_path};
 use crate::daemon::protocol::Event;
 
 pub(super) async fn handle_source_add(
@@ -38,7 +36,11 @@ pub(super) async fn handle_source_add(
     let derived_title = derive_source_title(&content, &source_path);
 
     if !raw_path.exists() {
-        let kind = if memex_core::raw::is_url(&source_path) { "url" } else { "path" };
+        let kind = if memex_core::raw::is_url(&source_path) {
+            "url"
+        } else {
+            "path"
+        };
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let fm = memex_core::raw::RawFrontmatter {
             source: Some(source_path.clone()),
@@ -74,10 +76,7 @@ pub(super) async fn handle_source_add(
     }
 
     let docid = memex_core::docid::short(&body_hash).to_string();
-    vec![
-        Event::SourceAdded { docid },
-        Event::Done { status: 0 },
-    ]
+    vec![Event::SourceAdded { docid }, Event::Done { status: 0 }]
 }
 
 pub(super) async fn handle_source_delete(

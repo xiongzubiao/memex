@@ -27,10 +27,14 @@ impl Default for Config {
 
 impl Config {
     pub fn wiki_dir(&self, root: &Path) -> PathBuf {
-        self.wiki_override.clone().unwrap_or_else(|| root.join("wiki"))
+        self.wiki_override
+            .clone()
+            .unwrap_or_else(|| root.join("wiki"))
     }
     pub fn raw_dir(&self, root: &Path) -> PathBuf {
-        self.raw_override.clone().unwrap_or_else(|| root.join("raw"))
+        self.raw_override
+            .clone()
+            .unwrap_or_else(|| root.join("raw"))
     }
 }
 
@@ -73,7 +77,9 @@ impl Config {
             if let Some(storage) = parsed.storage {
                 cfg.wiki_override = storage.wiki.map(PathBuf::from);
                 cfg.raw_override = storage.raw.map(PathBuf::from);
-                if let Some(p) = storage.poll_interval_sec { cfg.poll_interval_sec = p; }
+                if let Some(p) = storage.poll_interval_sec {
+                    cfg.poll_interval_sec = p;
+                }
             }
         }
 
@@ -303,8 +309,14 @@ mod tests {
             "[storage]\nwiki = \"/Users/me/Notes/wiki\"\nraw = \"/mnt/nas/raw\"\npoll_interval_sec = 90\n"
         ).unwrap();
         let cfg = Config::load(dir.path()).unwrap();
-        assert_eq!(cfg.wiki_dir(dir.path()), std::path::PathBuf::from("/Users/me/Notes/wiki"));
-        assert_eq!(cfg.raw_dir(dir.path()), std::path::PathBuf::from("/mnt/nas/raw"));
+        assert_eq!(
+            cfg.wiki_dir(dir.path()),
+            std::path::PathBuf::from("/Users/me/Notes/wiki")
+        );
+        assert_eq!(
+            cfg.raw_dir(dir.path()),
+            std::path::PathBuf::from("/mnt/nas/raw")
+        );
         assert_eq!(cfg.poll_interval_sec, 90);
     }
 

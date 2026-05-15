@@ -120,12 +120,11 @@ impl HandlerState {
 /// Single-slug convenience over `acquire_slug_locks`. Most ingest /
 /// write / delete paths touch exactly one slug; the original
 /// `vec![slug.clone()]` wrapping at every call site was noise.
-pub(super) async fn acquire_slug_lock(
-    writer: &WriterSession,
-    slug: &str,
-) -> OwnedMutexGuard<()> {
+pub(super) async fn acquire_slug_lock(writer: &WriterSession, slug: &str) -> OwnedMutexGuard<()> {
     let mut guards = acquire_slug_locks(writer, vec![slug.to_string()]).await;
-    guards.pop().expect("acquire_slug_locks returns one guard for one slug")
+    guards
+        .pop()
+        .expect("acquire_slug_locks returns one guard for one slug")
 }
 
 pub(super) async fn acquire_slug_locks(
@@ -221,8 +220,9 @@ pub(super) async fn run_worker_job<R, F>(
 ) -> Result<R, DaemonError>
 where
     R: Send + 'static,
-    F: FnOnce(tokio::sync::oneshot::Sender<Result<R, crate::daemon::queue::WorkerError>>)
-        -> crate::daemon::queue::BackendJob,
+    F: FnOnce(
+        tokio::sync::oneshot::Sender<Result<R, crate::daemon::queue::WorkerError>>,
+    ) -> crate::daemon::queue::BackendJob,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let job = build_job(tx);
@@ -364,7 +364,10 @@ pub(super) fn validate_source_path(s: &str) -> Result<(), String> {
         return Err("source path is empty".into());
     }
     if s.len() > 2048 {
-        return Err(format!("source path too long: {} chars (max 2048)", s.len()));
+        return Err(format!(
+            "source path too long: {} chars (max 2048)",
+            s.len()
+        ));
     }
     for c in s.chars() {
         let cu = c as u32;

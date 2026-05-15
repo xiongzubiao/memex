@@ -21,10 +21,10 @@ pub struct ReconcileReport {
     pub hash_mismatches: usize,
 }
 
-/// Output of `reconcile_walk`: the file lists the caller should index
-/// + the doc-row paths it should delete. Lets the daemon chunk the
-/// per-file indexing so the embed-model lock isn't held for an entire
-/// long reconcile sweep.
+/// Output of `reconcile_walk`: the file lists the caller should index plus
+/// the doc-row paths it should delete. Lets the daemon chunk the per-file
+/// indexing so the embed-model lock isn't held for an entire long reconcile
+/// sweep.
 #[derive(Debug, Default)]
 pub struct ReconcilePlan {
     pub wiki_paths: Vec<std::path::PathBuf>,
@@ -210,10 +210,7 @@ fn walk_dir(
     // forever as `missing-file:` in lint).
     let max_depth = if doc_type == "raw" { 2 } else { 1 };
     let mut out = Vec::new();
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .max_depth(max_depth)
-    {
+    for entry in WalkDir::new(root).follow_links(false).max_depth(max_depth) {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -232,7 +229,10 @@ fn walk_dir(
         if doc_type == "wiki" && path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let rel = path.strip_prefix(memex.root()).unwrap_or(path).to_path_buf();
+        let rel = path
+            .strip_prefix(memex.root())
+            .unwrap_or(path)
+            .to_path_buf();
         if rel
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -473,7 +473,9 @@ sources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\
         };
         std::fs::write(&raw_path, assemble_raw_file(&original_fm, body)).unwrap();
         crate::index_raw::index_raw_file(&memex, &raw_path, None).unwrap();
-        let raw_rel = raw_path.strip_prefix(memex.root()).unwrap_or(&raw_path)
+        let raw_rel = raw_path
+            .strip_prefix(memex.root())
+            .unwrap_or(&raw_path)
             .to_string_lossy()
             .to_string();
         let pre_hash = memex
