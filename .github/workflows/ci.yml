@@ -31,10 +31,16 @@ jobs:
 
       # Clippy runs first because it doubles as the compile check and is
       # cheap to re-use for `cargo test` below (same artifacts).
-      # Pre-existing warnings exist across the workspace; tighten to
-      # `-D warnings` once those are cleared.
+      # `-D warnings` makes any new clippy warning fail CI.
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --no-deps
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace --all-targets
+
+      # actionlint catches workflow YAML mistakes and surfaces them as
+      # inline PR annotations on the diff via reviewdog. `fail_level: error`
+      # fails the job if actionlint reports any error-severity finding.
+      - uses: reviewdog/action-actionlint@v1
+        with:
+          fail_level: error

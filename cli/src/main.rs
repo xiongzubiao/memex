@@ -1267,10 +1267,8 @@ fn drive_ingest_request(
                 eprintln!("ingest error ({code}): {message}");
                 exit_code = *status;
             }
-            memex_cli::daemon::protocol::Event::Stored { wiki_pages, .. } => {
-                if !quiet {
-                    println!("stored: {} pages", wiki_pages.len());
-                }
+            memex_cli::daemon::protocol::Event::Stored { wiki_pages, .. } if !quiet => {
+                println!("stored: {} pages", wiki_pages.len());
             }
             memex_cli::daemon::protocol::Event::Done { status } if *status != 0 => {
                 exit_code = *status;

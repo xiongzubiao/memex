@@ -957,7 +957,7 @@ async fn materialize_dedup_pairs(
 ) {
     let mut new_pages = Vec::new();
     let mut merge_pairs = Vec::new();
-    for (page, slug) in valid_pages.iter().zip(slugs.into_iter()) {
+    for (page, slug) in valid_pages.iter().zip(slugs) {
         match slug {
             Some(slug) => {
                 let existing_path = memex_core::wiki::wiki_path_for_slug(wiki_dir, &slug);

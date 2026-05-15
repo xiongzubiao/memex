@@ -155,7 +155,6 @@ mod tests {
             ingested_at: Some("2026-04-26T10:00:00Z".into()),
             converter: Some("markitdown".into()),
             title: Some("Auth Tokens Explained".into()),
-            ..Default::default()
         };
         std::fs::write(&raw_path, crate::raw::assemble_raw_file(&fm, body)).unwrap();
 

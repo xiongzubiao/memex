@@ -102,7 +102,7 @@ pub(super) async fn handle_write(
         .filter(|(stem, _)| memex_core::crosslink::auto_link_eligible(stem))
         .cloned()
         .collect();
-    let (linked_body, linked) = memex_core::crosslink::forward_link(&body, &eligible_pages, &slug);
+    let (linked_body, linked) = memex_core::crosslink::forward_link(body, &eligible_pages, &slug);
 
     // suggest_create: any [[stem]] left in the body whose target
     // page doesn't exist (after forward_link's pass).

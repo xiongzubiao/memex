@@ -234,6 +234,7 @@ pub fn hybrid_retrieve_expanded(
 /// `src/store.ts:4131`. Short common tokens like "the", "did", "to"
 /// would contribute uniform noise to chunk scores; dropping them
 /// keeps the signal-bearing nouns and verbs in charge.
+#[allow(clippy::too_many_arguments)] // body cache + retrieval signals are genuinely independent inputs
 fn populate_bodies(
     results: &mut Vec<SearchResult>,
     search: &Db,

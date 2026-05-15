@@ -336,10 +336,8 @@ pub async fn ingest_opencode_async(
     let mut status_code = 1;
     for ev in &events {
         match ev {
-            protocol::Event::Queued { job_id, .. } => {
-                if !job_id.is_empty() {
-                    eprintln!("memex: queued {job_id}");
-                }
+            protocol::Event::Queued { job_id, .. } if !job_id.is_empty() => {
+                eprintln!("memex: queued {job_id}");
             }
             protocol::Event::Error { code, message, .. } => {
                 eprintln!("memex ingest error ({code}): {message}");
@@ -391,10 +389,8 @@ pub async fn ingest_async(
     let mut status_code = 1;
     for ev in &events {
         match ev {
-            protocol::Event::Queued { job_id, .. } => {
-                if !job_id.is_empty() {
-                    eprintln!("memex: queued {job_id}");
-                }
+            protocol::Event::Queued { job_id, .. } if !job_id.is_empty() => {
+                eprintln!("memex: queued {job_id}");
             }
             protocol::Event::Error { code, message, .. } => {
                 eprintln!("memex ingest error ({code}): {message}");
@@ -510,10 +506,8 @@ pub fn query_raw(
                 }
                 status_code = *status;
             }
-            protocol::Event::Done { status } => {
-                if *status == 0 {
-                    status_code = 0;
-                }
+            protocol::Event::Done { status } if *status == 0 => {
+                status_code = 0;
             }
             _ => {}
         }
@@ -603,10 +597,8 @@ pub fn query_synth(
                 }
                 status_code = *status;
             }
-            protocol::Event::Done { status } => {
-                if *status == 0 {
-                    status_code = 0;
-                }
+            protocol::Event::Done { status } if *status == 0 => {
+                status_code = 0;
             }
             _ => {}
         }

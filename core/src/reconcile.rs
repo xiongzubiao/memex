@@ -21,10 +21,10 @@ pub struct ReconcileReport {
     pub hash_mismatches: usize,
 }
 
-/// Output of `reconcile_walk`: the file lists the caller should index
-/// + the doc-row paths it should delete. Lets the daemon chunk the
-/// per-file indexing so the embed-model lock isn't held for an entire
-/// long reconcile sweep.
+/// Output of `reconcile_walk`: the file lists the caller should index plus
+/// the doc-row paths it should delete. Lets the daemon chunk the per-file
+/// indexing so the embed-model lock isn't held for an entire long reconcile
+/// sweep.
 #[derive(Debug, Default)]
 pub struct ReconcilePlan {
     pub wiki_paths: Vec<std::path::PathBuf>,

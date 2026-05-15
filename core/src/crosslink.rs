@@ -30,7 +30,7 @@ pub fn forward_link(
     // Sort by title length descending so longer (more specific) titles match
     // before their substrings (e.g. "Rust Borrow Checker" before "Rust").
     let mut sorted_pages: Vec<&(String, String)> = existing_pages.iter().collect();
-    sorted_pages.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted_pages.sort_by_key(|p| std::cmp::Reverse(p.1.len()));
 
     for (stem, title) in sorted_pages {
         // Never self-link.
