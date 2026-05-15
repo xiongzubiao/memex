@@ -215,11 +215,12 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> crate::error::Result<()> {
             operation: "atomic_write: open parent dir for fsync",
             source: e,
         })?;
-        dir.sync_all().map_err(|e| crate::error::MemexError::FileOpFailed {
-            path: parent.to_path_buf(),
-            operation: "atomic_write: fsync parent dir",
-            source: e,
-        })?;
+        dir.sync_all()
+            .map_err(|e| crate::error::MemexError::FileOpFailed {
+                path: parent.to_path_buf(),
+                operation: "atomic_write: fsync parent dir",
+                source: e,
+            })?;
     }
 
     Ok(())
@@ -416,15 +417,14 @@ mod tests {
     /// edit to either function from silently regressing.
     #[test]
     fn validate_and_split_extract_identical_body() {
-        const FM: &str =
-            "title: T
+        const FM: &str = "title: T
 sources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z";
         let bodies = [
-            "body content\n",                   // canonical
-            "body content",                     // no trailing newline
-            "body content\n\n\n",               // trailing blank lines
-            "  body with leading spaces\n",     // body whitespace preserved
-            "body",                             // minimal
+            "body content\n",               // canonical
+            "body content",                 // no trailing newline
+            "body content\n\n\n",           // trailing blank lines
+            "  body with leading spaces\n", // body whitespace preserved
+            "body",                         // minimal
         ];
         for body in bodies {
             let content = format!("---\n{FM}\n---\n\n{body}");
@@ -652,10 +652,7 @@ sources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z"
         assert!(!is_memex_tmp_name(".DS_Store"));
         assert!(!is_memex_tmp_name(".swp"));
         assert!(!is_memex_tmp_name("rest-patterns.md"));
-        assert!(
-            !is_memex_tmp_name(".rest-patterns.md.tmp"),
-            "missing nonce"
-        );
+        assert!(!is_memex_tmp_name(".rest-patterns.md.tmp"), "missing nonce");
         assert!(
             !is_memex_tmp_name(".rest.patterns.md.a1b2c3d4.tmp"),
             "stem must not contain dots"

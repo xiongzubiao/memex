@@ -1144,8 +1144,9 @@ fn run_ingest(
             );
         }
         let db = opencode_db_path()?;
-        let envelope = memex_core::transcript::extract_opencode_session(&db, sid)
-            .map_err(|e| anyhow::anyhow!("read OpenCode session {sid} from {}: {e}", db.display()))?;
+        let envelope = memex_core::transcript::extract_opencode_session(&db, sid).map_err(|e| {
+            anyhow::anyhow!("read OpenCode session {sid} from {}: {e}", db.display())
+        })?;
         let request = memex_cli::daemon::protocol::Request::Ingest {
             source: memex_cli::daemon::protocol::IngestSource::TranscriptInline {
                 content: envelope,
@@ -1566,7 +1567,9 @@ fn run_doctor() -> i32 {
     }
 
     // 4. Agent CLIs (informational only).
-    for tool in ["claude", "codex", "gemini", "openclaw", "hermes", "opencode"] {
+    for tool in [
+        "claude", "codex", "gemini", "openclaw", "hermes", "opencode",
+    ] {
         let on_path = std::process::Command::new("which")
             .arg(tool)
             .output()
@@ -1612,7 +1615,10 @@ fn print_check(name: &str, ok: bool, detail: &str, had_fail: &mut bool) {
 /// degrades search quality. Skipped for `doctor` (it reports the same
 /// thing explicitly with PASS/FAIL output).
 fn warn_if_postinstall_incomplete(cmd: &Commands) {
-    if matches!(cmd, Commands::Doctor | Commands::Hook { .. } | Commands::Uninstall { .. }) {
+    if matches!(
+        cmd,
+        Commands::Doctor | Commands::Hook { .. } | Commands::Uninstall { .. }
+    ) {
         return;
     }
     let Ok(model) = memex_core::retrieval::default_model_path() else {
@@ -1739,11 +1745,13 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
             memex_cli::install::run(&home, &agents, dry_run)
         }
         Commands::Hook { action } => match action {
-            HookAction::Ingest { agent, session } => {
-                run_hook_ingest(&agent, session.as_deref())
-            }
+            HookAction::Ingest { agent, session } => run_hook_ingest(&agent, session.as_deref()),
         },
-        Commands::Uninstall { agents, dry_run, purge } => {
+        Commands::Uninstall {
+            agents,
+            dry_run,
+            purge,
+        } => {
             let home = memex_cli::install::home_dir()?;
             memex_cli::install::run_uninstall(&home, &agents, dry_run, purge)
         }

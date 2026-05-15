@@ -1,16 +1,10 @@
 //! `Request::Delete` handler — remove a wiki page from disk + index.
 
 use crate::daemon::error::DaemonError;
-use crate::daemon::handler::{
-    HandlerState, acquire_slug_lock, error_events, get_or_open_memex,
-};
+use crate::daemon::handler::{HandlerState, acquire_slug_lock, error_events, get_or_open_memex};
 use crate::daemon::protocol::Event;
 
-pub(super) async fn handle_delete(
-    slug: String,
-    force: bool,
-    state: &HandlerState,
-) -> Vec<Event> {
+pub(super) async fn handle_delete(slug: String, force: bool, state: &HandlerState) -> Vec<Event> {
     let root = state.writer.bound_root().to_path_buf();
     let memex = match get_or_open_memex(state.writer.memex_handle(), &root) {
         Ok(m) => m,
@@ -75,13 +69,14 @@ pub(super) async fn handle_delete(
     // Remove the file.
     let abs = root.join(&target_path);
     if let Err(e) = std::fs::remove_file(&abs)
-        && e.kind() != std::io::ErrorKind::NotFound {
-            return error_events(DaemonError::Storage(format!(
-                "remove wiki file {}: {e}",
-                abs.display()
-            )));
-        }
-        // file already gone — fall through to DB cleanup
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return error_events(DaemonError::Storage(format!(
+            "remove wiki file {}: {e}",
+            abs.display()
+        )));
+    }
+    // file already gone — fall through to DB cleanup
 
     if let Err(e) = search.delete_document_with_cleanup(&target_path) {
         return error_events(DaemonError::Storage(e.to_string()));

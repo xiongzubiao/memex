@@ -9,8 +9,8 @@ pub mod index;
 pub mod index_raw;
 pub mod index_wiki;
 pub mod ingest_jobs;
-pub mod llm_cache;
 pub mod lint;
+pub mod llm_cache;
 pub mod model;
 pub mod node_parser;
 pub mod raw;
@@ -108,14 +108,13 @@ impl Memex {
         // Migration hint: if DB is empty but wiki/ has .md files, suggest rebuild.
         // Spec Section 7 — r1 auto-rebuilt here; we moved that to open_writer to
         // eliminate the two-reader rebuild race. Now hint instead.
-        if search.is_empty()?
-            && wiki_dir.is_dir() && any_md_file(&wiki_dir) {
-                eprintln!(
-                    "note: search index is empty but `{}` contains markdown files; \
+        if search.is_empty()? && wiki_dir.is_dir() && any_md_file(&wiki_dir) {
+            eprintln!(
+                "note: search index is empty but `{}` contains markdown files; \
                      run `memex lint --fix` or any write command to rebuild.",
-                    wiki_dir.display()
-                );
-            }
+                wiki_dir.display()
+            );
+        }
 
         Ok(Self {
             root,
@@ -368,8 +367,7 @@ sources: []\ncreated_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\
         std::fs::write(root.join("wiki/p.md"), content).unwrap();
 
         let from_disk = read_body_from_disk(&root, "wiki", "wiki/p.md").unwrap();
-        let from_writer =
-            storage::split_frontmatter(content).map_or(content, |(_, b)| b);
+        let from_writer = storage::split_frontmatter(content).map_or(content, |(_, b)| b);
         assert_eq!(
             from_disk, from_writer,
             "read_body_from_disk must match commit_doc's body so chunk pos/len align"
@@ -476,13 +474,20 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("config.toml"),
-            format!("[storage]\nwiki = {:?}\nraw = {:?}\n", custom_wiki, custom_raw),
-        ).unwrap();
+            format!(
+                "[storage]\nwiki = {:?}\nraw = {:?}\n",
+                custom_wiki, custom_raw
+            ),
+        )
+        .unwrap();
         let memex = Memex::open(root.clone()).unwrap();
         assert_eq!(memex.wiki_dir(), custom_wiki);
         assert_eq!(memex.raw_dir(), custom_raw);
         assert!(custom_wiki.is_dir());
         assert!(custom_raw.is_dir());
-        assert!(!root.join("wiki").exists(), "default wiki dir must not be auto-created when wiki is configured elsewhere");
+        assert!(
+            !root.join("wiki").exists(),
+            "default wiki dir must not be auto-created when wiki is configured elsewhere"
+        );
     }
 }

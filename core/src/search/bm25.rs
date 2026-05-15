@@ -399,7 +399,10 @@ mod tests {
     #[test]
     fn sanitize_query_mixed() {
         let result = sanitize_query("\"exact match\" multi-agent -python");
-        assert_eq!(result, "\"exact match\" AND \"multi agent\" NOT \"python\"*");
+        assert_eq!(
+            result,
+            "\"exact match\" AND \"multi agent\" NOT \"python\"*"
+        );
     }
 
     #[test]
@@ -500,14 +503,24 @@ mod tests {
         let (_dir, search) = open_temp_search();
 
         search
-            .index_page(Path::new("wiki/team-a.md"), "Alpha Team A", "Alpha content for the team-a collection.", 1000)
+            .index_page(
+                Path::new("wiki/team-a.md"),
+                "Alpha Team A",
+                "Alpha content for the team-a collection.",
+                1000,
+            )
             .unwrap();
         search
             .set_document_collections_by_path("wiki", "wiki/team-a.md", &["team-a".to_string()])
             .unwrap();
 
         search
-            .index_page(Path::new("wiki/team-b.md"), "Alpha Team B", "Alpha content for the team-b collection.", 1000)
+            .index_page(
+                Path::new("wiki/team-b.md"),
+                "Alpha Team B",
+                "Alpha content for the team-b collection.",
+                1000,
+            )
             .unwrap();
         search
             .set_document_collections_by_path("wiki", "wiki/team-b.md", &["team-b".to_string()])
@@ -527,10 +540,20 @@ mod tests {
         let (_dir, search) = open_temp_search();
 
         search
-            .index_page(Path::new("wiki/rust-borrow.md"), "Rust Borrow Checker", "The borrow checker enforces ownership rules at compile time.", 1000)
+            .index_page(
+                Path::new("wiki/rust-borrow.md"),
+                "Rust Borrow Checker",
+                "The borrow checker enforces ownership rules at compile time.",
+                1000,
+            )
             .unwrap();
         search
-            .index_page(Path::new("wiki/python-gc.md"), "Python Garbage Collection", "Python uses reference counting with a cyclic garbage collector.", 1000)
+            .index_page(
+                Path::new("wiki/python-gc.md"),
+                "Python Garbage Collection",
+                "Python uses reference counting with a cyclic garbage collector.",
+                1000,
+            )
             .unwrap();
 
         let results = search
@@ -539,7 +562,11 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].path, PathBuf::from("wiki/rust-borrow.md"));
         for r in &results {
-            assert!((0.0..=1.0).contains(&r.score), "score out of range: {}", r.score);
+            assert!(
+                (0.0..=1.0).contains(&r.score),
+                "score out of range: {}",
+                r.score
+            );
         }
     }
 
@@ -547,19 +574,30 @@ mod tests {
     fn bm25_remove_page() {
         let (_dir, search) = open_temp_search();
         search
-            .index_page(Path::new("wiki/ephemeral.md"), "Ephemeral Page", "This page will be removed shortly.", 1000)
+            .index_page(
+                Path::new("wiki/ephemeral.md"),
+                "Ephemeral Page",
+                "This page will be removed shortly.",
+                1000,
+            )
             .unwrap();
-        let before = search.search_by_doc_type("ephemeral", "wiki", 10, &[]).unwrap();
+        let before = search
+            .search_by_doc_type("ephemeral", "wiki", 10, &[])
+            .unwrap();
         assert_eq!(before.len(), 1);
         search.remove_page("wiki/ephemeral.md").unwrap();
-        let after = search.search_by_doc_type("ephemeral", "wiki", 10, &[]).unwrap();
+        let after = search
+            .search_by_doc_type("ephemeral", "wiki", 10, &[])
+            .unwrap();
         assert!(after.is_empty());
     }
 
     #[test]
     fn bm25_empty_search() {
         let (_dir, search) = open_temp_search();
-        let results = search.search_by_doc_type("anything", "wiki", 10, &[]).unwrap();
+        let results = search
+            .search_by_doc_type("anything", "wiki", 10, &[])
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -574,10 +612,20 @@ mod tests {
     fn bm25_index_page_replace() {
         let (_dir, search) = open_temp_search();
         search
-            .index_page(Path::new("wiki/page.md"), "Original Title", "Original body content.", 1000)
+            .index_page(
+                Path::new("wiki/page.md"),
+                "Original Title",
+                "Original body content.",
+                1000,
+            )
             .unwrap();
         search
-            .index_page(Path::new("wiki/page.md"), "Updated Quantum Computing", "Body content.", 2000)
+            .index_page(
+                Path::new("wiki/page.md"),
+                "Updated Quantum Computing",
+                "Body content.",
+                2000,
+            )
             .unwrap();
         let results = search
             .search_by_doc_type("quantum computing", "wiki", 10, &[])

@@ -207,11 +207,17 @@ mod tests {
     #[test]
     fn parse_header_line_matches_python_regex() {
         assert_eq!(parse_header_line("# Title").unwrap(), (1, "Title".into()));
-        assert_eq!(parse_header_line("### Triple").unwrap(), (3, "Triple".into()));
+        assert_eq!(
+            parse_header_line("### Triple").unwrap(),
+            (3, "Triple".into())
+        );
         assert_eq!(parse_header_line("###### Six").unwrap(), (6, "Six".into()));
         assert!(parse_header_line("#NoSpace").is_none());
         assert!(parse_header_line("#").is_none());
-        assert_eq!(parse_header_line("#\tWithTab").unwrap(), (1, "WithTab".into()));
+        assert_eq!(
+            parse_header_line("#\tWithTab").unwrap(),
+            (1, "WithTab".into())
+        );
         assert!(parse_header_line("text").is_none());
     }
 

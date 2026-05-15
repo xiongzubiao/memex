@@ -3,7 +3,6 @@
 use crate::integration_harness::IntegrationHarness;
 use memex_cli::daemon::protocol::{Event, Request};
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn source_add_returns_docid_and_dedups_repeats() {
     let h = IntegrationHarness::start().await;
@@ -134,7 +133,9 @@ async fn source_delete_refuses_when_referenced_without_force() {
     };
     let events = h.send(&r).await.unwrap();
     assert!(
-        events.iter().any(|e| matches!(e, Event::Error { code, message, .. }
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Error { code, message, .. }
             if code == "bad_request" && message.contains("wiki pages reference"))),
         "expected reference-blocked error, got: {events:?}"
     );
@@ -174,9 +175,11 @@ async fn source_delete_resolves_path_ref() {
         force: false,
     };
     let events = h.send(&r).await.unwrap();
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, Event::SourceDeleted { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::SourceDeleted { .. }))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -269,7 +272,10 @@ async fn source_add_writes_raw_file_with_frontmatter_and_returns_short_docid() {
     assert!(file.contains("source: https://example.com/articles/auth-tokens-explained"));
     assert!(file.contains("source_kind: url"));
     assert!(file.contains("ingested_at:"));
-    assert!(file.ends_with(body), "file should end with original body verbatim");
+    assert!(
+        file.ends_with(body),
+        "file should end with original body verbatim"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -285,5 +291,8 @@ async fn source_add_idempotent_does_not_modify_existing_file() {
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let _ = harness.source_add("https://x", body).await.unwrap();
     let mtime_after = std::fs::metadata(&raw_path).unwrap().modified().unwrap();
-    assert_eq!(mtime_before, mtime_after, "second add must not touch the file");
+    assert_eq!(
+        mtime_before, mtime_after,
+        "second add must not touch the file"
+    );
 }

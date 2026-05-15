@@ -116,7 +116,10 @@ created_at: 2026-04-10T00:00:00Z\nupdated_at: 2026-04-10T00:00:00Z\nsources: []\
     )
     .unwrap();
 
-    let fix_out = memex_cmd(&root, None).args(["lint", "--fix"]).output().unwrap();
+    let fix_out = memex_cmd(&root, None)
+        .args(["lint", "--fix"])
+        .output()
+        .unwrap();
     let fix_stderr = String::from_utf8_lossy(&fix_out.stderr);
     assert!(
         fix_out.status.success(),
@@ -184,7 +187,10 @@ fn lint_fix_stale_preserves_search() {
     existing.push_str("\nAppended extra content.\n");
     std::fs::write(&path, &existing).unwrap();
 
-    let fix = memex_cmd(&root, None).args(["lint", "--fix"]).output().unwrap();
+    let fix = memex_cmd(&root, None)
+        .args(["lint", "--fix"])
+        .output()
+        .unwrap();
     assert!(
         fix.status.success(),
         "lint --fix should succeed, stderr: {}",
@@ -201,5 +207,8 @@ fn lint_fix_stale_preserves_search() {
         "searchable",
         "should still find page after stale fix, got: {after_stdout}"
     );
-    let _ = memex_cmd(&root, None).args(["daemon", "stop"]).output().unwrap();
+    let _ = memex_cmd(&root, None)
+        .args(["daemon", "stop"])
+        .output()
+        .unwrap();
 }

@@ -158,7 +158,10 @@ impl ClaudeCodeSubprocess {
                         // `authentication_failed`) over the API status when
                         // both are present — it's the most specific label.
                         let code = last_assistant_error.clone().or(api_error_status);
-                        return Ok(TurnOutcome::BackendError { message: text, code });
+                        return Ok(TurnOutcome::BackendError {
+                            message: text,
+                            code,
+                        });
                     }
                     let input_tokens = usage
                         .map(|u| {

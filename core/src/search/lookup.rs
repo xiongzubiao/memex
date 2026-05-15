@@ -117,7 +117,10 @@ fn format_mtime(t: std::time::SystemTime) -> String {
 /// parse failure or missing frontmatter.
 fn frontmatter_lists_source(body: &str, source_path: &str) -> bool {
     let trimmed = body.trim_start();
-    let after = match trimmed.strip_prefix("---\n").or_else(|| trimmed.strip_prefix("---")) {
+    let after = match trimmed
+        .strip_prefix("---\n")
+        .or_else(|| trimmed.strip_prefix("---"))
+    {
         Some(s) => s,
         None => return false,
     };
@@ -227,13 +230,11 @@ impl Db {
             let mut stmt = conn
                 .prepare("SELECT path FROM documents WHERE hash LIKE ?1 || '%' LIMIT 1")
                 .map_err(sqlite_err)?;
-            stmt.query_map(rusqlite::params![reference], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(sqlite_err)?
-            .next()
-            .transpose()
-            .map_err(sqlite_err)?
+            stmt.query_map(rusqlite::params![reference], |row| row.get::<_, String>(0))
+                .map_err(sqlite_err)?
+                .next()
+                .transpose()
+                .map_err(sqlite_err)?
         };
         if let Some(p) = path {
             return Ok(Some(PathBuf::from(p)));
@@ -269,11 +270,7 @@ impl Db {
     }
 
     /// Get document mtime + size for a (doc_type, path) pair.
-    pub fn get_document_meta(
-        &self,
-        doc_type: &str,
-        path: &str,
-    ) -> Result<Option<DocumentMeta>> {
+    pub fn get_document_meta(&self, doc_type: &str, path: &str) -> Result<Option<DocumentMeta>> {
         use rusqlite::OptionalExtension;
         let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
         let row = conn
@@ -342,7 +339,10 @@ impl Db {
                     let (path, mtime, size) = row;
                     out.insert(
                         (doc_type.to_string(), path),
-                        DocumentMeta { mtime: crate::storage::nanos_to_systime(mtime), size },
+                        DocumentMeta {
+                            mtime: crate::storage::nanos_to_systime(mtime),
+                            size,
+                        },
                     );
                 }
             }
@@ -490,7 +490,9 @@ impl Db {
                             path: row.get(1)?,
                             title: row.get(2)?,
                             size_bytes: row.get::<_, i64>(3)? as usize,
-                            mtime: format_mtime(crate::storage::nanos_to_systime(row.get::<_, i64>(4)?)),
+                            mtime: format_mtime(crate::storage::nanos_to_systime(
+                                row.get::<_, i64>(4)?,
+                            )),
                             collections: Vec::new(),
                         },
                         row.get::<_, String>(5)?,
@@ -633,10 +635,7 @@ impl Db {
     /// hash that fans out to thousands of doc rows doesn't trip SQLite's
     /// `SQLITE_MAX_VARIABLE_NUMBER` limit (default 999, 32766 in newer
     /// builds).
-    pub fn lookup_documents_with_collections(
-        &self,
-        hashes: &[String],
-    ) -> Result<DocLookup> {
+    pub fn lookup_documents_with_collections(&self, hashes: &[String]) -> Result<DocLookup> {
         if hashes.is_empty() {
             return Ok((Default::default(), Default::default(), Default::default()));
         }
@@ -715,7 +714,9 @@ impl Db {
         // snapshot. A deleted doc won't appear in `all_ids` because step
         // 1 didn't return it under the same connection-lock.
         for &id in &all_ids {
-            mem_acc.entry(id).or_insert_with(|| vec!["default".to_string()]);
+            mem_acc
+                .entry(id)
+                .or_insert_with(|| vec!["default".to_string()]);
         }
         let memberships: std::collections::HashMap<i64, Vec<String>> = mem_acc;
         Ok((docs, memberships, meta_acc))
@@ -808,7 +809,12 @@ mod tests {
     fn generate_index_from_db() {
         let (_dir, search) = open_temp_search();
         search
-            .index_page(Path::new("wiki/rust-borrow.md"), "Rust Borrow Checker", "The borrow checker enforces ownership rules at compile time.", 1000)
+            .index_page(
+                Path::new("wiki/rust-borrow.md"),
+                "Rust Borrow Checker",
+                "The borrow checker enforces ownership rules at compile time.",
+                1000,
+            )
             .unwrap();
         let index = search.generate_index().unwrap();
         assert!(index.contains("# Index"), "got: {index}");
@@ -868,9 +874,13 @@ mod tests {
         search
             .index_page(Path::new("wiki/alpha.md"), "Alpha", "Body.", 1000)
             .unwrap();
-        let ts = search.get_last_modified(Path::new("wiki/alpha.md")).unwrap();
+        let ts = search
+            .get_last_modified(Path::new("wiki/alpha.md"))
+            .unwrap();
         assert_eq!(ts, Some(1000i64));
-        let missing = search.get_last_modified(Path::new("wiki/missing.md")).unwrap();
+        let missing = search
+            .get_last_modified(Path::new("wiki/missing.md"))
+            .unwrap();
         assert_eq!(missing, None);
     }
 
@@ -901,13 +911,15 @@ mod tests {
             .index_page(std::path::Path::new("wiki/m.md"), "M", body, 6000)
             .unwrap();
         let hash = crate::storage::content_hash(body.as_bytes());
-        let (_docs, _memberships, meta_by_id) = search
-            .lookup_documents_with_collections(&[hash])
-            .unwrap();
+        let (_docs, _memberships, meta_by_id) =
+            search.lookup_documents_with_collections(&[hash]).unwrap();
         let (mtime, size) = meta_by_id
             .get(&id)
             .expect("meta should be present for the inserted doc");
-        assert_eq!(*mtime, std::time::UNIX_EPOCH + std::time::Duration::from_nanos(6000));
+        assert_eq!(
+            *mtime,
+            std::time::UNIX_EPOCH + std::time::Duration::from_nanos(6000)
+        );
         assert_eq!(*size, body.len() as i64);
     }
 }

@@ -64,7 +64,10 @@ fn write_lazy_init() {
     let content = make_page("First Page", "Hello world.");
     seed_wiki_page(&root, "first-page", &content, false).expect("write should succeed");
 
-    assert!(root.join("wiki").is_dir(), "wiki/ directory should be created");
+    assert!(
+        root.join("wiki").is_dir(),
+        "wiki/ directory should be created"
+    );
     assert!(root.join("wiki/first-page.md").exists());
 }
 
@@ -117,7 +120,8 @@ fn write_handles_colon_in_title() {
 
     let content = "---\ntitle: Go: Deep Equal Comparison
 created_at: 2026-04-14T00:00:00Z\nupdated_at: 2026-04-14T00:00:00Z\nsources: []\n---\n\nComparing structs.\n";
-    seed_wiki_page(&root, "go-deep-equal", content, false).expect("colon in title should be handled");
+    seed_wiki_page(&root, "go-deep-equal", content, false)
+        .expect("colon in title should be handled");
 
     let disk = std::fs::read_to_string(root.join("wiki/go-deep-equal.md")).unwrap();
     assert!(
@@ -132,7 +136,8 @@ fn write_force_on_new_page_creates_normally() {
     let root = dir.path().join("memex");
 
     let content = make_page("Brand New", "Created via force=true on a new page.");
-    seed_wiki_page(&root, "brand-new", &content, true).expect("force on non-existent page should succeed");
+    seed_wiki_page(&root, "brand-new", &content, true)
+        .expect("force on non-existent page should succeed");
 
     assert!(root.join("wiki/brand-new.md").exists());
 }

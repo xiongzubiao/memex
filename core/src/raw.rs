@@ -6,11 +6,16 @@ use crate::error::{MemexError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct RawFrontmatter {
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub source: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub source_kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub ingested_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] pub converter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingested_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub converter: Option<String>,
 }
 
 /// True for `http://` and `https://` source paths. Used to distinguish a
@@ -31,9 +36,8 @@ pub fn parse_raw_frontmatter(file: &str) -> Result<(RawFrontmatter, &str)> {
             "raw file missing leading or closing frontmatter fence"
         ))
     })?;
-    let fm: RawFrontmatter = serde_yaml::from_str(yaml).map_err(|e| {
-        MemexError::Other(anyhow::anyhow!("invalid raw frontmatter YAML: {e}"))
-    })?;
+    let fm: RawFrontmatter = serde_yaml::from_str(yaml)
+        .map_err(|e| MemexError::Other(anyhow::anyhow!("invalid raw frontmatter YAML: {e}")))?;
     Ok((fm, body))
 }
 
@@ -52,7 +56,9 @@ mod tests {
         let h = "abcd0123456789abcd0123456789abcd0123456789abcd0123456789abcd0123";
         assert_eq!(
             raw_path_for_hash(&PathBuf::from("/m/raw"), h),
-            PathBuf::from("/m/raw/ab/cd0123456789abcd0123456789abcd0123456789abcd0123456789abcd0123"),
+            PathBuf::from(
+                "/m/raw/ab/cd0123456789abcd0123456789abcd0123456789abcd0123456789abcd0123"
+            ),
         );
     }
 

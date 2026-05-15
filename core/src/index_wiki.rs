@@ -54,9 +54,8 @@ pub fn index_wiki_file(
     }
 
     let bytes = std::fs::read(path)?;
-    let content = String::from_utf8(bytes).map_err(|e| {
-        crate::error::MemexError::Other(anyhow::anyhow!("non-utf8 wiki body: {e}"))
-    })?;
+    let content = String::from_utf8(bytes)
+        .map_err(|e| crate::error::MemexError::Other(anyhow::anyhow!("non-utf8 wiki body: {e}")))?;
     // parse_frontmatter is wiki-schema-aware and gives us the body
     // slice that commit_doc will hash and feed to chunks_fts.
     let (fm, body) = validate::parse_frontmatter(&content).map_err(|e| {
@@ -88,7 +87,13 @@ pub fn index_wiki_file(
     if outcome != IndexOutcome::Skipped
         && let Some(model) = model
     {
-        crate::retrieval::embed_document(memex.search(), &result.body_hash, &fm.title, &body, model)?;
+        crate::retrieval::embed_document(
+            memex.search(),
+            &result.body_hash,
+            &fm.title,
+            &body,
+            model,
+        )?;
     }
 
     Ok(outcome)
@@ -154,7 +159,10 @@ created_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\nsources: []\
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(chunk_count >= 1, "chunks rows should be populated at commit");
+        assert!(
+            chunk_count >= 1,
+            "chunks rows should be populated at commit"
+        );
         let vec_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM chunks_vec WHERE hash_seq LIKE ?1 || '%'",
@@ -162,7 +170,10 @@ created_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\nsources: []\
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(vec_count, 0, "chunks_vec must remain empty without an embedder");
+        assert_eq!(
+            vec_count, 0,
+            "chunks_vec must remain empty without an embedder"
+        );
     }
 
     #[test]

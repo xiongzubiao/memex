@@ -4,7 +4,6 @@
 //! can verify collection filtering without relying on Unix socket startup in
 //! the sandboxed test environment.
 
-
 use crate::common;
 use memex_cli::daemon::handler::{
     HandlerState, ReaderSession, SharedEmbedder, WriterSession, handle, shared_embedder,
@@ -75,7 +74,7 @@ async fn query_raw_returns_indexed_entry() {
 
     common::ingest_page(
         &root,
-                "auth-migration-timeline",
+        "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",
     );
@@ -105,13 +104,13 @@ async fn query_raw_with_default_collection_excludes_non_default_docs() {
 
     common::ingest_page(
         &root,
-                "default-article",
+        "default-article",
         "Default Article",
         "shared query target in the default collection",
     );
     common::ingest_page(
         &root,
-                "project-article",
+        "project-article",
         "Project Article",
         "shared query target in the project collection",
     );
@@ -152,13 +151,13 @@ async fn query_raw_with_explicit_collection_includes_only_matching_docs() {
 
     common::ingest_page(
         &root,
-                "default-article",
+        "default-article",
         "Default Article",
         "shared query target in the default collection",
     );
     common::ingest_page(
         &root,
-                "team-b-article",
+        "team-b-article",
         "Team B Article",
         "shared query target in team b",
     );
@@ -229,6 +228,9 @@ async fn query_rejects_empty_question() {
         );
         // No Context event — the pipeline must short-circuit, not run.
         let titles = context_entry_titles(&events);
-        assert!(titles.is_empty(), "blank question must not return results: {titles:?}");
+        assert!(
+            titles.is_empty(),
+            "blank question must not return results: {titles:?}"
+        );
     }
 }

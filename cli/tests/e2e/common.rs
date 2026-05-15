@@ -35,12 +35,7 @@ impl WriteStatus {
 /// (mirroring how the old `memex write --direct` subprocess wrapper
 /// was used). Calls `seed_wiki_page` and packages the result into a
 /// `WriteResult` so the test assertion patterns don't churn.
-pub fn run_write(
-    root: &Path,
-    name: &str,
-    content: &str,
-    extra_args: &[&str],
-) -> WriteResult {
+pub fn run_write(root: &Path, name: &str, content: &str, extra_args: &[&str]) -> WriteResult {
     let force = extra_args.contains(&"--force");
     match seed_wiki_page(root, name, content, force) {
         Ok(()) => WriteResult {
@@ -65,8 +60,8 @@ pub fn binary() -> &'static str {
 pub fn mock_on_path(fixture_name: &str, binary_name: &str) -> (TempDir, PathBuf) {
     let tmp = TempDir::new().unwrap();
     let bin_dir = tmp.path().to_path_buf();
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/e2e/fixtures/{fixture_name}"));
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("tests/e2e/fixtures/{fixture_name}"));
     assert!(fixture.exists(), "mock fixture missing: {fixture:?}");
     std::os::unix::fs::symlink(&fixture, bin_dir.join(binary_name)).unwrap();
     (tmp, bin_dir)

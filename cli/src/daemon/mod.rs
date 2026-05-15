@@ -410,11 +410,7 @@ pub async fn ingest_async(
 
 /// `memex ingest` entrypoint. Sync wrapper spinning up a fresh runtime for
 /// single-call hook use. Returns exit code (0 = queued, 1 = error/skipped).
-pub fn ingest(
-    transcript_path: &str,
-    agent: &str,
-    collections: Vec<String>,
-) -> Result<i32> {
+pub fn ingest(transcript_path: &str, agent: &str, collections: Vec<String>) -> Result<i32> {
     let rt = tokio::runtime::Runtime::new()?;
     match rt.block_on(ingest_async(transcript_path, agent, collections)) {
         Ok(code) => Ok(code),

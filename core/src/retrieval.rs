@@ -2,7 +2,7 @@
 //! RRF fusion → MIN_SCORE filter. Used by the `memex search` command and by
 //! the daemon's query path.
 
-use crate::embed::{EmbeddingModel, Embedder, catch_unwind_silent, load_model};
+use crate::embed::{Embedder, EmbeddingModel, catch_unwind_silent, load_model};
 use crate::error::Result;
 use crate::search::{self, Db, MIN_SCORE, SearchResult};
 use crate::vector::vector_search_collapsed;
@@ -338,10 +338,7 @@ fn populate_bodies(
         let (best_pos, best_len) = if let Some(seq) = r.chunk_seq {
             // Result was retrieved at chunk granularity, so use that
             // specific chunk's bytes rather than re-running a per-chunk pick.
-            chunks
-                .get(seq as usize)
-                .copied()
-                .unwrap_or((0, body.len()))
+            chunks.get(seq as usize).copied().unwrap_or((0, body.len()))
         } else if chunks.is_empty() {
             (0, body.len())
         } else {
@@ -376,11 +373,9 @@ fn populate_bodies(
 fn memex_models_dir() -> Result<PathBuf> {
     dirs::home_dir()
         .map(|h| h.join(".memex/models"))
-        .ok_or_else(|| {
-            crate::error::MemexError::EmbeddingUnavailable {
-                path: PathBuf::from("~/.memex/models"),
-                reason: "cannot resolve home directory ($HOME unset?)".into(),
-            }
+        .ok_or_else(|| crate::error::MemexError::EmbeddingUnavailable {
+            path: PathBuf::from("~/.memex/models"),
+            reason: "cannot resolve home directory ($HOME unset?)".into(),
         })
 }
 
@@ -525,7 +520,9 @@ pub fn embed_document(
         crate::vector::delete_chunks(tx, hash)?;
         for (seq, (chunk, emb)) in chunks.iter().zip(all_embeds.iter()).enumerate() {
             let chunk_text = &body[chunk.pos..chunk.pos + chunk.len];
-            crate::vector::store_chunk(tx, hash, seq as i32, chunk.pos, chunk.len, chunk_text, emb)?;
+            crate::vector::store_chunk(
+                tx, hash, seq as i32, chunk.pos, chunk.len, chunk_text, emb,
+            )?;
         }
         // Stamp embed_model atomically with chunk write. Without this,
         // a tx-then-stamp split races: chunks land but the stamp lands
@@ -893,16 +890,14 @@ mod tests {
         // Index a wiki document (the on-disk content + DB row + mtime/size).
         std::fs::write(
             memex.wiki_dir().join("auth.md"),
-            format!("---\ntitle: Auth
-sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body}"),
+            format!(
+                "---\ntitle: Auth
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\n{body}"
+            ),
         )
         .unwrap();
-        crate::index_wiki::index_wiki_file(
-            &memex,
-            &memex.wiki_dir().join("auth.md"),
-            None,
-        )
-        .unwrap();
+        crate::index_wiki::index_wiki_file(&memex, &memex.wiki_dir().join("auth.md"), None)
+            .unwrap();
         let body_hash = crate::storage::content_hash(body.as_bytes());
 
         // Manually wire a single chunk_vec row with a fixture vector.
@@ -960,16 +955,14 @@ sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\
         let body = "Working with the linux kernel internals requires deep knowledge.";
         std::fs::write(
             memex.wiki_dir().join("kernel-notes.md"),
-            format!("---\ntitle: Kernel Notes
-sources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\n---\n\n{body}"),
+            format!(
+                "---\ntitle: Kernel Notes
+sources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\n---\n\n{body}"
+            ),
         )
         .unwrap();
-        crate::index_wiki::index_wiki_file(
-            &memex,
-            &memex.wiki_dir().join("kernel-notes.md"),
-            None,
-        )
-        .unwrap();
+        crate::index_wiki::index_wiki_file(&memex, &memex.wiki_dir().join("kernel-notes.md"), None)
+            .unwrap();
 
         let collections: [String; 0] = [];
         let exp = Expansion::default();
@@ -1055,4 +1048,3 @@ sources: []\ncreated_at: 2026-04-29T00:00:00Z\nupdated_at: 2026-04-29T00:00:00Z\
         );
     }
 }
-

@@ -5,12 +5,16 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonError {
     BadRequest(String),
-    VersionMismatch { supported: Vec<u32> },
+    VersionMismatch {
+        supported: Vec<u32>,
+    },
     /// Retrieval returned no results. `collections` carries the user's
     /// filter (empty = no filter); `Display` formats it as either
     /// "no indexed content for MEMEX_ROOT" or "no documents matched in
     /// collection(s): X, Y".
-    RetrievalEmpty { collections: Vec<String> },
+    RetrievalEmpty {
+        collections: Vec<String>,
+    },
     Internal(String),
     SubprocessTimeout {
         timeout_sec: u64,
@@ -122,7 +126,10 @@ mod tests {
         );
         assert_eq!(DaemonError::BadRequest("x".into()).exit_code(), 1);
 
-        assert_eq!(DaemonError::SubprocessTimeout { timeout_sec: 300 }.exit_code(), 4);
+        assert_eq!(
+            DaemonError::SubprocessTimeout { timeout_sec: 300 }.exit_code(),
+            4
+        );
         assert_eq!(DaemonError::SubprocessCrashed("".into()).exit_code(), 4);
         assert_eq!(DaemonError::SubprocessCrashed("x".into()).exit_code(), 4);
 
@@ -180,7 +187,10 @@ mod tests {
             "subprocess_timeout: no reply within 300s (daemon.worker.timeout_sec)"
         );
         assert_eq!(
-            DaemonError::RetrievalEmpty { collections: vec![] }.to_string(),
+            DaemonError::RetrievalEmpty {
+                collections: vec![]
+            }
+            .to_string(),
             "retrieval_empty: no indexed content for MEMEX_ROOT"
         );
         assert_eq!(

@@ -26,8 +26,7 @@ created_at: 2026-04-10T00:00:00Z\nupdated_at: 2026-04-10T00:00:00Z\nsources: []\
 /// just needs "this page exists on disk and in the index, please."
 pub fn ingest_page(root: &Path, slug: &str, title: &str, body: &str) {
     let content = make_page(title, body);
-    seed_wiki_page(root, slug, &content, true)
-        .unwrap_or_else(|e| panic!("ingest failed: {e}"));
+    seed_wiki_page(root, slug, &content, true).unwrap_or_else(|e| panic!("ingest failed: {e}"));
 }
 
 /// Write a wiki page to SQLite + filesystem. `content` must include
@@ -40,8 +39,8 @@ pub fn seed_wiki_page(root: &Path, name: &str, content: &str, force: bool) -> Re
         anyhow::bail!("name slugifies to empty: {name:?}");
     }
 
-    let (fm, body) = memex_core::validate::parse_frontmatter(content)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (fm, body) =
+        memex_core::validate::parse_frontmatter(content).map_err(|e| anyhow::anyhow!("{e}"))?;
     if fm.title.trim().is_empty() {
         anyhow::bail!("page title is empty");
     }
@@ -61,8 +60,7 @@ pub fn seed_wiki_page(root: &Path, name: &str, content: &str, force: bool) -> Re
         .filter(|(s, _)| memex_core::crosslink::auto_link_eligible(s))
         .cloned()
         .collect();
-    let (linked_body, _linked) =
-        memex_core::crosslink::forward_link(&body, &eligible_pages, &stem);
+    let (linked_body, _linked) = memex_core::crosslink::forward_link(&body, &eligible_pages, &stem);
     let final_content =
         memex_core::crosslink::replace_body_preserving_frontmatter(content, &linked_body);
     memex_core::storage::atomic_write(&page_path, final_content.as_bytes())?;

@@ -13,7 +13,8 @@ fn gemini_harness(mock_mode: Option<&str>) -> (tempfile::TempDir, std::path::Pat
         b = b.env("MOCK_GEMINI_MODE", mode);
     }
     let h = b.start();
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",

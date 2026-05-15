@@ -341,8 +341,7 @@ mod tests {
 
     #[test]
     fn search_request_deserializes() {
-        let r: Request =
-            serde_json::from_str(r#"{"op":"search","title":"Auth Tokens"}"#).unwrap();
+        let r: Request = serde_json::from_str(r#"{"op":"search","title":"Auth Tokens"}"#).unwrap();
         match r {
             Request::Search { title } => assert_eq!(title, "Auth Tokens"),
             _ => panic!("expected Search"),
@@ -376,7 +375,11 @@ mod tests {
             serde_json::from_str(r#"{"op":"write","title":"Test","content":"body"}"#).unwrap();
         match r {
             Request::Write {
-                title, content, source, force, ..
+                title,
+                content,
+                source,
+                force,
+                ..
             } => {
                 assert_eq!(title, "Test");
                 assert_eq!(content, "body");
@@ -406,7 +409,11 @@ mod tests {
         )
         .unwrap();
         match r {
-            Request::SourceAdd { source_path, content, .. } => {
+            Request::SourceAdd {
+                source_path,
+                content,
+                ..
+            } => {
                 assert_eq!(source_path, "https://x/p");
                 assert!(content.starts_with("# T"));
             }
@@ -416,7 +423,9 @@ mod tests {
 
     #[test]
     fn source_added_event_serializes() {
-        let e = Event::SourceAdded { docid: "src-abc".into() };
+        let e = Event::SourceAdded {
+            docid: "src-abc".into(),
+        };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""type":"source_added""#));
         assert!(s.contains(r#""docid":"src-abc""#));
@@ -424,10 +433,8 @@ mod tests {
 
     #[test]
     fn source_delete_request_deserializes() {
-        let r: Request = serde_json::from_str(
-            r#"{"op":"source_delete","ref":"src-abc","force":true}"#,
-        )
-        .unwrap();
+        let r: Request =
+            serde_json::from_str(r#"{"op":"source_delete","ref":"src-abc","force":true}"#).unwrap();
         match r {
             Request::SourceDelete { ref_, force, .. } => {
                 assert_eq!(ref_, "src-abc");
@@ -456,7 +463,10 @@ mod tests {
         )
         .unwrap();
         match r {
-            Request::Ingest { source, collections } => {
+            Request::Ingest {
+                source,
+                collections,
+            } => {
                 match source {
                     IngestSource::Transcript { path, agent } => {
                         assert_eq!(path, "/tmp/s.jsonl");
@@ -500,9 +510,16 @@ mod tests {
         )
         .unwrap();
         match r {
-            Request::Ingest { source, collections, .. } => {
+            Request::Ingest {
+                source,
+                collections,
+                ..
+            } => {
                 match source {
-                    IngestSource::Document { source_path, content } => {
+                    IngestSource::Document {
+                        source_path,
+                        content,
+                    } => {
                         assert_eq!(source_path, "https://example.com/post");
                         assert!(content.starts_with("# Title"));
                     }
@@ -516,8 +533,7 @@ mod tests {
 
     #[test]
     fn delete_request_deserializes() {
-        let r: Request =
-            serde_json::from_str(r#"{"op":"delete","slug":"my-page"}"#).unwrap();
+        let r: Request = serde_json::from_str(r#"{"op":"delete","slug":"my-page"}"#).unwrap();
         assert!(matches!(r, Request::Delete { .. }));
     }
 
@@ -589,10 +605,8 @@ mod tests {
 
     #[test]
     fn source_plan_request_deserializes() {
-        let r: Request = serde_json::from_str(
-            r#"{"op":"source_plan","source_id":"src-abc"}"#,
-        )
-        .unwrap();
+        let r: Request =
+            serde_json::from_str(r#"{"op":"source_plan","source_id":"src-abc"}"#).unwrap();
         match r {
             Request::SourcePlan { source_id } => assert_eq!(source_id, "src-abc"),
             _ => panic!("expected SourcePlan"),
@@ -601,10 +615,7 @@ mod tests {
 
     #[test]
     fn plan_apply_request_deserializes() {
-        let r: Request = serde_json::from_str(
-            r#"{"op":"plan_apply","plan_json":"{}"}"#,
-        )
-        .unwrap();
+        let r: Request = serde_json::from_str(r#"{"op":"plan_apply","plan_json":"{}"}"#).unwrap();
         match r {
             Request::PlanApply { plan_json } => assert_eq!(plan_json, "{}"),
             _ => panic!("expected PlanApply"),
@@ -621,7 +632,9 @@ mod tests {
 
     #[test]
     fn empty_extract_event_serializes() {
-        let e = Event::EmptyExtract { reason: "no-subjects".into() };
+        let e = Event::EmptyExtract {
+            reason: "no-subjects".into(),
+        };
         let s = serde_json::to_string(&e).unwrap();
         assert!(s.contains(r#""type":"empty_extract""#));
         assert!(s.contains(r#""reason":"no-subjects""#));

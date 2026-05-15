@@ -62,7 +62,9 @@ pub fn chunk_markdown(
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChunkError {
-    #[error("document would split into more than {0} chunks; raise max_chunks or shrink the source")]
+    #[error(
+        "document would split into more than {0} chunks; raise max_chunks or shrink the source"
+    )]
     TooManyChunks(usize),
 }
 
@@ -90,8 +92,7 @@ fn split_into_segments(content: &str) -> Vec<String> {
         byte_pos += line.len();
         let in_fence = in_code_fence.get(line_start).copied().unwrap_or(false);
         let trimmed = line.trim_start();
-        let is_heading = !in_fence
-            && (trimmed.starts_with("# ") || trimmed.starts_with("## "));
+        let is_heading = !in_fence && (trimmed.starts_with("# ") || trimmed.starts_with("## "));
         if is_heading && !current.is_empty() {
             segments.push(std::mem::take(&mut current));
         }
@@ -203,15 +204,27 @@ mod tests {
         );
         // target = 1500 tokens (~4500 chars). Each section is 3000+ chars -> 1000+ tokens.
         let chunks = chunk_markdown(&c, 1500, 3000, 10).unwrap();
-        assert!(chunks.len() >= 2, "expected ≥2 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected ≥2 chunks, got {}",
+            chunks.len()
+        );
         for ch in &chunks {
-            assert!(ch.contains("# Section "), "chunk should contain a heading: {ch}");
+            assert!(
+                ch.contains("# Section "),
+                "chunk should contain a heading: {ch}"
+            );
         }
     }
 
     #[test]
     fn splits_at_paragraphs_when_no_headings() {
-        let c = format!("{}\n\n{}\n\n{}\n", "x".repeat(3000), "y".repeat(3000), "z".repeat(3000));
+        let c = format!(
+            "{}\n\n{}\n\n{}\n",
+            "x".repeat(3000),
+            "y".repeat(3000),
+            "z".repeat(3000)
+        );
         let chunks = chunk_markdown(&c, 1500, 3000, 10).unwrap();
         assert!(chunks.len() >= 2);
     }

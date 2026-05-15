@@ -18,7 +18,10 @@ fn read_by_stem() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let output = memex_cmd(&root, None).args(["read", "caching"]).output().unwrap();
+    let output = memex_cmd(&root, None)
+        .args(["read", "caching"])
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -93,7 +96,10 @@ fn read_by_docid_prefix() {
     // Use the first 4 characters as prefix.
     let prefix = &docid[..4.min(docid.len())];
 
-    let output = memex_cmd(&root, None).args(["read", prefix]).output().unwrap();
+    let output = memex_cmd(&root, None)
+        .args(["read", prefix])
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "stderr: {}",

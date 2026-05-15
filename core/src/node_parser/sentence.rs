@@ -329,7 +329,10 @@ fn chunk_extent(splits: &[Split]) -> TextChunk {
     let pos = splits[0].pos;
     let last = splits.last().unwrap();
     let end = last.pos + last.len;
-    TextChunk { pos, len: end - pos }
+    TextChunk {
+        pos,
+        len: end - pos,
+    }
 }
 
 /// Mirror LlamaIndex's `_postprocess_chunks`: drop chunks whose body
@@ -494,8 +497,8 @@ mod tests {
         );
         // First chunk includes the first paragraph; second includes the second.
         let c0 = &text[chunks[0].pos..chunks[0].pos + chunks[0].len];
-        let c_last = &text[chunks.last().unwrap().pos
-            ..chunks.last().unwrap().pos + chunks.last().unwrap().len];
+        let c_last = &text
+            [chunks.last().unwrap().pos..chunks.last().unwrap().pos + chunks.last().unwrap().len];
         assert!(c0.contains("one"));
         assert!(c_last.contains("ten"));
     }
@@ -563,7 +566,11 @@ mod tests {
         let text = "Café est ouvert.\n\n\nJe bois café.";
         let chunks = s.split_text(text, &mut word_tokens, &naive_sentences);
         for c in &chunks {
-            assert!(text.is_char_boundary(c.pos), "pos {} not char-aligned", c.pos);
+            assert!(
+                text.is_char_boundary(c.pos),
+                "pos {} not char-aligned",
+                c.pos
+            );
             assert!(
                 text.is_char_boundary(c.pos + c.len),
                 "end {} not char-aligned",

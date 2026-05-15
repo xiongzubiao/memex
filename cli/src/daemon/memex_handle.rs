@@ -87,7 +87,10 @@ mod tests {
         let h = MemexHandle::new();
         let h1 = h.get_or_open(&root).unwrap();
         let h2 = h.get_or_open(&root).unwrap();
-        assert!(Arc::ptr_eq(&h1, &h2), "second call must return the bound Arc");
+        assert!(
+            Arc::ptr_eq(&h1, &h2),
+            "second call must return the bound Arc"
+        );
     }
 
     #[test]

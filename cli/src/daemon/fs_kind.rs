@@ -60,7 +60,10 @@ fn detect(path: &Path) -> Option<bool> {
     // f_fstypename is a fixed-size [c_char; 16] containing a C string
     // like "nfs", "smbfs", "afpfs", "webdav". Read up to the first NUL.
     let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(buf.f_fstypename.as_ptr() as *const u8, buf.f_fstypename.len())
+        std::slice::from_raw_parts(
+            buf.f_fstypename.as_ptr() as *const u8,
+            buf.f_fstypename.len(),
+        )
     };
     let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let name = std::str::from_utf8(&bytes[..nul]).ok()?;

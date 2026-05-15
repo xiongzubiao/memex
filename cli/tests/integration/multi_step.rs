@@ -5,8 +5,11 @@ use crate::integration_harness::IntegrationHarness;
 /// are present immediately after `write` returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn write_via_daemon_populates_chunks_vec() {
-    let h = IntegrationHarness::start_with_real_retrieval().await.unwrap();
-    let body = "# Auth Tokens\n\nbearer tokens authenticate api requests using the Authorization header";
+    let h = IntegrationHarness::start_with_real_retrieval()
+        .await
+        .unwrap();
+    let body =
+        "# Auth Tokens\n\nbearer tokens authenticate api requests using the Authorization header";
     h.write("Auth", body).await.unwrap();
 
     // The daemon strips any incoming frontmatter and re-serializes; the
@@ -25,7 +28,10 @@ async fn write_via_daemon_populates_chunks_vec() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(chunk_count >= 1, "expected ≥1 chunk for new doc, got {chunk_count}");
+    assert!(
+        chunk_count >= 1,
+        "expected ≥1 chunk for new doc, got {chunk_count}"
+    );
     let vec_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM chunks_vec WHERE hash_seq LIKE ?1 || '_%'",
@@ -33,5 +39,8 @@ async fn write_via_daemon_populates_chunks_vec() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(vec_count >= 1, "expected ≥1 chunks_vec row, got {vec_count}");
+    assert!(
+        vec_count >= 1,
+        "expected ≥1 chunks_vec row, got {vec_count}"
+    );
 }

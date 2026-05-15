@@ -18,7 +18,8 @@ fn concurrent_queries_all_succeed() {
         .env("MEMEX__DAEMON__WORKER__MAX_COUNT", "2")
         .start();
 
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",

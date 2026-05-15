@@ -61,7 +61,10 @@ pub fn assert_invariants(memex: &Memex) {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(dup_paths, 0, "found {dup_paths} duplicate (doc_type, path) rows");
+            assert_eq!(
+                dup_paths, 0,
+                "found {dup_paths} duplicate (doc_type, path) rows"
+            );
             Ok(())
         })
         .unwrap();

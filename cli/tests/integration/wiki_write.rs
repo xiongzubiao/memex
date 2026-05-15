@@ -1,9 +1,11 @@
-
 use crate::integration_harness::IntegrationHarness;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_creates_wiki_file_and_indexes() {
     let harness = IntegrationHarness::start().await;
-    let resp = harness.write("Auth Tokens", "# Auth Tokens\n\nbearer body").await.unwrap();
+    let resp = harness
+        .write("Auth Tokens", "# Auth Tokens\n\nbearer body")
+        .await
+        .unwrap();
     let docid = resp.docid;
     assert_eq!(docid.len(), 7);
 

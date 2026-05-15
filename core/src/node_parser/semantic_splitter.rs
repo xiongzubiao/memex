@@ -152,7 +152,11 @@ fn build_node_chunks(
         // Group: sentences[start_idx ..= bp]. Pos = first sentence's
         // start; end = next sentence's start (or text_len if last).
         let pos = spans[start_idx].0;
-        let end = if bp + 1 < n { spans[bp + 1].0 } else { text_len };
+        let end = if bp + 1 < n {
+            spans[bp + 1].0
+        } else {
+            text_len
+        };
         if end > pos {
             chunks.push(SemanticChunk {
                 pos,
@@ -363,10 +367,7 @@ mod tests {
             "Cats purr loudly.Cars are fast.Cars need fuel.".to_string(),
             vec![0.0, 1.0],
         );
-        map.insert(
-            "Cars are fast.Cars need fuel.".to_string(),
-            vec![0.0, 1.0],
-        );
+        map.insert("Cars are fast.Cars need fuel.".to_string(), vec![0.0, 1.0]);
         let mut emb = StubEmbedder { map };
         let chunks =
             build_semantic_nodes_from_text(text, &mut emb, 1, 95.0, whole_text_splitter).unwrap();

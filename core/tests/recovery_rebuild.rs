@@ -9,12 +9,19 @@ fn missing_index_db_triggers_full_rebuild_from_filesystem() {
         std::fs::write(
             m.wiki_dir().join("foo.md"),
             "---\ntitle: Foo
-sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nbody"
-        ).unwrap();
+sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\n---\n\nbody",
+        )
+        .unwrap();
         memex_core::reconcile::reconcile(&m, Default::default()).unwrap();
-        let count: i64 = m.search().conn_for_test().query_row(
-            "SELECT COUNT(*) FROM documents WHERE doc_type='wiki'",
-            [], |r| r.get(0)).unwrap();
+        let count: i64 = m
+            .search()
+            .conn_for_test()
+            .query_row(
+                "SELECT COUNT(*) FROM documents WHERE doc_type='wiki'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1, "preconditions: should have 1 indexed wiki doc");
     }
 
@@ -28,8 +35,14 @@ sources: []\ncreated_at: 2026-04-26T00:00:00Z\nupdated_at: 2026-04-26T00:00:00Z\
     let m = Memex::open_writer(root.clone()).unwrap();
     let report = memex_core::reconcile::reconcile(&m, Default::default()).unwrap();
     assert_eq!(report.indexed, 1);
-    let count: i64 = m.search().conn_for_test().query_row(
-        "SELECT COUNT(*) FROM documents WHERE doc_type='wiki'",
-        [], |r| r.get(0)).unwrap();
+    let count: i64 = m
+        .search()
+        .conn_for_test()
+        .query_row(
+            "SELECT COUNT(*) FROM documents WHERE doc_type='wiki'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(count, 1, "rebuild should restore the doc");
 }

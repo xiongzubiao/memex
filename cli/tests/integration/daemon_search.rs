@@ -9,7 +9,6 @@
 //!   exercised because the seeded pages give an unambiguous BM25 winner,
 //!   so the embedder is never invoked).
 
-
 use crate::common;
 use memex_cli::daemon::handler::{HandlerState, ReaderSession, WriterSession, handle};
 use memex_cli::daemon::memex_handle::MemexHandle;
@@ -26,9 +25,7 @@ fn stub_retrieval() -> (
     tokio::task::JoinHandle<()>,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<RetrievalReq>(1);
-    let handle = tokio::spawn(async move {
-        while rx.recv().await.is_some() {}
-    });
+    let handle = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     (tx, handle)
 }
 
@@ -41,9 +38,7 @@ fn test_state(
         memex_handle: MemexHandle::new(),
         // Strong-BM25 short-circuit fires for an unambiguous title hit,
         // so MockEmbedder is never invoked here — keeps the test ONNX-free.
-        embed_model: memex_cli::daemon::handler::shared_embedder(
-            memex_core::embed::MockEmbedder,
-        ),
+        embed_model: memex_cli::daemon::handler::shared_embedder(memex_core::embed::MockEmbedder),
     };
     let writer_session = WriterSession {
         reader: reader_session,
@@ -77,13 +72,13 @@ async fn search_returns_top_match_via_strong_bm25_short_circuit() {
 
     common::ingest_page(
         &root,
-                "auth-tokens",
+        "auth-tokens",
         "Auth Tokens",
         "Bearer tokens authenticate API requests.",
     );
     common::ingest_page(
         &root,
-                "caching-strategies",
+        "caching-strategies",
         "Caching Strategies",
         "Cache layers reduce latency.",
     );
@@ -114,7 +109,7 @@ async fn search_returns_none_for_missing_title() {
 
     common::ingest_page(
         &root,
-                "auth-tokens",
+        "auth-tokens",
         "Auth Tokens",
         "Bearer tokens authenticate API requests.",
     );

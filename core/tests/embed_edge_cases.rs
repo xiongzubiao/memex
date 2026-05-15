@@ -15,11 +15,8 @@ fn embed_text_edge_cases_no_panic() {
     assert_eq!(v.len(), memex_core::embed::EMBEDDING_DIM);
 
     // Multi-byte.
-    let v = memex_core::embed::embed_text(
-        &mut model,
-        "こんにちは世界 🌍 café résumé naïve",
-    )
-    .unwrap();
+    let v =
+        memex_core::embed::embed_text(&mut model, "こんにちは世界 🌍 café résumé naïve").unwrap();
     assert_eq!(v.len(), memex_core::embed::EMBEDDING_DIM);
 
     // Very long (>2048 tokens after tokenization). Embedder rejects

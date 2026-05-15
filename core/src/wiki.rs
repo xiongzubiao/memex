@@ -45,7 +45,9 @@ pub fn normalize_slug(input: &str) -> String {
             prev_dash = true;
         }
     }
-    while out.ends_with('-') { out.pop(); }
+    while out.ends_with('-') {
+        out.pop();
+    }
     out
 }
 

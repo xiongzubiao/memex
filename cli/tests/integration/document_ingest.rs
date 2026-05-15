@@ -3,7 +3,6 @@
 use crate::integration_harness::IntegrationHarness;
 use memex_cli::daemon::protocol::{Event, IngestSource, Request};
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn document_ingest_short_content_runs_one_chunk() {
     let h = IntegrationHarness::start_with_mock_extract(|_prompt| {
@@ -254,9 +253,7 @@ async fn merge_failure_preserves_existing_wiki_page() {
     let h = match IntegrationHarness::start_with_mock_extract_and_merge_with_embed(
         move |_prompt| {
             let n = extract_clone.fetch_add(1, Ordering::Relaxed);
-            format!(
-                "- slug: alice\n  title: Alice\n  tags: []\n  body: |\n    extract-call-{n}\n",
-            )
+            format!("- slug: alice\n  title: Alice\n  tags: []\n  body: |\n    extract-call-{n}\n",)
         },
         move |_prompt| {
             merge_clone.fetch_add(1, Ordering::Relaxed);
@@ -294,7 +291,11 @@ async fn merge_failure_preserves_existing_wiki_page() {
         after_first.contains("extract-call-0"),
         "expected extract-call-0 body, got:\n{after_first}"
     );
-    assert_eq!(merge_calls.load(Ordering::Relaxed), 0, "no merge on first ingest");
+    assert_eq!(
+        merge_calls.load(Ordering::Relaxed),
+        0,
+        "no merge on first ingest"
+    );
 
     // Second ingest: extract proposes alice again, MERGE fails. The patched
     // fallback must NOT overwrite alice.md.
@@ -362,9 +363,14 @@ async fn document_ingest_dispatches_per_slug_merge_calls() {
         move |prompt| {
             let payload = prompt.split_once("\n\n").map(|(_, p)| p).unwrap_or("");
             let v: serde_json::Value = serde_json::from_str(payload.trim()).unwrap_or_default();
-            let pages = v.get("pages").and_then(|p| p.as_array()).cloned().unwrap_or_default();
+            let pages = v
+                .get("pages")
+                .and_then(|p| p.as_array())
+                .cloned()
+                .unwrap_or_default();
             let count = pages.len();
-            let slug = pages.first()
+            let slug = pages
+                .first()
                 .and_then(|p| p.get("slug"))
                 .and_then(|s| s.as_str())
                 .unwrap_or("?")
@@ -372,7 +378,11 @@ async fn document_ingest_dispatches_per_slug_merge_calls() {
             merge_clone.lock().unwrap().push((slug.clone(), count));
             format!(
                 "- slug: {slug}\n  title: {}\n  tags: []\n  body: Merged {slug}.\n",
-                slug.chars().next().unwrap_or('?').to_uppercase().to_string()
+                slug.chars()
+                    .next()
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .to_string()
                     + slug.get(1..).unwrap_or("")
             )
         },
@@ -471,8 +481,18 @@ async fn document_ingest_per_slug_merge_fault_isolation() {
         }
     };
 
-    crate::common::ingest_page(h.memex_root(), "andrew", "Andrew", "Andrew-original-content.");
-    crate::common::ingest_page(h.memex_root(), "audrey", "Audrey", "Audrey-original-content.");
+    crate::common::ingest_page(
+        h.memex_root(),
+        "andrew",
+        "Andrew",
+        "Andrew-original-content.",
+    );
+    crate::common::ingest_page(
+        h.memex_root(),
+        "audrey",
+        "Audrey",
+        "Audrey-original-content.",
+    );
 
     let andrew_before = std::fs::read_to_string(h.memex_root().join("wiki/andrew.md")).unwrap();
 
@@ -490,7 +510,10 @@ async fn document_ingest_per_slug_merge_fault_isolation() {
     );
 
     let andrew_after = std::fs::read_to_string(h.memex_root().join("wiki/andrew.md")).unwrap();
-    assert_eq!(andrew_before, andrew_after, "andrew.md changed despite failed MERGE");
+    assert_eq!(
+        andrew_before, andrew_after,
+        "andrew.md changed despite failed MERGE"
+    );
 
     let audrey_after = std::fs::read_to_string(h.memex_root().join("wiki/audrey.md")).unwrap();
     assert!(

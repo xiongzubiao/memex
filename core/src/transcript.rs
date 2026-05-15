@@ -920,9 +920,7 @@ pub fn extract_opencode_session(
     .map_err(|e| format!("open {}: {e}", db_path.display()))?;
 
     let mut msg_stmt = conn
-        .prepare(
-            "SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created ASC",
-        )
+        .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created ASC")
         .map_err(|e| format!("prepare message query: {e}"))?;
     let msg_rows = msg_stmt
         .query_map([session_id], |row| {
@@ -984,7 +982,10 @@ pub fn extract_opencode_session(
                     }
                 }
                 "tool" => {
-                    let name = part.get("tool").and_then(Value::as_str).unwrap_or("unknown");
+                    let name = part
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
                     let input = part
                         .get("state")
                         .and_then(|s| s.get("input"))
@@ -1013,8 +1014,7 @@ pub fn extract_opencode_session(
         session_id: session_id.to_string(),
         turns,
     };
-    serde_json::to_string(&envelope)
-        .map_err(|e| format!("serialize OpenCode envelope: {e}"))
+    serde_json::to_string(&envelope).map_err(|e| format!("serialize OpenCode envelope: {e}"))
 }
 
 /// List every OpenCode session id present in `db_path`. Used by `memex
@@ -1167,7 +1167,10 @@ mod tests {
         // camelCase filePath, and SKIP reasoning + step-start parts.
         let asst = &parsed.turns[1].text;
         assert!(asst.contains("on it"), "missing text part: {asst}");
-        assert!(asst.contains("[Tool: read — file: /repo/foo.rs]"), "tool summary missing: {asst}");
+        assert!(
+            asst.contains("[Tool: read — file: /repo/foo.rs]"),
+            "tool summary missing: {asst}"
+        );
         assert!(!asst.contains("thinking about"), "reasoning leaked: {asst}");
         assert!(!asst.contains("snapshot"), "step-start leaked: {asst}");
     }
@@ -1193,9 +1196,15 @@ mod tests {
     fn redact_secrets_redacts_known_patterns() {
         let s = "key sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA bla AKIAABCDEFGHIJKLMNOP after\npassword=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let out = redact_secrets(s);
-        assert!(!out.contains("sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {out}");
+        assert!(
+            !out.contains("sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "got: {out}"
+        );
         assert!(!out.contains("AKIAABCDEFGHIJKLMNOP"), "got: {out}");
-        assert!(!out.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {out}");
+        assert!(
+            !out.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -1207,8 +1216,12 @@ mod tests {
             r#"{"type":"user","uuid":"abc","message":{"role":"user","content":"hi"}}
 {"type":"assistant","parentUuid":"abc","message":{"role":"assistant","content":"hello"}}
 "#,
-        ).unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::ClaudeCode));
+        )
+        .unwrap();
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::ClaudeCode)
+        );
     }
 
     #[test]
@@ -1219,7 +1232,8 @@ mod tests {
             &path,
             r#"{"event_msg":"started","response_id":"r1"}
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::Codex));
     }
 
@@ -1230,8 +1244,12 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"messages": [{"role": "user", "parts": [{"text": "hi"}]}]}"#,
-        ).unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+        )
+        .unwrap();
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::GeminiCli)
+        );
     }
 
     #[test]
@@ -1243,8 +1261,12 @@ mod tests {
             r#"{"sessionId":"abc","projectHash":"h","startTime":"t","lastUpdated":"t","kind":"main"}
 {"id":"m1","timestamp":"t","type":"user","content":[{"text":"hi"}]}
 "#,
-        ).unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+        )
+        .unwrap();
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::GeminiCli)
+        );
     }
 
     #[test]
@@ -1289,8 +1311,12 @@ mod tests {
             r#"{"type":"session","version":3,"id":"abc","timestamp":"t","cwd":"/x"}
 {"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}
 "#,
-        ).unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::OpenClaw));
+        )
+        .unwrap();
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::OpenClaw)
+        );
     }
 
     #[test]
@@ -1323,7 +1349,10 @@ mod tests {
             r#"{"session_id":"abc","platform":"cli","model":"gpt-5.4-mini","session_start":"2026-05-13T22:45:45","last_updated":"2026-05-13T22:46:00","message_count":2,"messages":[{"role":"user","content":"hi"}]}"#,
         )
         .unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::Hermes));
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::Hermes)
+        );
     }
 
     #[test]
@@ -1380,7 +1409,10 @@ mod tests {
             r#"{"sessionId":"x","messages":[{"type":"user","content":[{"text":"hi"}]}]}"#,
         )
         .unwrap();
-        assert_eq!(detect_transcript_agent(&path), Some(TranscriptAgent::GeminiCli));
+        assert_eq!(
+            detect_transcript_agent(&path),
+            Some(TranscriptAgent::GeminiCli)
+        );
     }
 
     #[test]
@@ -1392,7 +1424,11 @@ mod tests {
 {"type":"message","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}
 "#;
         let parsed = parse_openclaw_session(text).unwrap();
-        assert_eq!(parsed.turns.len(), 1, "only the message record should produce a turn");
+        assert_eq!(
+            parsed.turns.len(),
+            1,
+            "only the message record should produce a turn"
+        );
     }
 
     #[test]

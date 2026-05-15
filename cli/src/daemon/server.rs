@@ -221,10 +221,10 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
     })?;
     let embed_model = crate::daemon::handler::shared_embedder(model);
 
-    let retrieval_tx =
-        crate::daemon::retrieval::spawn(memex_handle.clone(), embed_model.clone());
+    let retrieval_tx = crate::daemon::retrieval::spawn(memex_handle.clone(), embed_model.clone());
 
-    let pool = crate::daemon::worker::WorkerPool::new(cfg.daemon.worker.clone(), memex_handle.clone());
+    let pool =
+        crate::daemon::worker::WorkerPool::new(cfg.daemon.worker.clone(), memex_handle.clone());
     let cfg = Arc::new(cfg);
     let reader_session = crate::daemon::handler::ReaderSession {
         bound_root: root.clone(),
@@ -313,24 +313,22 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                 );
                 let mut recovered = false;
                 if let Err(e2) = std::fs::rename(&db_path, &backup) {
-                    warn!(?e2, "could not move corrupt index.db aside; deferring recovery");
+                    warn!(
+                        ?e2,
+                        "could not move corrupt index.db aside; deferring recovery"
+                    );
                 } else {
                     // Stale WAL/SHM from the corrupt DB are also unusable.
-                    let _ = std::fs::remove_file(root.join(format!(
-                        "{}-wal", memex_core::INDEX_DB_NAME
-                    )));
-                    let _ = std::fs::remove_file(root.join(format!(
-                        "{}-shm", memex_core::INDEX_DB_NAME
-                    )));
+                    let _ = std::fs::remove_file(
+                        root.join(format!("{}-wal", memex_core::INDEX_DB_NAME)),
+                    );
+                    let _ = std::fs::remove_file(
+                        root.join(format!("{}-shm", memex_core::INDEX_DB_NAME)),
+                    );
                     match state.writer.memex_handle().get_or_open(&root) {
                         Ok(memex) => {
                             info!("rebuilt fresh index.db after corruption; running reconcile");
-                            match reconcile_chunked(
-                                &memex,
-                                &embed_model,
-                                Default::default(),
-                            )
-                            .await
+                            match reconcile_chunked(&memex, &embed_model, Default::default()).await
                             {
                                 Ok(r) => {
                                     info!(
@@ -348,7 +346,10 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                             }
                         }
                         Err(e3) => {
-                            warn!(?e3, "could not re-open index.db even after backing up corrupt file");
+                            warn!(
+                                ?e3,
+                                "could not re-open index.db even after backing up corrupt file"
+                            );
                         }
                     }
                 }
@@ -410,13 +411,19 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                     });
                 }
                 Err(e) => {
-                    warn!(?e, "watcher startup failed; daemon will run without filesystem watching");
+                    warn!(
+                        ?e,
+                        "watcher startup failed; daemon will run without filesystem watching"
+                    );
                     native_unreliable = true;
                 }
             }
         }
         Err(e) => {
-            warn!(?e, "could not open memex for watcher; skipping watcher startup");
+            warn!(
+                ?e,
+                "could not open memex for watcher; skipping watcher startup"
+            );
         }
     }
 
@@ -473,12 +480,8 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                         continue;
                     }
                 };
-                match reconcile_chunked(
-                    &memex,
-                    &embed_model_for_reconcile,
-                    Default::default(),
-                )
-                .await
+                match reconcile_chunked(&memex, &embed_model_for_reconcile, Default::default())
+                    .await
                 {
                     Ok(r) => {
                         if r.indexed > 0 || r.deleted > 0 || r.hash_mismatches > 0 {
@@ -496,8 +499,7 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
         });
         info!(
             interval_sec = interval.as_secs(),
-            native_unreliable,
-            "periodic reconcile timer armed"
+            native_unreliable, "periodic reconcile timer armed"
         );
     }
 

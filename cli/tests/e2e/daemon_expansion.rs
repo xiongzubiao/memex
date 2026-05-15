@@ -21,7 +21,8 @@ fn weak_signal_query_triggers_expansion_and_returns_answer() {
         .env("MEMEX__DAEMON__WORKER__MAX_COUNT", "1")
         .start();
 
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",
@@ -64,12 +65,14 @@ fn strong_signal_query_skips_expansion() {
     // Wiki title has BM25 weight 4.0, so a title-matching query yields
     // a high top-1 score; page 2's unrelated content → BM25 returns only
     // page 1 → s2 defaults to 0.0 → (s1 - 0.0) ≥ 0.15 easily.
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "auth-migration-timeline",
         "Auth Migration Timeline",
         "- 2026-04-16: Production rollout begins",
     );
-    common::ingest_page(h.memex_root(),
+    common::ingest_page(
+        h.memex_root(),
         "database-schema",
         "Database Schema",
         "User accounts table has columns id, email, created_at.",

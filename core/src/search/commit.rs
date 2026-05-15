@@ -15,9 +15,7 @@ use walkdir::WalkDir;
 
 use crate::error::Result;
 
-use super::collections::{
-    ensure_default_document_collection, set_document_collections_in_conn,
-};
+use super::collections::{ensure_default_document_collection, set_document_collections_in_conn};
 use super::{Db, mutex_err, parse_page_for_indexing, sqlite_err};
 
 /// A wiki page ready to be inserted by `store_wiki_page`.
@@ -75,10 +73,7 @@ pub struct CommitResult {
 /// inconsistent hash. Returns `(id, body_hash)` — `id` for fixture seeding
 /// that joins on document id; `body_hash` for `commit_doc`'s chunk-cleanup
 /// decision.
-pub fn upsert_document(
-    conn: &rusqlite::Connection,
-    spec: &DocSpec<'_>,
-) -> Result<(i64, String)> {
+pub fn upsert_document(conn: &rusqlite::Connection, spec: &DocSpec<'_>) -> Result<(i64, String)> {
     let body_hash = crate::storage::content_hash(spec.body.as_bytes());
 
     // Capture the previous (id, title) so we can issue a precise
@@ -153,10 +148,7 @@ pub fn upsert_document(
 /// Caller is responsible for the path convention (raw is
 /// content-addressable, wiki is slug-named) and for committing the
 /// transaction. Caller also handles the embedding step if applicable.
-pub fn commit_doc(
-    tx: &rusqlite::Connection,
-    spec: &DocSpec<'_>,
-) -> Result<CommitResult> {
+pub fn commit_doc(tx: &rusqlite::Connection, spec: &DocSpec<'_>) -> Result<CommitResult> {
     let prev_hash: Option<String> = tx
         .query_row(
             "SELECT hash FROM documents WHERE doc_type=?1 AND path=?2",
@@ -475,9 +467,7 @@ impl Db {
                 Err(_) => continue,
             };
 
-            if let Some((title, body, _summary, collections)) =
-                parse_page_for_indexing(&content)
-            {
+            if let Some((title, body, _summary, collections)) = parse_page_for_indexing(&content) {
                 let rel_path = abs_path.strip_prefix(root).unwrap_or(abs_path);
                 let path_str = rel_path.to_string_lossy().to_string();
                 let Ok(mtime) = std::fs::metadata(abs_path).and_then(|m| m.modified()) else {
@@ -731,16 +721,42 @@ mod tests {
         let alpha_hash = crate::storage::content_hash(alpha_body.as_bytes());
         let beta_hash = crate::storage::content_hash(beta_body.as_bytes());
 
-        std::fs::write(wiki_dir.join("alpha.md"), make_page("Alpha", alpha_body.trim_end())).unwrap();
-        std::fs::write(wiki_dir.join("beta.md"), make_page("Beta", beta_body.trim_end())).unwrap();
+        std::fs::write(
+            wiki_dir.join("alpha.md"),
+            make_page("Alpha", alpha_body.trim_end()),
+        )
+        .unwrap();
+        std::fs::write(
+            wiki_dir.join("beta.md"),
+            make_page("Beta", beta_body.trim_end()),
+        )
+        .unwrap();
 
         let db_path = root.join(crate::INDEX_DB_NAME);
         let search = Db::open(&db_path).unwrap();
         search.rebuild(root).unwrap();
 
         let conn = search.conn_for_test();
-        crate::vector::store_chunk(&conn, &alpha_hash, 0, 0, 5, "", &vec![0.1f32; crate::embed::EMBEDDING_DIM]).unwrap();
-        crate::vector::store_chunk(&conn, &beta_hash, 0, 0, 5, "", &vec![0.1f32; crate::embed::EMBEDDING_DIM]).unwrap();
+        crate::vector::store_chunk(
+            &conn,
+            &alpha_hash,
+            0,
+            0,
+            5,
+            "",
+            &vec![0.1f32; crate::embed::EMBEDDING_DIM],
+        )
+        .unwrap();
+        crate::vector::store_chunk(
+            &conn,
+            &beta_hash,
+            0,
+            0,
+            5,
+            "",
+            &vec![0.1f32; crate::embed::EMBEDDING_DIM],
+        )
+        .unwrap();
         drop(conn);
 
         std::fs::remove_file(wiki_dir.join("beta.md")).unwrap();
@@ -781,10 +797,31 @@ mod tests {
         let h2 = "bb".repeat(32);
         {
             let conn = search.conn_for_test();
-            crate::vector::store_chunk(&conn, &h1, 0, 0, 5, "", &vec![0.1f32; crate::embed::EMBEDDING_DIM]).unwrap();
-            crate::vector::store_chunk(&conn, &h2, 0, 0, 5, "", &vec![0.1f32; crate::embed::EMBEDDING_DIM]).unwrap();
+            crate::vector::store_chunk(
+                &conn,
+                &h1,
+                0,
+                0,
+                5,
+                "",
+                &vec![0.1f32; crate::embed::EMBEDDING_DIM],
+            )
+            .unwrap();
+            crate::vector::store_chunk(
+                &conn,
+                &h2,
+                0,
+                0,
+                5,
+                "",
+                &vec![0.1f32; crate::embed::EMBEDDING_DIM],
+            )
+            .unwrap();
         }
-        assert!(!root.join("wiki").exists(), "test setup: wiki dir must be absent");
+        assert!(
+            !root.join("wiki").exists(),
+            "test setup: wiki dir must be absent"
+        );
 
         search.rebuild(root).unwrap();
 
@@ -805,12 +842,18 @@ mod tests {
 
         std::fs::write(
             wiki_dir.join("alpha.md"),
-            make_page("Alpha Topic", "Alpha is the first letter of the Greek alphabet."),
+            make_page(
+                "Alpha Topic",
+                "Alpha is the first letter of the Greek alphabet.",
+            ),
         )
         .unwrap();
         std::fs::write(
             wiki_dir.join("beta.md"),
-            make_page("Beta Topic", "Beta is the second letter of the Greek alphabet."),
+            make_page(
+                "Beta Topic",
+                "Beta is the second letter of the Greek alphabet.",
+            ),
         )
         .unwrap();
 
@@ -941,7 +984,11 @@ mod tests {
             Ok(())
         });
         r.unwrap();
-        assert_eq!(collections_row_count(&db), 1, "Ok-returning closure should commit");
+        assert_eq!(
+            collections_row_count(&db),
+            1,
+            "Ok-returning closure should commit"
+        );
     }
 
     #[test]
@@ -955,6 +1002,10 @@ mod tests {
             )))
         });
         assert!(r.is_err());
-        assert_eq!(collections_row_count(&db), 0, "Err-returning closure should roll back");
+        assert_eq!(
+            collections_row_count(&db),
+            0,
+            "Err-returning closure should roll back"
+        );
     }
 }

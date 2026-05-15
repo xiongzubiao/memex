@@ -36,14 +36,11 @@ impl Memex {
 
         // Collect DB state: all wiki documents, keyed by slug.
         let db_docs = self.search.all_wiki_documents()?;
-        let db_slugs: std::collections::HashSet<String> = db_docs
-            .iter()
-            .map(|d| slug_of_db_path(&d.path))
-            .collect();
+        let db_slugs: std::collections::HashSet<String> =
+            db_docs.iter().map(|d| slug_of_db_path(&d.path)).collect();
 
         // Collect disk state: slug of every .md file in wiki/.
-        let mut disk_slugs: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut disk_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
         if wiki_dir.exists() {
             for entry in std::fs::read_dir(&wiki_dir)? {
                 let entry = entry?;
@@ -66,19 +63,20 @@ impl Memex {
             let slug = slug_of_db_path(&doc.path);
             let full_path = crate::wiki::wiki_path_for_slug(&wiki_dir, &slug);
             if full_path.exists()
-                && let Ok(content) = std::fs::read_to_string(&full_path) {
-                    let disk_body_hash = match validate::parse_frontmatter(&content) {
-                        Ok((_, body)) => crate::storage::content_hash(body.as_bytes()),
-                        Err(_) => crate::storage::content_hash(content.as_bytes()),
-                    };
-                    if disk_body_hash != doc.hash {
-                        issues.push(LintIssue {
-                            kind: LintIssueKind::StaleIndex,
-                            page: slug,
-                            target: doc.path.clone(),
-                        });
-                    }
+                && let Ok(content) = std::fs::read_to_string(&full_path)
+            {
+                let disk_body_hash = match validate::parse_frontmatter(&content) {
+                    Ok((_, body)) => crate::storage::content_hash(body.as_bytes()),
+                    Err(_) => crate::storage::content_hash(content.as_bytes()),
+                };
+                if disk_body_hash != doc.hash {
+                    issues.push(LintIssue {
+                        kind: LintIssueKind::StaleIndex,
+                        page: slug,
+                        target: doc.path.clone(),
+                    });
                 }
+            }
         }
 
         // Check: Untracked file — on disk but no DB row. `page` carries
@@ -225,8 +223,7 @@ impl Memex {
             // Dedupe per (page, target) since stem-pattern and
             // title-pattern can both match the same target.
             if let Some(set) = &cross_link_set {
-                let mut seen: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
                 for idx in set.matches(body).iter() {
                     let target = pattern_target[idx];
                     if target == stem.as_str() {
@@ -378,11 +375,9 @@ fn fix_wiki_reindex(
 ) -> crate::error::Result<()> {
     let full_path = root.join(&issue.target);
     let content = std::fs::read_to_string(&full_path)?;
-    let (title, body, _summary, collections) =
-        crate::search::parse_page_for_indexing(&content).ok_or_else(|| {
-            crate::error::MemexError::ValidationFailure {
-                details: format!("page {} has no valid frontmatter", issue.target),
-            }
+    let (title, body, _summary, collections) = crate::search::parse_page_for_indexing(&content)
+        .ok_or_else(|| crate::error::MemexError::ValidationFailure {
+            details: format!("page {} has no valid frontmatter", issue.target),
         })?;
     let mtime = std::fs::metadata(&full_path)?.modified()?;
     let size = content.len() as i64;
@@ -413,10 +408,7 @@ fn fix_wiki_reindex(
 /// Re-embed every documents row whose `embed_model` differs from the
 /// current model. Iterates by hash since `chunks` are hash-keyed; one
 /// embed_document call refreshes every row that shared the body.
-fn fix_outdated_embedding(
-    search: &Db,
-    root: &std::path::Path,
-) -> crate::error::Result<()> {
+fn fix_outdated_embedding(search: &Db, root: &std::path::Path) -> crate::error::Result<()> {
     let mut model = crate::retrieval::load_default_model()?;
     let outdated = search.outdated_chunk_hashes(crate::embed::CURRENT_MODEL_NAME)?;
     for hash in &outdated {
@@ -445,10 +437,7 @@ fn fix_outdated_embedding(
 /// is path-keyed; `issue.target` preserves the DB-stored path so this
 /// matches whichever convention the row used (`<slug>` or
 /// `wiki/<slug>.md`).
-fn fix_missing_file(
-    search: &Db,
-    issue: &LintIssue,
-) -> crate::error::Result<()> {
+fn fix_missing_file(search: &Db, issue: &LintIssue) -> crate::error::Result<()> {
     search.delete_document_with_cleanup(&issue.target)?;
     Ok(())
 }
@@ -490,9 +479,22 @@ fn fix_raw_hash_mismatch(
     if new_abs.exists() {
         return fix_raw_hash_duplicate(search, old_rel, &old_abs);
     }
-    let title = fm.as_ref().and_then(|f| f.title.clone()).unwrap_or_default();
+    let title = fm
+        .as_ref()
+        .and_then(|f| f.title.clone())
+        .unwrap_or_default();
     let source = fm.as_ref().and_then(|f| f.source.clone());
-    fix_raw_hash_rename(search, root, old_rel, &old_abs, &new_abs, new_hash, &title, source.as_deref(), &body)
+    fix_raw_hash_rename(
+        search,
+        root,
+        old_rel,
+        &old_abs,
+        &new_abs,
+        new_hash,
+        &title,
+        source.as_deref(),
+        &body,
+    )
 }
 
 /// `new_abs` already exists — the body is canonical under another
@@ -543,9 +545,7 @@ fn fix_raw_hash_rename(
     body: &str,
 ) -> crate::error::Result<()> {
     std::fs::rename(old_abs, new_abs)?;
-    let new_rel = crate::storage::rel_path_string(
-        new_abs.strip_prefix(root).unwrap_or(new_abs),
-    );
+    let new_rel = crate::storage::rel_path_string(new_abs.strip_prefix(root).unwrap_or(new_abs));
     let meta = std::fs::metadata(new_abs)?;
     let mtime = meta.modified()?;
     let size = meta.len() as i64;
@@ -592,9 +592,9 @@ fn fix_raw_hash_rename(
     // itself failed.
     match crate::retrieval::load_default_model() {
         Ok(mut model) => {
-            if let Err(e) = crate::retrieval::embed_document(
-                search, new_hash, title, body, &mut model,
-            ) {
+            if let Err(e) =
+                crate::retrieval::embed_document(search, new_hash, title, body, &mut model)
+            {
                 tracing::warn!(
                     path = %new_rel,
                     error = %e,
@@ -625,10 +625,7 @@ fn fix_raw_hash_rename(
 /// have no FK cascade from documents, so the hash-keyed sweep is
 /// explicit. The reference count guards against wiping a sibling row's
 /// chunks when two docs share a body.
-fn drop_raw_row_and_chunks(
-    tx: &rusqlite::Connection,
-    old_rel: &str,
-) -> crate::error::Result<()> {
+fn drop_raw_row_and_chunks(tx: &rusqlite::Connection, old_rel: &str) -> crate::error::Result<()> {
     let prior: Option<(i64, String, String)> = tx
         .query_row(
             "SELECT id, title, hash FROM documents WHERE doc_type='raw' AND path=?1",
@@ -926,8 +923,14 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             .iter()
             .filter(|i| i.kind == crate::types::LintIssueKind::MissingFile)
             .count();
-        assert_eq!(untracked, 0, "DB row exists for the file; nothing should be untracked");
-        assert_eq!(missing, 0, "file exists for the DB row; nothing should be missing");
+        assert_eq!(
+            untracked, 0,
+            "DB row exists for the file; nothing should be untracked"
+        );
+        assert_eq!(
+            missing, 0,
+            "file exists for the DB row; nothing should be missing"
+        );
     }
 
     #[test]
@@ -1150,7 +1153,11 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             .get_document_hash("wiki/current-page.md")
             .unwrap()
             .expect("document should have a hash");
-        set_embed_model(search, "wiki/current-page.md", crate::embed::CURRENT_MODEL_NAME);
+        set_embed_model(
+            search,
+            "wiki/current-page.md",
+            crate::embed::CURRENT_MODEL_NAME,
+        );
 
         let _ = fixture_embedding();
 
@@ -1221,7 +1228,9 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         };
         std::fs::write(&raw_path, assemble_raw_file(&fm, body)).unwrap();
         crate::index_raw::index_raw_file(&memex, &raw_path, None).unwrap();
-        let rel = raw_path.strip_prefix(memex.root()).unwrap_or(&raw_path)
+        let rel = raw_path
+            .strip_prefix(memex.root())
+            .unwrap_or(&raw_path)
             .to_string_lossy()
             .to_string();
 
@@ -1260,7 +1269,11 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         let memex = open_and_reindex(&root);
         // Confirm the row exists.
         assert!(
-            memex.search().get_document_hash("wiki/ghost.md").unwrap().is_some(),
+            memex
+                .search()
+                .get_document_hash("wiki/ghost.md")
+                .unwrap()
+                .is_some(),
             "row should exist post-reindex"
         );
         // Delete the file off disk.
@@ -1273,7 +1286,11 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         };
         crate::lint::apply_fix_inner(memex.search(), &root, &issue).unwrap();
         assert!(
-            memex.search().get_document_hash("wiki/ghost.md").unwrap().is_none(),
+            memex
+                .search()
+                .get_document_hash("wiki/ghost.md")
+                .unwrap()
+                .is_none(),
             "row should be gone after MissingFile fix"
         );
 
@@ -1317,7 +1334,9 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         )
         .unwrap();
         crate::index_raw::index_raw_file(&memex, &canonical_path, None).unwrap();
-        let canonical_rel = canonical_path.strip_prefix(memex.root()).unwrap_or(&canonical_path)
+        let canonical_rel = canonical_path
+            .strip_prefix(memex.root())
+            .unwrap_or(&canonical_path)
             .to_string_lossy()
             .to_string();
 
@@ -1342,7 +1361,9 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         // hash (the hash before the manual edit). commit_doc recomputes
         // hash from body, so use raw SQL to capture the production state
         // where the row's hash column is stale relative to disk content.
-        let stale_rel_for_insert = stale_path.strip_prefix(memex.root()).unwrap_or(&stale_path)
+        let stale_rel_for_insert = stale_path
+            .strip_prefix(memex.root())
+            .unwrap_or(&stale_path)
             .to_string_lossy()
             .to_string();
         let old_body_hash = "feedface".to_string() + &"de".repeat(28);
@@ -1357,12 +1378,22 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
                 // Seed a chunk at the OLD hash so the test can verify
                 // the chunks-leak fix actually deletes it.
                 let dummy_embedding = vec![0.0f32; 768];
-                crate::vector::store_chunk(tx, &old_body_hash, 0, 0, body.len(), "", &dummy_embedding)?;
+                crate::vector::store_chunk(
+                    tx,
+                    &old_body_hash,
+                    0,
+                    0,
+                    body.len(),
+                    "",
+                    &dummy_embedding,
+                )?;
                 Ok(())
             })
             .unwrap();
 
-        let stale_rel = stale_path.strip_prefix(memex.root()).unwrap_or(&stale_path)
+        let stale_rel = stale_path
+            .strip_prefix(memex.root())
+            .unwrap_or(&stale_path)
             .to_string_lossy()
             .to_string();
         let issue = LintIssue {
@@ -1377,7 +1408,11 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
         assert!(canonical_path.exists(), "canonical file preserved");
         // Stale row gone.
         assert!(
-            memex.search().get_document_hash(&stale_rel).unwrap().is_none(),
+            memex
+                .search()
+                .get_document_hash(&stale_rel)
+                .unwrap()
+                .is_none(),
             "stale row removed"
         );
         // Canonical row still has its ORIGINAL title — not clobbered by
@@ -1439,14 +1474,12 @@ created_at: 2026-04-06T00:00:00Z\nupdated_at: 2026-04-06T00:00:00Z\nsources: []\
             target: "wiki/orphan.md".into(),
         };
         // Before indexing: issue is present.
-        let before =
-            crate::lint::is_issue_still_present(memex.search(), &root, &issue).unwrap();
+        let before = crate::lint::is_issue_still_present(memex.search(), &root, &issue).unwrap();
         assert!(before, "untracked file pre-index => issue present");
 
         // After reindex: row exists, issue is gone.
         memex.reindex().unwrap();
-        let after =
-            crate::lint::is_issue_still_present(memex.search(), &root, &issue).unwrap();
+        let after = crate::lint::is_issue_still_present(memex.search(), &root, &issue).unwrap();
         assert!(!after, "indexed file => issue gone");
     }
 }

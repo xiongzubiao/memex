@@ -149,11 +149,12 @@ impl Db {
 
     pub fn pending_ingest_jobs(&self) -> Result<Vec<PendingJob>> {
         let conn = self.conn.lock().map_err(|e| mutex_err(&e))?;
-        let mut stmt = conn.prepare(
-            "SELECT job_id, job_type, source_path, agent, content_hash, collections \
+        let mut stmt = conn
+            .prepare(
+                "SELECT job_id, job_type, source_path, agent, content_hash, collections \
              FROM ingest_jobs WHERE status IN ('pending', 'processing')",
-        )
-        .map_err(sqlite_err)?;
+            )
+            .map_err(sqlite_err)?;
         let rows = stmt
             .query_map([], |row| {
                 let job_type_s: String = row.get(1)?;
@@ -172,8 +173,9 @@ impl Db {
         for row in rows {
             let (job_id, job_type_s, source_path, agent, content_hash, collections_s) =
                 row.map_err(sqlite_err)?;
-            let job_type = JobType::from_str(&job_type_s)
-                .ok_or_else(|| crate::error::MemexError::Internal(format!("bad job_type: {job_type_s}")))?;
+            let job_type = JobType::from_str(&job_type_s).ok_or_else(|| {
+                crate::error::MemexError::Internal(format!("bad job_type: {job_type_s}"))
+            })?;
             let collections: Vec<String> = serde_json::from_str(&collections_s).unwrap_or_default();
             jobs.push(PendingJob {
                 job_id,
@@ -330,7 +332,8 @@ mod tests {
             &[],
         )
         .unwrap();
-        s.update_ingest_job_status("old", "completed", None).unwrap();
+        s.update_ingest_job_status("old", "completed", None)
+            .unwrap();
         s.insert_ingest_job(
             "new",
             JobType::Transcript,
@@ -340,7 +343,8 @@ mod tests {
             &[],
         )
         .unwrap();
-        s.update_ingest_job_status("new", "completed", None).unwrap();
+        s.update_ingest_job_status("new", "completed", None)
+            .unwrap();
         s.with_connection(|conn| {
             conn.execute(
                 "UPDATE ingest_jobs SET updated_at = datetime('now', '-60 days') \

@@ -113,9 +113,7 @@ impl E2EHarnessBuilder {
         let socket = memex_root.join("daemon.sock");
         let deadline = Instant::now() + self.timeout;
         loop {
-            if socket.exists()
-                && std::os::unix::net::UnixStream::connect(&socket).is_ok()
-            {
+            if socket.exists() && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
                 break;
             }
             if Instant::now() >= deadline {
@@ -219,7 +217,7 @@ impl Drop for E2EHarness {
 /// `target/{debug,release}/deps/<test>` → `target/{debug,release}/memex`.
 fn memex_bin() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe");
-    let parent = exe.parent().unwrap();          // deps/
+    let parent = exe.parent().unwrap(); // deps/
     let profile_dir = parent.parent().unwrap_or(parent); // debug or release
     profile_dir.join("memex")
 }
