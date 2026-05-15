@@ -1,0 +1,40 @@
+name: CI
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel superseded runs (e.g. when a PR is force-pushed) — the latest
+# commit is the only one whose result matters.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # Caches ~/.cargo/registry, ~/.cargo/git, and target/ keyed on
+      # Cargo.lock + toolchain. Cuts cold builds (5-8 min) to ~1 min on hit.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # Clippy runs first because it doubles as the compile check and is
+      # cheap to re-use for `cargo test` below (same artifacts).
+      # Pre-existing warnings exist across the workspace; tighten to
+      # `-D warnings` once those are cleared.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --no-deps
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
