@@ -67,6 +67,29 @@ where
     // Mirror LlamaIndex's `text_splits` (raw sentence strings).
     let sentences: Vec<&str> = spans.iter().map(|&(s, e)| &text[s..e]).collect();
     let combined = build_sentence_groups(&sentences, buffer_size);
+
+    // Combined windows (2*buffer_size+1 sentences) can overflow the
+    // embedder on dense sections; if any does, skip distance scoring
+    // and emit one chunk covering the whole section. The outer
+    // `enforce_token_budget` will split it. Combined strings are
+    // throwaway — only the distance signal matters.
+    let budget = embed_model.max_input_tokens();
+    for s in &combined {
+        if embed_model.count_tokens(s)? > budget {
+            tracing::warn!(
+                section_len = text.len(),
+                sentence_count = sentences.len(),
+                budget,
+                "semantic splitter: combined window exceeds embedder budget; \
+                 falling back to single-chunk-then-budget-split"
+            );
+            return Ok(vec![SemanticChunk {
+                pos: 0,
+                len: text.len(),
+            }]);
+        }
+    }
+
     let combined_refs: Vec<&str> = combined.iter().map(String::as_str).collect();
     // `combined_sentence_embeddings = embed_model.get_text_embedding_batch(...)`.
     let embs = embed_model.embed_batch(&combined_refs)?;
@@ -397,6 +420,71 @@ mod tests {
         let text = "Just one paragraph.";
         let chunks =
             build_semantic_nodes_from_text(text, &mut emb, 1, 95.0, whole_text_splitter).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].pos, 0);
+        assert_eq!(chunks[0].len, text.len());
+    }
+
+    /// `build_sentence_groups` concatenates 2*buffer_size+1 adjacent
+    /// sentences. If a single one of those combined windows tokenizes
+    /// over the embedder's input limit, the previous implementation
+    /// would crash inside `embed_batch` and skip the entire section
+    /// (and, via reconcile_chunked, the entire file). The new behavior:
+    /// fall back to the single-chunk-covering-the-whole-section path
+    /// without calling `embed_batch`, so the outer SentenceSplitter
+    /// budget pass can do per-budget-window splitting.
+    #[test]
+    fn oversized_combined_window_falls_back_to_whole_text_chunk() {
+        /// An embedder that errors if `embed_batch` is ever called.
+        /// Lets us assert the fallback skipped the embed.
+        struct NeverEmbed {
+            budget: usize,
+        }
+        impl crate::embed::Embedder for NeverEmbed {
+            fn model_name(&self) -> &str {
+                "never-embed"
+            }
+            fn embed_text(&mut self, _text: &str) -> Result<Vec<f32>> {
+                panic!("embed_text must not be called when window is oversized")
+            }
+            fn embed_batch(&mut self, _texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+                panic!("embed_batch must not be called when window is oversized")
+            }
+            fn count_tokens(&mut self, text: &str) -> Result<usize> {
+                Ok(text.split_whitespace().count())
+            }
+            fn max_input_tokens(&self) -> usize {
+                self.budget
+            }
+        }
+
+        // Three short sentences. With buffer_size=1 each combined
+        // window holds up to 3 sentences (~12 tokens). Set the budget
+        // to 5 so the combined windows blow past it.
+        let text = "alpha alpha alpha.\n\nbeta beta beta.\n\ngamma gamma gamma.";
+        let mut emb = NeverEmbed { budget: 5 };
+        let chunks =
+            build_semantic_nodes_from_text(text, &mut emb, 1, 95.0, whole_text_splitter).unwrap();
+        assert_eq!(chunks.len(), 1, "expected single fallback chunk");
+        assert_eq!(chunks[0].pos, 0);
+        assert_eq!(chunks[0].len, text.len());
+    }
+
+    /// Sanity check: when combined windows fit, behavior is unchanged
+    /// — `embed_batch` runs, distances are computed.
+    #[test]
+    fn within_budget_combined_window_still_uses_embed_batch() {
+        let mut emb = StubEmbedder {
+            map: HashMap::new(),
+        };
+        let text = "alpha.\n\nbeta.\n\ngamma.";
+        // StubEmbedder.max_input_tokens() = usize::MAX, so the fallback
+        // path never triggers — embed_batch runs and returns the
+        // default [1.0] vectors for each combined window.
+        let chunks =
+            build_semantic_nodes_from_text(text, &mut emb, 1, 95.0, whole_text_splitter).unwrap();
+        // Identical embeddings → distances all 0.0 → no breakpoints →
+        // single chunk covering full text.
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].pos, 0);
         assert_eq!(chunks[0].len, text.len());

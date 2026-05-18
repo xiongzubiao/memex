@@ -56,10 +56,16 @@ impl Db {
         let now = now_rfc3339();
         let collections_json = serde_json::to_string(collections)
             .map_err(|e| crate::error::MemexError::Internal(format!("collections json: {e}")))?;
+        // Re-submit of a previously-failed row resets to pending;
+        // completed/processing rows are left alone so we neither
+        // re-run a success nor race an in-flight job.
         conn.execute(
-            "INSERT OR IGNORE INTO ingest_jobs \
+            "INSERT INTO ingest_jobs \
              (job_id, job_type, source_path, agent, content_hash, collections, status, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8) \
+             ON CONFLICT(job_id) DO UPDATE \
+               SET status = 'pending', error = NULL, updated_at = ?8 \
+               WHERE ingest_jobs.status = 'failed'",
             rusqlite::params![
                 job_id,
                 job_type.as_str(),
@@ -314,6 +320,57 @@ mod tests {
         );
         assert_eq!(row_status("job-completed").0, "completed");
         assert_eq!(row_status("job-failed").1.as_deref(), Some("worker died"));
+    }
+
+    /// Re-submitting a previously-failed job resets to pending so
+    /// stale `interrupted by daemon restart` rows are retryable.
+    /// Completed and processing rows must not be touched.
+    #[test]
+    fn insert_ingest_job_resets_failed_rows_to_pending() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let memex = crate::Memex::open_writer(dir.path().to_path_buf()).unwrap();
+        let s = memex.search();
+        let args = (
+            JobType::Transcript,
+            "/p.jsonl",
+            None::<&str>,
+            "aa".repeat(32),
+            vec!["default".to_string()],
+        );
+
+        // Seed three rows in different terminal/active states.
+        for jid in ["job-failed", "job-completed", "job-processing"] {
+            s.insert_ingest_job(jid, args.0, args.1, args.2, &args.3, &args.4)
+                .unwrap();
+        }
+        s.update_ingest_job_status("job-failed", "failed", Some("worker died"))
+            .unwrap();
+        s.update_ingest_job_status("job-completed", "completed", None)
+            .unwrap();
+        s.update_ingest_job_status("job-processing", "processing", None)
+            .unwrap();
+
+        // Re-insert each. The failed row should flip to pending and
+        // clear its error; the other two should be left alone.
+        for jid in ["job-failed", "job-completed", "job-processing"] {
+            s.insert_ingest_job(jid, args.0, args.1, args.2, &args.3, &args.4)
+                .unwrap();
+        }
+        let row_status = |job_id: &str| -> (String, Option<String>) {
+            s.with_connection(|conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT status, error FROM ingest_jobs WHERE job_id=?1",
+                        rusqlite::params![job_id],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                    )
+                    .unwrap())
+            })
+            .unwrap()
+        };
+        assert_eq!(row_status("job-failed"), ("pending".to_string(), None));
+        assert_eq!(row_status("job-completed").0, "completed");
+        assert_eq!(row_status("job-processing").0, "processing");
     }
 
     /// Prune deletes terminal rows older than the cutoff and leaves

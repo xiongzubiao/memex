@@ -226,16 +226,36 @@ where
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let job = build_job(tx);
+    let task = match &job {
+        crate::daemon::queue::BackendJob::Ingest(_) => "extract",
+        crate::daemon::queue::BackendJob::Merge(_) => "merge",
+        crate::daemon::queue::BackendJob::Expand(_) => "expand",
+        crate::daemon::queue::BackendJob::Synth(_) => "synth",
+    };
+    // Split wait into enqueue (pool saturation) and dispatch (LLM).
+    let t_enqueue = std::time::Instant::now();
     state
         .jobs
         .submit(job)
         .await
         .map_err(|_| DaemonError::Internal("worker queue closed".into()))?;
-    match rx.await {
+    let enqueue_ms = t_enqueue.elapsed().as_millis() as u64;
+    let t_dispatch = std::time::Instant::now();
+    let result = match rx.await {
         Ok(Ok(reply)) => Ok(reply),
         Ok(Err(e)) => Err(e.into()),
         Err(_) => Err(DaemonError::Internal("worker dropped reply".into())),
-    }
+    };
+    let dispatch_ms = t_dispatch.elapsed().as_millis() as u64;
+    let outcome = if result.is_ok() { "ok" } else { "err" };
+    tracing::info!(
+        task,
+        enqueue_ms,
+        dispatch_ms,
+        outcome,
+        "worker_job complete"
+    );
+    result
 }
 
 /// Given a parsed request, return the stream of events to emit, in order.

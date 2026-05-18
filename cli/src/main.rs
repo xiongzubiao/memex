@@ -1289,10 +1289,58 @@ fn opencode_db_path() -> anyhow::Result<std::path::PathBuf> {
     Ok(home.join(".local/share/opencode/opencode.db"))
 }
 
+/// Cap on concurrently-in-flight ingest connections from a single
+/// `memex backfill` invocation. The macOS Unix-domain listen backlog
+/// defaults to ~128; without a cap, an N-session backfill races N
+/// `connect()` calls into the kernel queue, and once it overflows the
+/// surplus get ECONNREFUSED with no way to recover within the client's
+/// 5 s connect-retry deadline. Matches `available_parallelism`, which
+/// is the daemon's default `WorkerConfig::max_count`; submitting more
+/// requests than workers piles queue-wait into per-job `elapsed_ms`.
+fn max_backfill_inflight() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+}
+
+/// Drive a stream of ingest task handles, printing `[done/total]`
+/// progress in completion order. Returns `(queued, skipped, errors)`.
+/// Identifier type `I` is what the spawned task returns alongside its
+/// `Result` — typically the source path (`String`) or session id.
+async fn drive_backfill_progress<I: std::fmt::Display>(
+    mut futs: futures::stream::FuturesUnordered<tokio::task::JoinHandle<(I, anyhow::Result<i32>)>>,
+    total: usize,
+) -> (u32, u32, u32) {
+    use futures::stream::StreamExt;
+    let (mut queued, mut skipped, mut errors) = (0u32, 0u32, 0u32);
+    while let Some(h) = futs.next().await {
+        let done = queued + skipped + errors + 1;
+        match h {
+            Ok((id, Ok(0))) => {
+                queued += 1;
+                eprintln!("[{done}/{total}] queued: {id}");
+            }
+            Ok((id, Ok(_))) => {
+                skipped += 1;
+                eprintln!("[{done}/{total}] skipped: {id}");
+            }
+            Ok((id, Err(e))) => {
+                errors += 1;
+                eprintln!("[{done}/{total}] error: {id}: {e}");
+            }
+            Err(e) => {
+                errors += 1;
+                eprintln!("[{done}/{total}] task join error: {e}");
+            }
+        }
+    }
+    (queued, skipped, errors)
+}
+
 /// Discover session files for an agent (or a user-supplied directory) and
-/// dispatch ingestion to the daemon. All sessions are fired concurrently;
-/// the daemon's worker pool (`daemon.worker.max_count`) caps actual
-/// parallelism, with excess jobs queued internally.
+/// dispatch ingestion to the daemon. Up to `max_backfill_inflight()`
+/// sessions run concurrently; the rest queue on the semaphore until
+/// a slot frees.
 fn run_backfill(
     agent: &Agent,
     collections: &[String],
@@ -1326,39 +1374,29 @@ fn run_backfill(
             eprintln!("warning: daemon pre-warm failed: {e}");
         }
 
-        let mut handles = Vec::with_capacity(total);
-        for p in session_files {
-            let agent_str = agent_str.clone();
-            let collections = collections.clone();
-            let path_str = p.to_string_lossy().to_string();
-            handles.push(tokio::spawn(async move {
-                let result =
-                    memex_cli::daemon::ingest_async(&path_str, &agent_str, collections).await;
-                (path_str, result)
-            }));
-        }
-
-        let mut queued = 0u32;
-        let mut skipped = 0u32;
-        let mut errors = 0u32;
-        for h in handles {
-            match h.await {
-                Ok((path_str, Ok(0))) => {
-                    queued += 1;
-                    eprintln!("queued: {path_str}");
-                }
-                Ok((_, Ok(_))) => skipped += 1,
-                Ok((path_str, Err(e))) => {
-                    eprintln!("error: {path_str}: {e}");
-                    errors += 1;
-                }
-                Err(e) => {
-                    eprintln!("task join error: {e}");
-                    errors += 1;
-                }
-            }
-        }
-        (queued, skipped, errors)
+        // FuturesUnordered yields in completion order so progress
+        // lines stream as soon as each session finishes, regardless of
+        // submission order.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_backfill_inflight()));
+        let futs: futures::stream::FuturesUnordered<_> = session_files
+            .into_iter()
+            .map(|p| {
+                let agent_str = agent_str.clone();
+                let collections = collections.clone();
+                let path_str = p.to_string_lossy().to_string();
+                let sem = sem.clone();
+                tokio::spawn(async move {
+                    let _permit = sem
+                        .acquire_owned()
+                        .await
+                        .expect("backfill semaphore closed unexpectedly");
+                    let result =
+                        memex_cli::daemon::ingest_async(&path_str, &agent_str, collections).await;
+                    (path_str, result)
+                })
+            })
+            .collect();
+        drive_backfill_progress(futs, total).await
     });
 
     println!("Queued {queued} (skipped {skipped}, errors {errors}) of {total} sessions");
@@ -1399,37 +1437,25 @@ fn run_backfill_opencode(
             eprintln!("warning: daemon pre-warm failed: {e}");
         }
 
-        let mut handles = Vec::with_capacity(total);
-        for sid in session_ids {
-            let collections = collections.clone();
-            let db = db_path.clone();
-            handles.push(tokio::spawn(async move {
-                let result = memex_cli::daemon::ingest_opencode_async(&sid, &db, collections).await;
-                (sid, result)
-            }));
-        }
-
-        let mut queued = 0u32;
-        let mut skipped = 0u32;
-        let mut errors = 0u32;
-        for h in handles {
-            match h.await {
-                Ok((sid, Ok(0))) => {
-                    queued += 1;
-                    eprintln!("queued: {sid}");
-                }
-                Ok((_, Ok(_))) => skipped += 1,
-                Ok((sid, Err(e))) => {
-                    eprintln!("error: {sid}: {e}");
-                    errors += 1;
-                }
-                Err(e) => {
-                    eprintln!("task join error: {e}");
-                    errors += 1;
-                }
-            }
-        }
-        (queued, skipped, errors)
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_backfill_inflight()));
+        let futs: futures::stream::FuturesUnordered<_> = session_ids
+            .into_iter()
+            .map(|sid| {
+                let collections = collections.clone();
+                let db = db_path.clone();
+                let sem = sem.clone();
+                tokio::spawn(async move {
+                    let _permit = sem
+                        .acquire_owned()
+                        .await
+                        .expect("backfill semaphore closed unexpectedly");
+                    let result =
+                        memex_cli::daemon::ingest_opencode_async(&sid, &db, collections).await;
+                    (sid, result)
+                })
+            })
+            .collect();
+        drive_backfill_progress(futs, total).await
     });
 
     println!("Queued {queued} (skipped {skipped}, errors {errors}) of {total} sessions");

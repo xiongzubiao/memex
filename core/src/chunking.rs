@@ -52,12 +52,14 @@ pub fn chunk_markdown(body: &str) -> Vec<Chunk> {
 }
 
 /// Full pipeline: markdown → semantic → SentenceSplitter token-budget.
-/// The canonical chunk set stored for retrieval. The token-budget pass
-/// guarantees no chunk exceeds the embedder's context window so every
-/// byte gets represented in a vector.
+/// The canonical chunk set stored for retrieval. Every chunk's tokens
+/// plus `prompt_prefix`'s tokens fit within the embedder's context
+/// window, so callers that prepend the prefix at embed time never
+/// overflow. Pass `""` if no prefix will be added.
 pub fn chunk_full_pipeline(
     body: &str,
     embedder: &mut dyn crate::embed::Embedder,
+    prompt_prefix: &str,
 ) -> Result<Vec<Chunk>> {
     let nodes = markdown::get_nodes_from_text(body, markdown::DEFAULT_HEADER_PATH_SEPARATOR);
     let mut semantic_chunks: Vec<Chunk> = Vec::new();
@@ -77,19 +79,26 @@ pub fn chunk_full_pipeline(
             });
         }
     }
-    enforce_token_budget(body, semantic_chunks, embedder)
+    enforce_token_budget(body, semantic_chunks, embedder, prompt_prefix)
 }
 
-/// Re-split any chunk whose token count exceeds `embedder.max_input_tokens()`.
-/// Chunks already under budget pass through. Splits are produced by
-/// `SentenceSplitter` (paragraph → sentence → regex → word → char
-/// cascade) so cuts prefer natural boundaries.
+/// Re-split chunks whose token count exceeds the effective budget
+/// (`max_input_tokens() - prefix_tokens`). Splits use `SentenceSplitter`
+/// (paragraph → sentence → regex → word → char cascade) so cuts prefer
+/// natural boundaries.
 fn enforce_token_budget(
     body: &str,
     chunks: Vec<Chunk>,
     embedder: &mut dyn crate::embed::Embedder,
+    prompt_prefix: &str,
 ) -> Result<Vec<Chunk>> {
-    let budget = embedder.max_input_tokens();
+    let raw_budget = embedder.max_input_tokens();
+    let prefix_tokens = if prompt_prefix.is_empty() {
+        0
+    } else {
+        embedder.count_tokens(prompt_prefix)?
+    };
+    let budget = raw_budget.saturating_sub(prefix_tokens);
     let splitter = sentence::SentenceSplitter {
         chunk_size: budget,
         ..Default::default()

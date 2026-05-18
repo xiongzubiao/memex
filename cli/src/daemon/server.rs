@@ -245,6 +245,14 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
         writer: writer_session,
     });
 
+    // Tracks in-flight client connections AND background tasks
+    // (startup reconcile, periodic reconcile, watcher event handling).
+    // The drain loop and idle-timeout check both read this. Background
+    // tasks must register themselves via `CountGuard` so SIGTERM
+    // mid-ONNX doesn't fall through to runtime-drop while a worker
+    // thread is blocked in `Session::run`.
+    let in_flight = Arc::new(AtomicUsize::new(0));
+
     // 5. Startup reconcile: recover from a missing or corrupt index.db.
     // Pass the warm embedder so reconcile fills in vector chunks for
     // any newly-indexed files. Without this, files indexed at startup
@@ -285,16 +293,31 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                 Err(e) => warn!(?e, "stuck-job recovery failed; continuing"),
             }
 
-            match reconcile_chunked(&memex, &embed_model, Default::default()).await {
-                Ok(r) => info!(
-                    indexed = r.indexed,
-                    deleted = r.deleted,
-                    hash_mismatches = r.hash_mismatches,
-                    skipped_symlinks = r.skipped_symlinks,
-                    "startup reconcile complete"
-                ),
-                Err(e) => warn!(?e, "startup reconcile failed; continuing with current DB"),
-            }
+            // Run reconcile in the background so the accept loop starts
+            // immediately. Reconcile shares the embed-model lock with
+            // ingest, so they interleave safely.
+            let memex_for_reconcile = memex.clone();
+            let embed_model_for_reconcile = embed_model.clone();
+            let in_flight_for_reconcile = in_flight.clone();
+            tokio::spawn(async move {
+                let _guard = crate::daemon::worker::CountGuard::inc(&in_flight_for_reconcile);
+                match reconcile_chunked(
+                    &memex_for_reconcile,
+                    &embed_model_for_reconcile,
+                    Default::default(),
+                )
+                .await
+                {
+                    Ok(r) => info!(
+                        indexed = r.indexed,
+                        deleted = r.deleted,
+                        hash_mismatches = r.hash_mismatches,
+                        skipped_symlinks = r.skipped_symlinks,
+                        "startup reconcile complete"
+                    ),
+                    Err(e) => warn!(?e, "startup reconcile failed; continuing with current DB"),
+                }
+            });
         }
         Err(e) => {
             // If index.db exists and is non-empty but failed to open
@@ -394,10 +417,15 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                     // Keep watcher alive for daemon lifetime by storing in a task.
                     let memex_handle_for_watch = state.writer.memex_handle().clone();
                     let embed_model_for_watch = embed_model.clone();
+                    let in_flight_for_watch = in_flight.clone();
                     tokio::spawn(async move {
                         let _keep_alive = watcher;
                         let mut watch_rx = watch_rx;
                         while let Some(evt) = watch_rx.recv().await {
+                            // Only in-flight while handling an event;
+                            // the recv().await between events is idle.
+                            let _guard =
+                                crate::daemon::worker::CountGuard::inc(&in_flight_for_watch);
                             if let Err(e) = crate::daemon::watcher::handle_watch_event(
                                 &memex_handle_for_watch,
                                 &embed_model_for_watch,
@@ -457,6 +485,7 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
         let memex_handle_for_reconcile = state.writer.memex_handle().clone();
         let embed_model_for_reconcile = embed_model.clone();
         let root_for_reconcile = root.clone();
+        let in_flight_for_periodic = in_flight.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // Default `Burst` missed-tick behavior would fire every
@@ -480,6 +509,9 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
                         continue;
                     }
                 };
+                // Only in-flight during the reconcile pass; the
+                // inter-tick wait above is idle.
+                let _guard = crate::daemon::worker::CountGuard::inc(&in_flight_for_periodic);
                 match reconcile_chunked(&memex, &embed_model_for_reconcile, Default::default())
                     .await
                 {
@@ -513,11 +545,10 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
     // mid-accept dispatch), causing the daemon to keep serving
     // requests after SIGTERM until the idle timeout.
     let idle_timeout = Duration::from_secs(cfg.daemon.idle_timeout_min * 60);
-    // Shared across all connection tasks so long-running queries keep the
-    // daemon alive: we only time out when in_flight == 0 AND last_activity
-    // has been stale for the full idle_timeout.
+    // Shared across connection tasks so long queries keep the daemon
+    // alive; idle timeout fires only when `in_flight == 0` AND
+    // `last_activity` has been stale for the full window.
     let last_activity = Arc::new(Mutex::new(Instant::now()));
-    let in_flight = Arc::new(AtomicUsize::new(0));
 
     // Self-reap heartbeat: every `SOCKET_CHECK_INTERVAL` we stat the
     // socket file. If it's gone, our memex root has been deleted out

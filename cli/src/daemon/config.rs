@@ -29,13 +29,10 @@ pub struct DaemonConfig {
     pub log_file: PathBuf,
     pub worker: WorkerConfig,
     /// Seconds the daemon waits for in-flight requests to finish after
-    /// SIGTERM before forcibly exiting. Default is short (3s) — `daemon
-    /// stop` means "stop now," not "let me finish that LLM call." Bump
-    /// for LLM-heavy workloads where typical ingest takes 10-30s and
-    /// you'd rather not abandon them. The CLI's `daemon stop` polls
-    /// for up to 6s; if you set this above 6 the CLI will print "daemon
-    /// still running after 6s SIGTERM; giving up" and return, but the
-    /// daemon will continue draining until this timeout expires.
+    /// SIGTERM before forcibly exiting. Default 30s covers a typical
+    /// 10-30s ingest LLM turn. Lower in tests/query-only deployments
+    /// where stop snappiness matters more than preserving in-flight
+    /// work. The CLI's `daemon stop` waits up to `drain_timeout_sec + 2`.
     pub drain_timeout_sec: u64,
     /// Background reconcile cadence. Default: 1h. Set to 0 to disable.
     /// (See `server::run_daemon` for why the timer exists; the
@@ -49,7 +46,7 @@ impl Default for DaemonConfig {
             idle_timeout_min: 15,
             log_file: memex_root().join("daemon.log"),
             worker: WorkerConfig::default(),
-            drain_timeout_sec: 3,
+            drain_timeout_sec: 30,
             reconcile_interval_sec: 3600,
         }
     }
