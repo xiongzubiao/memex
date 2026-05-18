@@ -172,11 +172,19 @@ pub(super) async fn handle_ingest_transcript_content(
         return events;
     }
 
-    let title = if transcript.session_id.is_empty() {
-        agent_str.to_string()
-    } else {
-        format!("{agent_str} {}", transcript.session_id)
-    };
+    let title = transcript
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if transcript.session_id.is_empty() {
+                agent_str.to_string()
+            } else {
+                format!("{agent_str} {}", transcript.session_id)
+            }
+        });
     let fm = memex_core::raw::RawFrontmatter {
         source: Some(source_label.clone()),
         source_kind: Some("transcript".into()),
@@ -196,7 +204,20 @@ pub(super) async fn handle_ingest_transcript_content(
     .await
     {
         Ok(e) => e,
-        Err(err_events) => return err_events,
+        Err(err_events) => {
+            // Some interior error paths don't stamp the DB row before
+            // returning, leaving it stuck `processing` until the next
+            // daemon restart sweeps it.
+            let reason = err_events
+                .iter()
+                .find_map(|e| match e {
+                    crate::daemon::protocol::Event::Error { message, .. } => Some(message.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "store_extracted_pages failed".to_string());
+            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&reason));
+            return err_events;
+        }
     };
 
     let _ = search.update_ingest_job_status(&job_id, "completed", None);
@@ -321,7 +342,17 @@ pub(super) async fn handle_ingest_document(
     .await
     {
         Ok(e) => e,
-        Err(err_events) => return err_events,
+        Err(err_events) => {
+            let reason = err_events
+                .iter()
+                .find_map(|e| match e {
+                    Event::Error { message, .. } => Some(message.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "store_extracted_pages failed".to_string());
+            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&reason));
+            return err_events;
+        }
     };
 
     let _ = search.update_ingest_job_status(&job_id, "completed", None);

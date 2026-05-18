@@ -504,12 +504,14 @@ async fn run(
 
 /// Atomic counter guard: decrements on drop. Used to keep `WorkerPool`'s
 /// `live` and `busy` counters correct across normal exit, idle reap, and
-/// panic within the worker task.
-struct CountGuard(Arc<AtomicUsize>);
+/// panic within the worker task. Also used by `server::run_daemon` to
+/// track the startup-reconcile background task in `in_flight`, so the
+/// drain loop waits for it on SIGTERM.
+pub(crate) struct CountGuard(Arc<AtomicUsize>);
 
 impl CountGuard {
     /// Increment `counter` now; the returned guard decrements on drop.
-    fn inc(counter: &Arc<AtomicUsize>) -> Self {
+    pub(crate) fn inc(counter: &Arc<AtomicUsize>) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
         Self(counter.clone())
     }

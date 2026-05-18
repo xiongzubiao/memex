@@ -26,6 +26,8 @@ pub fn index_raw_file(
     path: &Path,
     model: Option<&mut dyn Embedder>,
 ) -> Result<IndexOutcome> {
+    // See `index_wiki_file` for span rationale.
+    let _span = tracing::info_span!("index_raw_file", path = %path.display()).entered();
     let rel = path.strip_prefix(memex.root()).unwrap_or(path);
     let rel_str = crate::storage::rel_path_string(rel);
 

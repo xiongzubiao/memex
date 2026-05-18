@@ -44,8 +44,8 @@ fn parse_claude_code_metadata() {
     let t = parse_claude_code_session(Cursor::new(claude_code_sample())).unwrap();
     assert_eq!(t.session_id, "abc-123");
     assert_eq!(t.agent, "claude-code");
-    assert_eq!(t.first_user_message, "Fix the auth bug");
     assert_eq!(t.filter, SessionFilter::Pass);
+    assert_eq!(t.title, None, "no ai-title in fixture");
 }
 
 #[test]
@@ -68,6 +68,33 @@ fn parse_claude_code_emits_structured_turns_with_timestamp() {
         Some("2026-04-15T10:00:00Z")
     );
     assert!(t.turns[0].text.contains("Fix the auth bug"));
+}
+
+#[test]
+fn parse_claude_code_extracts_ai_title() {
+    let lines = [
+        r#"{"type":"ai-title","aiTitle":"Rebase on worktree-remove-zeroclaw","sessionId":"s1"}"#,
+        r#"{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"s1"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"sessionId":"s1"}"#,
+    ];
+    let t = parse_claude_code_session(Cursor::new(lines.join("\n"))).unwrap();
+    assert_eq!(
+        t.title.as_deref(),
+        Some("Rebase on worktree-remove-zeroclaw")
+    );
+}
+
+#[test]
+fn parse_claude_code_custom_title_overrides_ai_title() {
+    // custom-title is user-set and should win over the auto-generated ai-title.
+    let lines = [
+        r#"{"type":"ai-title","aiTitle":"auto-generated thing","sessionId":"s1"}"#,
+        r#"{"type":"custom-title","customTitle":"My session","sessionId":"s1"}"#,
+        r#"{"type":"user","message":{"role":"user","content":"hi"},"sessionId":"s1"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"sessionId":"s1"}"#,
+    ];
+    let t = parse_claude_code_session(Cursor::new(lines.join("\n"))).unwrap();
+    assert_eq!(t.title.as_deref(), Some("My session"));
 }
 
 #[test]
@@ -110,7 +137,6 @@ fn filter_internal_session() {
     ];
     let t = parse_claude_code_session(Cursor::new(lines.join("\n"))).unwrap();
     assert_eq!(t.filter, SessionFilter::InternalSession);
-    assert_eq!(t.first_user_message, "/memex-distill summarize recent work");
 }
 
 #[test]

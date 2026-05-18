@@ -400,6 +400,9 @@ stay in topical sections only, never Timeline.)
   Output strict JSON: `{"pages":[{"slug":"...","title":"...","body":"..."}]}`
   — no surrounding prose, no code fences.
 
+  If the source has nothing wiki-worthy, output `{"pages":[]}` exactly.
+  Never a prose summary or status report — that's parsed as a failure.
+
 [TASK: MERGE]
   The user message contains a JSON object:
   `{"pages":[{"slug","existing","proposed"},...]}`

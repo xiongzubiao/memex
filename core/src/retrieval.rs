@@ -501,7 +501,10 @@ pub fn embed_document(
     body: &str,
     model: &mut dyn Embedder,
 ) -> Result<()> {
-    let chunks = crate::chunking::chunk_full_pipeline(body, model)?;
+    // `format_passage_for_embedding(title, "")` is the prefix the chunker
+    // must reserve room for, so per-chunk content fits after wrapping.
+    let prompt_prefix = format_passage_for_embedding(title, "");
+    let chunks = crate::chunking::chunk_full_pipeline(body, model, &prompt_prefix)?;
 
     // Build all prefixed inputs upfront, then embed in batches of
     // `EMBED_BATCH_SIZE` per ONNX call.

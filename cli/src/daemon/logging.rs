@@ -27,5 +27,18 @@ pub fn init(log_file: &Path) -> Result<WorkerGuard> {
         .with(fmt::layer().json().with_writer(non_blocking))
         .init();
 
+    // Route panics through tracing before unwinding. `daemonize_child`
+    // dups stderr to /dev/null, so the default panic-to-stderr is lost.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        tracing::error!(
+            panic = %info,
+            backtrace = %bt,
+            "daemon panicked",
+        );
+        prev(info);
+    }));
+
     Ok(guard)
 }

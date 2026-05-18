@@ -65,7 +65,10 @@ pub struct CleanedTranscript {
     pub turns: Vec<TranscriptTurn>,
     pub session_id: String,
     pub agent: String,
-    pub first_user_message: String,
+    /// Display title from source metadata (e.g. Claude Code's
+    /// `custom-title` / `ai-title`); `None` triggers the
+    /// `"<agent> <session_id>"` fallback at the ingest layer.
+    pub title: Option<String>,
     pub filter: SessionFilter,
 }
 
@@ -223,6 +226,9 @@ pub fn parse_claude_code_session(reader: impl BufRead) -> Result<CleanedTranscri
     let mut first_user_message = String::new();
     let mut has_user = false;
     let mut has_assistant = false;
+    let mut ai_title: Option<String> = None;
+    let mut custom_title: Option<String> = None;
+    let mut record_count: usize = 0;
 
     for (line_no, line) in reader.lines().enumerate() {
         let line = line.map_err(|e| format!("IO error reading line {}: {e}", line_no + 1))?;
@@ -234,6 +240,7 @@ pub fn parse_claude_code_session(reader: impl BufRead) -> Result<CleanedTranscri
             Ok(v) => v,
             Err(_) => continue, // Skip malformed lines (partial writes, truncation)
         };
+        record_count += 1;
 
         let msg_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
 
@@ -322,27 +329,49 @@ pub fn parse_claude_code_session(reader: impl BufRead) -> Result<CleanedTranscri
                     }
                 }
             }
-            other => {
-                // Format version detection (#11): warn on truly unknown types.
-                if !other.is_empty()
-                    && !matches!(
-                        other,
-                        "file-history-snapshot" | "attachment" | "queue-operation" | "last-prompt"
-                    )
-                {
-                    tracing::warn!(message_type = %other, "transcript parse: unknown Claude Code message type");
+            "ai-title" => {
+                if let Some(t) = obj.get("aiTitle").and_then(Value::as_str) {
+                    let t = t.trim();
+                    if !t.is_empty() {
+                        ai_title = Some(t.to_string());
+                    }
                 }
+            }
+            "custom-title" => {
+                // Field name varies; check both common spellings.
+                let t = obj
+                    .get("customTitle")
+                    .or_else(|| obj.get("title"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let Some(t) = t {
+                    custom_title = Some(t.to_string());
+                }
+            }
+            _ => {
+                // Other metadata types (file-history-snapshot, attachment,
+                // pr-link, worktree-state, etc.) silently skipped; the
+                // file-level canary below catches real schema drift.
             }
         }
     }
 
+    if record_count >= 5 && turns.is_empty() {
+        tracing::warn!(
+            records = record_count,
+            "transcript parse: Claude Code file has records but produced no turns (possible schema drift)"
+        );
+    }
+
     let filter = classify(has_user, has_assistant, &first_user_message);
+    let title = custom_title.or(ai_title);
 
     Ok(CleanedTranscript {
         turns,
         session_id,
         agent: "claude-code".to_string(),
-        first_user_message,
+        title,
         filter,
     })
 }
@@ -490,7 +519,7 @@ pub fn parse_codex_session(reader: impl BufRead) -> Result<CleanedTranscript, St
         turns,
         session_id,
         agent: "codex".to_string(),
-        first_user_message,
+        title: None,
         filter,
     })
 }
@@ -602,7 +631,7 @@ pub fn parse_gemini_cli_session(json_str: &str) -> Result<CleanedTranscript, Str
         turns,
         session_id,
         agent: "gemini-cli".to_string(),
-        first_user_message,
+        title: None,
         filter,
     })
 }
@@ -746,7 +775,7 @@ pub fn parse_openclaw_session(text: &str) -> Result<CleanedTranscript, String> {
         turns,
         session_id,
         agent: "openclaw".to_string(),
-        first_user_message,
+        title: None,
         filter,
     })
 }
@@ -846,7 +875,7 @@ pub fn parse_hermes_session(text: &str) -> Result<CleanedTranscript, String> {
         turns,
         session_id,
         agent: "hermes".to_string(),
-        first_user_message,
+        title: None,
         filter,
     })
 }
@@ -898,7 +927,7 @@ pub fn parse_opencode_session(reader: impl BufRead) -> Result<CleanedTranscript,
         turns: envelope.turns,
         session_id: envelope.session_id,
         agent: "opencode".to_string(),
-        first_user_message,
+        title: None,
         filter,
     })
 }
@@ -1283,7 +1312,6 @@ mod tests {
         assert_eq!(parsed.turns[0].text, "what is a bloom filter?");
         assert_eq!(parsed.turns[1].role, "assistant");
         assert!(parsed.turns[1].text.contains("probabilistic"));
-        assert_eq!(parsed.first_user_message, "what is a bloom filter?");
     }
 
     #[test]
@@ -1337,7 +1365,6 @@ mod tests {
         // Thinking block stripped; only text content kept.
         assert!(parsed.turns[1].text.contains("hash tree"));
         assert!(!parsed.turns[1].text.contains("..."));
-        assert_eq!(parsed.first_user_message, "what is a merkle tree?");
     }
 
     #[test]
@@ -1377,7 +1404,6 @@ mod tests {
         assert_eq!(parsed.turns[0].text, "Define paxos in one sentence");
         assert_eq!(parsed.turns[1].role, "assistant");
         assert_eq!(parsed.turns[1].text, "Paxos is a consensus protocol.");
-        assert_eq!(parsed.first_user_message, "Define paxos in one sentence");
     }
 
     #[test]

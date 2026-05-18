@@ -38,6 +38,9 @@ pub fn index_wiki_file(
     path: &Path,
     model: Option<&mut dyn Embedder>,
 ) -> Result<IndexOutcome> {
+    // Span carries `path` into warns emitted deeper in the chunking/
+    // embedding stack. Silent at info-or-below levels.
+    let _span = tracing::info_span!("index_wiki_file", path = %path.display()).entered();
     let rel = path.strip_prefix(memex.root()).unwrap_or(path);
     let rel_str = crate::storage::rel_path_string(rel);
 

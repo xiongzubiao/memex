@@ -180,7 +180,9 @@ fn socket_responsive(socket_path: &std::path::Path) -> bool {
 
 /// `memex daemon stop` entrypoint.
 ///
-/// Reads the PID file, sends SIGTERM, waits up to 10s for the process to exit.
+/// Reads the PID file, sends SIGTERM, waits up to `drain_timeout_sec + 2`
+/// for the process to exit (covers the daemon's drain plus tokio runtime
+/// teardown overhead).
 pub fn stop() -> Result<i32> {
     let paths = DaemonPaths::default_under(&memex_root());
     let pid = match pidfile::read(&paths.pid)? {
@@ -208,20 +210,26 @@ pub fn stop() -> Result<i32> {
         let _ = std::fs::remove_file(&paths.socket);
         return Ok(0);
     }
+    // Match wait to the daemon's drain budget. Fall back to a sane
+    // default if config can't load (e.g. malformed TOML); the daemon's
+    // own default is 30 s.
+    let drain_secs = config::Config::load(&default_config_path())
+        .map(|cfg| cfg.daemon.drain_timeout_sec)
+        .unwrap_or(30);
+    let wait_secs = drain_secs.saturating_add(2);
     #[cfg(unix)]
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGTERM);
     }
-    // Wait up to ~6 s — covers the daemon's 3 s drain plus tokio
-    // runtime teardown overhead.
-    for _ in 0..60 {
+    let poll_iters = wait_secs.saturating_mul(10);
+    for _ in 0..poll_iters {
         if !pidfile::is_alive(pid) {
             println!("daemon: stopped (pid {pid})");
             return Ok(0);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    eprintln!("daemon: still running after 6s SIGTERM; giving up");
+    eprintln!("daemon: still running after {wait_secs}s SIGTERM; giving up");
     Ok(1)
 }
 
