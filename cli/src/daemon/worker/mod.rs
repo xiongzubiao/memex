@@ -832,9 +832,17 @@ fn job_prompt_tokens(job: &BackendJob) -> u64 {
 /// applies `STRUCTURED_CONTENT_MULTIPLIER` if non-alpha density crosses the
 /// threshold.
 fn scale_for_structured_content(tokens: u64, job: &BackendJob) -> u64 {
+    // Sample the same fields the prompt actually serializes: Ingest = segment
+    // text; Merge = both `existing` and `proposed` (build_merge_prompt and
+    // job_prompt_tokens cover both, so classifying on `proposed` alone could
+    // miss code/JSON density that lives in `existing`).
     let texts: Box<dyn Iterator<Item = &str>> = match job {
         BackendJob::Ingest(j) => Box::new(j.segments.iter().map(|s| s.text.as_str())),
-        BackendJob::Merge(j) => Box::new(j.pages.iter().map(|p| p.proposed.as_str())),
+        BackendJob::Merge(j) => Box::new(
+            j.pages
+                .iter()
+                .flat_map(|p| [p.existing.as_str(), p.proposed.as_str()]),
+        ),
         _ => Box::new(std::iter::empty()),
     };
     let mut head = Vec::with_capacity(STRUCTURED_SAMPLE_BYTES);
