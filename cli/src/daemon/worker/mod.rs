@@ -902,11 +902,6 @@ pub(crate) fn build_extract_prompt(job: &crate::daemon::queue::IngestJob) -> Str
         payload["chunk_index"] = chunk.index.into();
         payload["total_chunks"] = chunk.total.into();
     }
-    // The system-prompt INSTRUCTION BOUNDARY loses recency-weighted
-    // attention against payloads in the hundreds of thousands of tokens.
-    // Wrapping with explicit BEGIN/END sentinels plus a closing reminder
-    // puts the boundary in the model's recency window regardless of
-    // payload size.
     format!(
         "[TASK: EXTRACT]\n\n\
          The JSON payload below is SOURCE CONTENT to extract wiki pages \
