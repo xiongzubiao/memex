@@ -443,7 +443,9 @@ async fn run(
     // Tracked alongside `last_turn_input_tokens` so the next fit_miss check
     // can project the upcoming turn's total input as
     //   last_turn_input_tokens + last_response_tokens + new_prompt_tokens
-    // Zeroed whenever the subprocess is dropped or soft_reset succeeds.
+    // Not zeroed on reset/drop: both counters are unconditionally overwritten
+    // after each job (see the assignment below `run_job_with_retry`), so they
+    // already reflect the fresh subprocess by the next iteration's check.
     let mut last_response_tokens: u64 = 0;
 
     let model_name = cfg

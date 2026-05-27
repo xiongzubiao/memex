@@ -1,11 +1,15 @@
 //! Section-aware Markdown chunking. Used by document ingestion to split
 //! long inputs into chunks that each fit through one Extract call.
 
-/// Approximate token count for English Markdown. ~3 chars per token is
-/// conservative; real tokenizers vary 2.5-4 chars/token. We err high so
-/// chunks stay below model context limits.
+/// Approximate token count. Takes the larger of two conservative estimates:
+/// chars/3 (Latin scripts — real tokenizers run 2.5-4 chars/token) and
+/// bytes/4 (multibyte scripts like CJK, where one char is ~3 UTF-8 bytes and
+/// tokenizes heavier than chars/3 would predict). Erring high in both regimes
+/// keeps chunks under the model context limit.
 pub fn estimate_tokens(s: &str) -> usize {
-    s.chars().count().div_ceil(3)
+    let by_chars = s.chars().count().div_ceil(3);
+    let by_bytes = s.len().div_ceil(crate::model::BYTES_PER_TOKEN);
+    by_chars.max(by_bytes)
 }
 
 /// A single addressable unit of source content for the EXTRACT worker.
@@ -299,6 +303,17 @@ fn build_code_fence_mask(content: &str) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn estimate_tokens_prefers_byte_estimate_for_multibyte() {
+        // 3-byte UTF-8 chars tokenize heavier than chars/3 predicts; the
+        // byte-based estimate must win so multibyte (e.g. CJK) content can't
+        // slip past the chunk cap. 12 chars × 3 bytes = 36 bytes:
+        // chars/3 = 4, bytes/4 = 9.
+        assert_eq!(estimate_tokens(&"€".repeat(12)), 9);
+        // ASCII is unaffected: chars/3 dominates (>= bytes/4 when 1 byte/char).
+        assert_eq!(estimate_tokens(&"x".repeat(12)), 4);
+    }
 
     #[test]
     fn short_content_one_chunk() {

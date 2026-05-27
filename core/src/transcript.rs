@@ -108,10 +108,11 @@ pub fn truncate(s: &str, max_chars: usize) -> String {
 ///
 /// Removes `<system-reminder>`, `<private>`, `<memex-context>`,
 /// `<persisted-output>` and their contents. Then neutralizes
-/// `<function_calls>`, `<invoke>`, `<parameter>`, `<*>`, `<tool_use>`,
-/// `<tool_result>`, `<thinking>` (open and close forms) by inserting U+200B
-/// after the leading `<`, preserving readability while breaking the
-/// directive token. See `INJECTION_TAG_PATTERN`.
+/// `<function_calls>`, `<invoke>`, `<parameter>`, `<tool_use>`,
+/// `<tool_result>`, `<thinking>` (and the `antml:`-prefixed variants of the
+/// first three, in both open and close forms) by inserting U+200B after the
+/// leading `<`, preserving readability while breaking the directive token.
+/// See `INJECTION_TAG_PATTERN`.
 pub fn strip_tags(s: &str) -> String {
     let mut result = std::borrow::Cow::Borrowed(s);
     for re in TAG_STRIP_PATTERNS.iter() {
