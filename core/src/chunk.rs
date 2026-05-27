@@ -379,7 +379,11 @@ mod tests {
         let chunks = chunk_markdown(&body, 1_000, 10).unwrap();
         assert!(!chunks.is_empty(), "should produce at least one chunk");
         for (i, c) in chunks.iter().enumerate() {
-            assert!(estimate_tokens(c) <= 1_000, "chunk {i} = {} tokens > cap", estimate_tokens(c));
+            assert!(
+                estimate_tokens(c) <= 1_000,
+                "chunk {i} = {} tokens > cap",
+                estimate_tokens(c)
+            );
         }
     }
 
@@ -387,8 +391,14 @@ mod tests {
     fn chunk_error_too_large_segment_message_includes_idx_and_tokens() {
         let e = ChunkError::TooLargeSegment(7, 192_345);
         let s = format!("{e}");
-        assert!(s.contains("7"), "error message should include segment index: {s}");
-        assert!(s.contains("192345") || s.contains("192,345"), "error message should include token count: {s}");
+        assert!(
+            s.contains("7"),
+            "error message should include segment index: {s}"
+        );
+        assert!(
+            s.contains("192345") || s.contains("192,345"),
+            "error message should include token count: {s}"
+        );
     }
 
     #[test]
@@ -404,7 +414,11 @@ mod tests {
             })
             .collect();
         let chunks = chunk_transcript_segments(&segs, 600, 100, 0).unwrap();
-        assert!(chunks.len() >= 3, "expected >=3 chunks at 600-token cap, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "expected >=3 chunks at 600-token cap, got {}",
+            chunks.len()
+        );
         for (i, c) in chunks.iter().enumerate() {
             let total = c.iter().map(|s| estimate_tokens(&s.text)).sum::<usize>();
             assert!(total <= 600, "chunk {i} total tokens {total} > cap 600");
@@ -481,7 +495,11 @@ mod tests {
         // Force two chunks. Each segment is ~5 chars / ~2 tokens. Cap = 8 tokens
         // → ~4 segments per chunk.
         let chunks = chunk_transcript_segments(&segs, 8, 100, 3).unwrap();
-        assert!(chunks.len() >= 2, "expected >=2 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected >=2 chunks, got {}",
+            chunks.len()
+        );
         // Chunk 1 should start with the last 3 segments of chunk 0.
         let prev_tail: Vec<usize> = chunks[0]
             .iter()
@@ -513,9 +531,17 @@ mod tests {
             })
             .collect();
         let chunks = chunk_transcript_segments(&segs, 8, 100, 3).unwrap();
-        assert!(chunks.len() >= 2, "expected >=2 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected >=2 chunks, got {}",
+            chunks.len()
+        );
         // Chunk 0 must start with segment 0 (no prepended overlap).
-        assert_eq!(chunks[0][0].index, Some(0), "chunk 0 should start with segment 0");
+        assert_eq!(
+            chunks[0][0].index,
+            Some(0),
+            "chunk 0 should start with segment 0"
+        );
     }
 
     #[test]
@@ -536,7 +562,11 @@ mod tests {
             })
             .collect();
         let chunks = chunk_transcript_segments(&segs, 60, 100, 3).unwrap();
-        assert!(chunks.len() >= 2, "expected >=2 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "expected >=2 chunks, got {}",
+            chunks.len()
+        );
         // Compare PRE-overlap sizes. After overlap is applied, all chunks
         // include the prepended turns — so to verify the reservation we
         // count chunks[1]'s original (non-overlap) tail: total - overlap.
@@ -637,8 +667,14 @@ mod tests {
             text: "hi".into(),
         };
         let json = serde_json::to_string(&seg).unwrap();
-        assert!(json.contains(r#""role":"user""#), "transcript mode should include role: {json}");
-        assert!(json.contains(r#""index":1"#), "transcript mode should include index: {json}");
+        assert!(
+            json.contains(r#""role":"user""#),
+            "transcript mode should include role: {json}"
+        );
+        assert!(
+            json.contains(r#""index":1"#),
+            "transcript mode should include index: {json}"
+        );
         assert!(
             json.contains(r#""timestamp":"2026-05-22T12:00:00Z""#),
             "transcript mode should include timestamp: {json}"

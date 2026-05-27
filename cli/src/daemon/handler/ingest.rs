@@ -828,14 +828,12 @@ pub(super) async fn extract_pages_from_content(
     state: &HandlerState,
 ) -> Result<Vec<crate::daemon::queue::ExtractedPage>, DaemonError> {
     let chunk_max = crate::daemon::worker::worker_chunk_max_tokens(&state.config);
-    let chunks = match memex_core::chunk::chunk_markdown(
-        content,
-        chunk_max,
-        state.config.ingest.max_chunks,
-    ) {
-        Ok(c) => c,
-        Err(e) => return Err(DaemonError::BadRequest(e.to_string())),
-    };
+    let chunks =
+        match memex_core::chunk::chunk_markdown(content, chunk_max, state.config.ingest.max_chunks)
+        {
+            Ok(c) => c,
+            Err(e) => return Err(DaemonError::BadRequest(e.to_string())),
+        };
     // Wrap each markdown chunk in a one-element Vec<ExtractSegment> with
     // role/timestamp/index = None — preserves Mode B detection in the
     // EXTRACT prompt (see ExtractSegment Mode A/B serde contract test in

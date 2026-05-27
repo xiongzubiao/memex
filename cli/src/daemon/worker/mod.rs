@@ -833,7 +833,10 @@ fn scale_for_structured_content(tokens: u64, job: &BackendJob) -> u64 {
         BackendJob::Merge(j) => j.pages.first().map(|p| p.proposed.as_str()).unwrap_or(""),
         _ => "",
     };
-    let head = sample.as_bytes().get(..STRUCTURED_SAMPLE_BYTES).unwrap_or(sample.as_bytes());
+    let head = sample
+        .as_bytes()
+        .get(..STRUCTURED_SAMPLE_BYTES)
+        .unwrap_or(sample.as_bytes());
     if head.is_empty() {
         return tokens;
     }
@@ -1129,7 +1132,9 @@ mod tests {
             .find("<<<BEGIN SOURCE CONTENT>>>\n")
             .expect("missing BEGIN sentinel")
             + "<<<BEGIN SOURCE CONTENT>>>\n".len();
-        let end = p.find("\n<<<END SOURCE CONTENT>>>").expect("missing END sentinel");
+        let end = p
+            .find("\n<<<END SOURCE CONTENT>>>")
+            .expect("missing END sentinel");
         let body = &p[begin..end];
         let parsed: Value = serde_json::from_str(body).expect("prompt body must be valid JSON");
 
@@ -1265,7 +1270,10 @@ mod tests {
         let cap = worker_chunk_max_tokens(&cfg);
         // Sonnet 4.6 has max_input >= 128K in the litellm catalog; minus
         // overhead + safety the budget should be at least 50K.
-        assert!(cap >= 50_000, "expected >= 50K cap for sonnet-4-6, got {cap}");
+        assert!(
+            cap >= 50_000,
+            "expected >= 50K cap for sonnet-4-6, got {cap}"
+        );
     }
 
     #[test]
@@ -1278,7 +1286,10 @@ mod tests {
         // Unknown model falls back to DEFAULT_MODEL_INFO (128K input) minus
         // overhead + safety → cap should still be > 50K, far above anything
         // the chunker would call pathological.
-        assert!(cap >= 50_000, "expected >= 50K cap for unknown model fallback, got {cap}");
+        assert!(
+            cap >= 50_000,
+            "expected >= 50K cap for unknown model fallback, got {cap}"
+        );
     }
 
     #[test]
@@ -1439,7 +1450,10 @@ mod tests {
                 body: "x".into(),
             }],
         }));
-        assert!(outcome_parsed_ok(&ok_ingest), "parsed Ingest must be cacheable");
+        assert!(
+            outcome_parsed_ok(&ok_ingest),
+            "parsed Ingest must be cacheable"
+        );
 
         let bad_ingest = JobOutcome::Ingest(Err(WorkerError::Backend {
             message: "Ready. The branch is at ...".into(),
@@ -1466,7 +1480,10 @@ mod tests {
                 body: "x".into(),
             }],
         }));
-        assert!(outcome_parsed_ok(&ok_merge), "parsed Merge must be cacheable");
+        assert!(
+            outcome_parsed_ok(&ok_merge),
+            "parsed Merge must be cacheable"
+        );
 
         let ok_expand = JobOutcome::Expand(Ok(ExpandReply {
             lex: "k".into(),
