@@ -825,18 +825,24 @@ fn job_prompt_tokens(job: &BackendJob) -> u64 {
 
 /// Scale a prompt-token estimate when the prompt looks structured (code,
 /// JSON, base64). bytes/4 systematically undercounts those by ~30-50%;
-/// the heuristic samples the first segment's leading bytes and applies
-/// `STRUCTURED_CONTENT_MULTIPLIER` if non-alpha density crosses the threshold.
+/// the heuristic samples up to `STRUCTURED_SAMPLE_BYTES` of leading bytes
+/// (walking across segments so heterogeneous payloads still classify) and
+/// applies `STRUCTURED_CONTENT_MULTIPLIER` if non-alpha density crosses the
+/// threshold.
 fn scale_for_structured_content(tokens: u64, job: &BackendJob) -> u64 {
-    let sample: &str = match job {
-        BackendJob::Ingest(j) => j.segments.first().map(|s| s.text.as_str()).unwrap_or(""),
-        BackendJob::Merge(j) => j.pages.first().map(|p| p.proposed.as_str()).unwrap_or(""),
-        _ => "",
+    let texts: Box<dyn Iterator<Item = &str>> = match job {
+        BackendJob::Ingest(j) => Box::new(j.segments.iter().map(|s| s.text.as_str())),
+        BackendJob::Merge(j) => Box::new(j.pages.iter().map(|p| p.proposed.as_str())),
+        _ => Box::new(std::iter::empty()),
     };
-    let head = sample
-        .as_bytes()
-        .get(..STRUCTURED_SAMPLE_BYTES)
-        .unwrap_or(sample.as_bytes());
+    let mut head = Vec::with_capacity(STRUCTURED_SAMPLE_BYTES);
+    for text in texts {
+        if head.len() >= STRUCTURED_SAMPLE_BYTES {
+            break;
+        }
+        let take = (STRUCTURED_SAMPLE_BYTES - head.len()).min(text.len());
+        head.extend_from_slice(&text.as_bytes()[..take]);
+    }
     if head.is_empty() {
         return tokens;
     }

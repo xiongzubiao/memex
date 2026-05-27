@@ -142,9 +142,10 @@ pub fn chunk_transcript_segments(
     // Overlap: chunks[1..] start with the last `overlap_turns` segments of
     // chunks[i-1]. Take min(overlap_turns, prev.len()) to handle the case
     // where overlap_budget saturated effective_cap and chunks[i-1] ended up
-    // with fewer segments than overlap_turns (e.g., overlap_budget >=
-    // chunk_max_tokens forces 1-seg chunks). Best-effort: prepend what's
-    // available.
+    // with fewer segments than overlap_turns. After prepending, drop
+    // overlap from the front while the chunk exceeds chunk_max_tokens —
+    // overlap is anchor context, not load-bearing, so trimming it to fit
+    // is safer than risking an oversized prompt at LLM dispatch time.
     if overlap_turns > 0 && chunks.len() > 1 {
         for i in 1..chunks.len() {
             let prev_len = chunks[i - 1].len();
@@ -153,6 +154,15 @@ pub fn chunk_transcript_segments(
             let mut new_chunk = Vec::with_capacity(overlap.len() + chunks[i].len());
             new_chunk.extend(overlap);
             new_chunk.extend(std::mem::take(&mut chunks[i]));
+            let mut total: usize = new_chunk.iter().map(|s| estimate_tokens(&s.text)).sum();
+            let mut drop_from_front = 0usize;
+            while total > chunk_max_tokens && drop_from_front < take {
+                total = total.saturating_sub(estimate_tokens(&new_chunk[drop_from_front].text));
+                drop_from_front += 1;
+            }
+            if drop_from_front > 0 {
+                new_chunk.drain(..drop_from_front);
+            }
             chunks[i] = new_chunk;
         }
     }
@@ -633,6 +643,57 @@ mod tests {
         let chunks = chunk_transcript_segments(&segs, 100, 100, 3).unwrap();
         assert!(chunks.len() >= 2, "expected multiple chunks");
         // No further behavioral assertion — the test is "doesn't panic".
+    }
+
+    #[test]
+    fn chunk_transcript_segments_post_overlap_heterogeneous_trims_to_fit() {
+        // Adversarial heterogeneity: 8 tiny segments (1 token each) followed by
+        // 2 large segments (20 tokens each). avg_seg_tokens = floor(48/10) = 4,
+        // overlap_budget = 3*4 = 12, effective_cap = 30-12 = 18. Pack:
+        //   chunks[0] = [s0..s8] (8 small + 1 large = 28 tokens, fits cap=30)
+        //   chunks[1] = [s9] (20 tokens, alone — 20 > effective_cap=18)
+        // Overlap prepends last 3 of chunks[0] = [s6, s7, s8] = [1, 1, 20]
+        // → chunks[1] would be [s6, s7, s8, s9] = 42 tokens > cap=30.
+        // The post-overlap trim must drop overlap from the front until the
+        // chunk fits. Final chunks[1] = [s9] (all 3 overlap turns trimmed).
+        let mut segs: Vec<ExtractSegment> = (0..8)
+            .map(|i| ExtractSegment {
+                index: Some(i),
+                role: Some("user".into()),
+                timestamp: None,
+                text: "x".to_string(), // 1 char → 1 token
+            })
+            .collect();
+        segs.push(ExtractSegment {
+            index: Some(8),
+            role: Some("user".into()),
+            timestamp: None,
+            text: "x".repeat(60), // 60 chars → 20 tokens
+        });
+        segs.push(ExtractSegment {
+            index: Some(9),
+            role: Some("user".into()),
+            timestamp: None,
+            text: "x".repeat(60),
+        });
+        let chunks = chunk_transcript_segments(&segs, 30, 100, 3).unwrap();
+        for (i, c) in chunks.iter().enumerate() {
+            let total: usize = c.iter().map(|s| estimate_tokens(&s.text)).sum();
+            assert!(
+                total <= 30,
+                "post-overlap chunk {i} = {total} tokens, exceeds cap 30"
+            );
+        }
+        assert!(chunks.len() >= 2, "expected multiple chunks");
+        // chunks[1] should have been trimmed all the way back to its single
+        // non-overlap segment (s9), since each successive overlap drop still
+        // left a chunk > cap until the overlap was fully removed.
+        assert_eq!(
+            chunks[1][0].index,
+            Some(9),
+            "chunks[1] should start with s9 after all 3 overlap turns were trimmed; got {:?}",
+            chunks[1][0].index
+        );
     }
 
     /// Load-bearing contract test: the EXTRACT system prompt's Mode A

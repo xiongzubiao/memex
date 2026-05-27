@@ -165,7 +165,18 @@ pub(super) async fn handle_ingest_transcript_content(
     ) {
         Ok(c) => c,
         Err(e) => {
-            let reason = e.to_string();
+            // TooLargeSegment carries a 0-based slice position; rewrite it
+            // to the user-visible 1-based segment.index for the diagnostic.
+            let reason = match e {
+                memex_core::chunk::ChunkError::TooLargeSegment(idx, toks) => {
+                    let visible = segments.get(idx).and_then(|s| s.index).unwrap_or(idx + 1);
+                    format!(
+                        "segment {visible} is {toks} tokens, exceeds chunk_max_tokens \
+                         (transcripts can't be split mid-segment)"
+                    )
+                }
+                _ => e.to_string(),
+            };
             let _ = search.update_ingest_job_status(&job_id, "failed", Some(&reason));
             return error_events(DaemonError::BadRequest(reason));
         }

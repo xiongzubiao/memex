@@ -517,7 +517,7 @@ The chunked-ingest design **does work end-to-end** on the originally-failing 30 
 - **Chunker correctness**: 4 chunks of ~108k each fit the 200k API context; overlap budget reservation prevents post-overlap overflow (E-CRIT-1); `fit_miss` worker resets fire correctly between chunks (E-HIGH-5/6 worked as designed); cross-chunk MERGE-by-slug consolidated multi-chunk subjects.
 - **6 review fold-ins** (E-CRIT-1 through E-CRIT-4, E-HIGH-5, E-HIGH-6) all behaved as specified in production conditions.
 - **Three orthogonal fixes layered onto the chunked-ingest design** to handle real-world claude-code OAuth realities: reasoning-effort capped, catalog override for sonnet-4-6's accessible context, parse-then-cache ordering. None of these were in the spec; all are tracked in their own commits (`424f75f`, `e400777`, `886d29a`).
-- **Full workspace test suite passes**: `cargo test --workspace` → 530 tests green.
+- **Full workspace test suite passes**: `cargo test --workspace` is green.
 
 ### Items still flagged for follow-up
 

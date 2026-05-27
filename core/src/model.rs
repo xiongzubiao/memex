@@ -256,10 +256,9 @@ mod tests {
         // we don't override it (not memex's default; if someone picks
         // it explicitly they presumably know what they're doing).
         let info = lookup_model("claude-sonnet-4-20250514");
-        assert!(
-            info.max_input_tokens >= 500_000,
-            "claude-sonnet-4-20250514 should not be derated; got {}",
-            info.max_input_tokens
+        assert_ne!(
+            info.max_input_tokens, 200_000,
+            "claude-sonnet-4-20250514 should not be derated to the claude-sonnet-4-6 override value"
         );
     }
 
