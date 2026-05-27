@@ -225,6 +225,12 @@ pub async fn run_daemon(paths: DaemonPaths, cfg: Config) -> Result<StartOutcome>
 
     let pool =
         crate::daemon::worker::WorkerPool::new(cfg.daemon.worker.clone(), memex_handle.clone());
+    tracing::info!(
+        backend = ?cfg.daemon.worker.backend,
+        model = ?cfg.daemon.worker.model.as_deref(),
+        chunk_max_tokens = crate::daemon::worker::worker_chunk_max_tokens(&cfg),
+        "resolved worker chunk budget"
+    );
     let cfg = Arc::new(cfg);
     let reader_session = crate::daemon::handler::ReaderSession {
         bound_root: root.clone(),

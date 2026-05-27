@@ -147,7 +147,9 @@ impl CodexSubprocess {
         cmd.arg("app-server")
             .args(["--listen", "stdio://"])
             .args(["--disable", "plugins"])
-            .args(["--disable", "codex_hooks"]);
+            .args(["--disable", "codex_hooks"])
+            // Bound reasoning effort (mirrors claude_code.rs rationale).
+            .args(["-c", "model_reasoning_effort=low"]);
 
         super::prepare_agent_cmd(
             &mut cmd,

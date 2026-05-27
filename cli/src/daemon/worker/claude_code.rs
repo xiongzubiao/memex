@@ -39,7 +39,13 @@ impl ClaudeCodeSubprocess {
             .args(["--setting-sources", ""])
             .args(["--mcp-config", r#"{"mcpServers":{}}"#])
             .arg("--strict-mcp-config")
-            .arg("--no-session-persistence");
+            .arg("--no-session-persistence")
+            // Bound reasoning effort. Default effort silently consumes
+            // the per-turn timeout on dense pipeline-meta content while
+            // emitting only `thinking` blocks (which the worker discards),
+            // producing zero usable output. `low` keeps the model
+            // generating instead of deliberating.
+            .args(["--effort", "low"]);
 
         super::prepare_agent_cmd(
             &mut cmd,

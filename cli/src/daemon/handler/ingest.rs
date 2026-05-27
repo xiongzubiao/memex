@@ -12,6 +12,14 @@ use crate::daemon::handler::{
 };
 use crate::daemon::protocol::Event;
 
+/// Anchor-context turns prepended from each previous chunk to the next
+/// one. Three covers a typical user→assistant→tool-result triplet around
+/// the cut point. Larger values inflate cross-chunk redundancy without
+/// recovering much extra topic continuity (cross-chunk MERGE-by-slug is
+/// the real continuity mechanism); smaller risks orphaning subjects
+/// introduced near a boundary.
+const TRANSCRIPT_OVERLAP_TURNS: usize = 3;
+
 /// Path-based transcript ingest: read the file, dispatch to the shared body.
 pub(super) async fn handle_ingest_transcript(
     transcript_path: String,
@@ -46,7 +54,6 @@ pub(super) async fn handle_ingest_transcript_content(
     state: &HandlerState,
 ) -> Vec<Event> {
     use crate::daemon::protocol::TranscriptAgent;
-    use crate::daemon::queue::{BackendJob, IngestJob};
     use memex_core::transcript::SessionFilter;
 
     let t0 = std::time::Instant::now();
@@ -149,22 +156,35 @@ pub(super) async fn handle_ingest_transcript_content(
         })
         .collect();
 
-    let extracted = match run_worker_job(state, |reply| {
-        BackendJob::Ingest(IngestJob {
-            segments,
-            source: source_label.clone(),
-            chunk: None,
-            reply,
-        })
-    })
-    .await
-    {
-        Ok(r) => r,
+    let chunk_max = crate::daemon::worker::worker_chunk_max_tokens(&state.config);
+    let chunks = match memex_core::chunk::chunk_transcript_segments(
+        &segments,
+        chunk_max,
+        state.config.ingest.max_chunks,
+        TRANSCRIPT_OVERLAP_TURNS,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            let reason = e.to_string();
+            let _ = search.update_ingest_job_status(&job_id, "failed", Some(&reason));
+            return error_events(DaemonError::BadRequest(reason));
+        }
+    };
+    tracing::info!(
+        n_chunks = chunks.len(),
+        total_segments = segments.len(),
+        job_id = %job_id,
+        "chunked transcript"
+    );
+
+    let pages = match extract_pages_from_chunked_jobs(chunks, &source_label, state).await {
+        Ok(pages) => pages,
         Err(e) => {
             let _ = search.update_ingest_job_status(&job_id, "failed", Some(&e.to_string()));
             return error_events(e);
         }
     };
+    let extracted = crate::daemon::queue::IngestReply { pages };
 
     if extracted.pages.is_empty() {
         let _ = search.update_ingest_job_status(&job_id, "completed", None);
@@ -807,32 +827,56 @@ pub(super) async fn extract_pages_from_content(
     source_path: &str,
     state: &HandlerState,
 ) -> Result<Vec<crate::daemon::queue::ExtractedPage>, DaemonError> {
-    use crate::daemon::queue::{
-        BackendJob, ChunkPosition, ExtractSegment, IngestJob, MergeJob, MergePair,
-    };
-
-    let cfg = state.config.ingest.clone();
+    let chunk_max = crate::daemon::worker::worker_chunk_max_tokens(&state.config);
     let chunks = match memex_core::chunk::chunk_markdown(
         content,
-        cfg.chunk_target_tokens,
-        cfg.chunk_hard_cap_tokens,
-        cfg.max_chunks,
+        chunk_max,
+        state.config.ingest.max_chunks,
     ) {
         Ok(c) => c,
         Err(e) => return Err(DaemonError::BadRequest(e.to_string())),
     };
-    let total_chunks = chunks.len();
-    let mut receivers = Vec::with_capacity(total_chunks);
-    for (idx, chunk) in chunks.into_iter().enumerate() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let job = BackendJob::Ingest(IngestJob {
-            segments: vec![ExtractSegment {
+    // Wrap each markdown chunk in a one-element Vec<ExtractSegment> with
+    // role/timestamp/index = None — preserves Mode B detection in the
+    // EXTRACT prompt (see ExtractSegment Mode A/B serde contract test in
+    // core/src/chunk.rs).
+    let chunks_for_helper: Vec<Vec<memex_core::chunk::ExtractSegment>> = chunks
+        .into_iter()
+        .map(|text| {
+            vec![memex_core::chunk::ExtractSegment {
                 index: None,
                 role: None,
                 timestamp: None,
-                text: chunk,
-            }],
-            source: source_path.to_string(),
+                text,
+            }]
+        })
+        .collect();
+    extract_pages_from_chunked_jobs(chunks_for_helper, source_path, state).await
+}
+
+/// Shared parallel-EXTRACT + cross-chunk MERGE pipeline. Takes pre-chunked
+/// segments (one inner Vec per chunk), fans out one IngestJob per chunk to
+/// the worker queue, collects ExtractedPages, then runs cross-chunk
+/// fragment-merge by slug.
+///
+/// Used by document ingest (via `extract_pages_from_content`, which
+/// wraps each markdown chunk in a one-element Vec<ExtractSegment>) and
+/// directly by transcript ingest (which produces Vec<ExtractSegment>
+/// per chunk and skips markdown chunking).
+pub(super) async fn extract_pages_from_chunked_jobs(
+    chunks: Vec<Vec<memex_core::chunk::ExtractSegment>>,
+    source: &str,
+    state: &HandlerState,
+) -> Result<Vec<crate::daemon::queue::ExtractedPage>, DaemonError> {
+    use crate::daemon::queue::{BackendJob, ChunkPosition, IngestJob, MergeJob, MergePair};
+
+    let total_chunks = chunks.len();
+    let mut receivers = Vec::with_capacity(total_chunks);
+    for (idx, chunk_segments) in chunks.into_iter().enumerate() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let job = BackendJob::Ingest(IngestJob {
+            segments: chunk_segments,
+            source: source.to_string(),
             chunk: Some(ChunkPosition {
                 index: idx,
                 total: total_chunks,
