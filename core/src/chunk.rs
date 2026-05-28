@@ -446,8 +446,9 @@ mod tests {
 
     #[test]
     fn chunk_transcript_segments_packs_under_chunk_max() {
-        // 10 segments, each ~200 tokens (800 chars). Cap at 600 tokens →
-        // each chunk holds ~3 segments (~600 tokens, just under cap).
+        // 10 segments of 800 chars = 267 text + 24 envelope = 291
+        // segment_tokens each. Cap 600 → 2 per chunk (582), 5 chunks. Assert
+        // in segment_tokens terms — that is what the cap is enforced in.
         let segs: Vec<ExtractSegment> = (0..10)
             .map(|i| ExtractSegment {
                 index: Some(i),
@@ -463,7 +464,7 @@ mod tests {
             chunks.len()
         );
         for (i, c) in chunks.iter().enumerate() {
-            let total = c.iter().map(|s| estimate_tokens(&s.text)).sum::<usize>();
+            let total = c.iter().map(segment_tokens).sum::<usize>();
             assert!(total <= 600, "chunk {i} total tokens {total} > cap 600");
         }
     }
