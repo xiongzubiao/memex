@@ -67,18 +67,39 @@ pub fn chunk_markdown(
     let mut current = String::new();
     // Track `current`'s char and byte counts incrementally instead of
     // rescanning the whole buffer each iteration (which made packing O(n²)
-    // in the document size). Both counts are exactly additive, so
-    // `cur_tokens` equals `estimate_tokens(&current)` without the rescan.
+    // in the document size). Both counts are exactly additive.
     let mut cur_chars = 0usize;
     let mut cur_bytes = 0usize;
-    let cur_tokens = |chars: usize, bytes: usize| {
+    // Tokens of a `(chars, bytes)` pair — identical formula to
+    // `estimate_tokens` so the running estimate matches a rescan exactly.
+    let tokens_of = |chars: usize, bytes: usize| {
         chars
             .div_ceil(3)
             .max(bytes.div_ceil(crate::model::BYTES_PER_TOKEN))
     };
+    // The separator `push_with_newline` will insert before appending `s` to
+    // `current`. 0/1/2 ASCII '\n' bytes, so the byte count equals the char
+    // count. Must match the logic inside `push_with_newline` exactly.
+    let pending_sep = |current: &str| -> usize {
+        if current.is_empty() || current.ends_with("\n\n") {
+            0
+        } else if current.ends_with('\n') {
+            1
+        } else {
+            2
+        }
+    };
     for seg in segments {
-        let seg_tokens = estimate_tokens(&seg);
-        if cur_tokens(cur_chars, cur_bytes) + seg_tokens > chunk_max_tokens && !current.is_empty() {
+        let seg_chars = seg.chars().count();
+        let seg_bytes = seg.len();
+        let seg_tokens = tokens_of(seg_chars, seg_bytes);
+        // Pre-check: post-append size of `current` including the separator
+        // `push_with_newline` will insert. Compute combined tokens exactly
+        // rather than summing per-piece estimates so the cap is enforced
+        // strictly (a separator byte can't slip a chunk 1 token over).
+        let sep = pending_sep(&current);
+        let combined_tokens = tokens_of(cur_chars + sep + seg_chars, cur_bytes + sep + seg_bytes);
+        if combined_tokens > chunk_max_tokens && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
             cur_chars = 0;
             cur_bytes = 0;
@@ -86,22 +107,23 @@ pub fn chunk_markdown(
         if seg_tokens > chunk_max_tokens {
             // Single segment too big — recursively split at paragraph then line.
             for sub in split_oversize(&seg, chunk_max_tokens) {
-                let sub_tokens = estimate_tokens(&sub);
-                if cur_tokens(cur_chars, cur_bytes) + sub_tokens > chunk_max_tokens
-                    && !current.is_empty()
-                {
+                let sub_chars = sub.chars().count();
+                let sub_bytes = sub.len();
+                let sep = pending_sep(&current);
+                let combined = tokens_of(cur_chars + sep + sub_chars, cur_bytes + sep + sub_bytes);
+                if combined > chunk_max_tokens && !current.is_empty() {
                     chunks.push(std::mem::take(&mut current));
                     cur_chars = 0;
                     cur_bytes = 0;
                 }
-                let sep = push_with_newline(&mut current, &sub);
-                cur_chars += sep + sub.chars().count();
-                cur_bytes += sep + sub.len();
+                let actual_sep = push_with_newline(&mut current, &sub);
+                cur_chars += actual_sep + sub_chars;
+                cur_bytes += actual_sep + sub_bytes;
             }
         } else {
-            let sep = push_with_newline(&mut current, &seg);
-            cur_chars += sep + seg.chars().count();
-            cur_bytes += sep + seg.len();
+            let actual_sep = push_with_newline(&mut current, &seg);
+            cur_chars += actual_sep + seg_chars;
+            cur_bytes += actual_sep + seg_bytes;
         }
         if chunks.len() >= max_chunks {
             return Err(ChunkError::TooManyChunks(max_chunks));
