@@ -98,6 +98,11 @@ pub fn chunk_markdown(
 
 /// Pack a sequence of transcript segments into chunks under the size cap.
 ///
+/// Consumes `segments` and *moves* each one into its chunk (no per-segment
+/// clone of the text body — only the small `overlap_turns` tail of each chunk
+/// is cloned into the next). This keeps peak memory at ~1× the transcript
+/// rather than doubling it on large sessions.
+///
 /// Each chunk is a `Vec<ExtractSegment>`. Segments are never split mid-turn;
 /// a single segment exceeding `chunk_max_tokens` errors with
 /// `ChunkError::TooLargeSegment`. After packing, the last `overlap_turns`
@@ -105,7 +110,7 @@ pub fn chunk_markdown(
 ///
 /// Token estimation uses the same `estimate_tokens` as `chunk_markdown`.
 pub fn chunk_transcript_segments(
-    segments: &[ExtractSegment],
+    segments: Vec<ExtractSegment>,
     chunk_max_tokens: usize,
     max_chunks: usize,
     overlap_turns: usize,
@@ -130,8 +135,8 @@ pub fn chunk_transcript_segments(
     let mut current: Vec<ExtractSegment> = Vec::new();
     let mut current_tokens: usize = 0;
 
-    for (idx, seg) in segments.iter().enumerate() {
-        let seg_tokens = segment_tokens(seg);
+    for (idx, seg) in segments.into_iter().enumerate() {
+        let seg_tokens = segment_tokens(&seg);
         if seg_tokens > chunk_max_tokens {
             return Err(ChunkError::TooLargeSegment(idx, seg_tokens));
         }
@@ -151,7 +156,7 @@ pub fn chunk_transcript_segments(
                 return Err(ChunkError::TooManyChunks(max_chunks));
             }
         }
-        current.push(seg.clone());
+        current.push(seg);
         current_tokens += seg_tokens;
     }
     if !current.is_empty() {
@@ -457,7 +462,7 @@ mod tests {
                 text: "x".repeat(800),
             })
             .collect();
-        let chunks = chunk_transcript_segments(&segs, 600, 100, 0).unwrap();
+        let chunks = chunk_transcript_segments(segs, 600, 100, 0).unwrap();
         assert!(
             chunks.len() >= 3,
             "expected >=3 chunks at 600-token cap, got {}",
@@ -480,7 +485,7 @@ mod tests {
             timestamp: None,
             text: "x".repeat(2000),
         }];
-        let chunks = chunk_transcript_segments(&segs, 1000, 100, 0).unwrap();
+        let chunks = chunk_transcript_segments(segs, 1000, 100, 0).unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].len(), 1, "segment must not be split");
         assert_eq!(chunks[0][0].text.len(), 2000);
@@ -496,7 +501,7 @@ mod tests {
             timestamp: None,
             text: "x".repeat(5000),
         }];
-        let err = chunk_transcript_segments(&segs, 600, 100, 0).unwrap_err();
+        let err = chunk_transcript_segments(segs, 600, 100, 0).unwrap_err();
         match err {
             ChunkError::TooLargeSegment(idx, _tokens) => {
                 assert_eq!(idx, 0);
@@ -507,7 +512,7 @@ mod tests {
 
     #[test]
     fn chunk_transcript_segments_empty_input() {
-        let chunks = chunk_transcript_segments(&[], 600, 100, 0).unwrap();
+        let chunks = chunk_transcript_segments(vec![], 600, 100, 0).unwrap();
         assert!(chunks.is_empty());
     }
 
@@ -522,7 +527,7 @@ mod tests {
                 text: "x".repeat(800),
             })
             .collect();
-        let err = chunk_transcript_segments(&segs, 800, 5, 0).unwrap_err();
+        let err = chunk_transcript_segments(segs, 800, 5, 0).unwrap_err();
         assert!(matches!(err, ChunkError::TooManyChunks(5)));
     }
 
@@ -539,7 +544,7 @@ mod tests {
                 text: "x".repeat(120),
             })
             .collect();
-        let chunks = chunk_transcript_segments(&segs, 256, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(segs, 256, 100, 3).unwrap();
         assert!(
             chunks.len() >= 2,
             "expected >=2 chunks, got {}",
@@ -573,7 +578,7 @@ mod tests {
                 text: "x".repeat(120),
             })
             .collect();
-        let chunks = chunk_transcript_segments(&segs, 256, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(segs, 256, 100, 3).unwrap();
         assert!(
             chunks.len() >= 2,
             "expected >=2 chunks, got {}",
@@ -603,7 +608,7 @@ mod tests {
                 text: "x".repeat(120),
             })
             .collect();
-        let chunks = chunk_transcript_segments(&segs, 256, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(segs, 256, 100, 3).unwrap();
         assert!(
             chunks.len() >= 2,
             "expected >=2 chunks, got {}",
@@ -637,7 +642,7 @@ mod tests {
                 text: "x".repeat(120),
             })
             .collect();
-        let chunks = chunk_transcript_segments(&segs, 256, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(segs, 256, 100, 3).unwrap();
         for (i, c) in chunks.iter().enumerate() {
             let total: usize = c.iter().map(segment_tokens).sum();
             assert!(
@@ -669,7 +674,7 @@ mod tests {
             })
             .collect();
         // Should not panic.
-        let chunks = chunk_transcript_segments(&segs, 100, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(segs, 100, 100, 3).unwrap();
         assert!(chunks.len() >= 2, "expected multiple chunks");
         // No further behavioral assertion — the test is "doesn't panic".
     }
@@ -705,7 +710,7 @@ mod tests {
             timestamp: None,
             text: "x".repeat(900),
         });
-        let chunks = chunk_transcript_segments(&segs, 600, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(segs, 600, 100, 3).unwrap();
         for (i, c) in chunks.iter().enumerate() {
             let total: usize = c.iter().map(segment_tokens).sum();
             assert!(
@@ -740,7 +745,7 @@ mod tests {
                 text: "x".repeat(3),
             })
             .collect();
-        let chunks = chunk_transcript_segments(&segs, 100, 100, 0).unwrap();
+        let chunks = chunk_transcript_segments(segs, 100, 100, 0).unwrap();
         assert_eq!(
             chunks.len(),
             5,

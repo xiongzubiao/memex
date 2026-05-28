@@ -157,19 +157,22 @@ pub(super) async fn handle_ingest_transcript_content(
         .collect();
 
     let chunk_max = crate::daemon::worker::worker_chunk_max_tokens(&state.config);
+    // Capture the count before the move; the chunker consumes `segments`.
+    let total_segments = segments.len();
     let chunks = match memex_core::chunk::chunk_transcript_segments(
-        &segments,
+        segments,
         chunk_max,
         state.config.ingest.max_chunks,
         TRANSCRIPT_OVERLAP_TURNS,
     ) {
         Ok(c) => c,
         Err(e) => {
-            // TooLargeSegment carries a 0-based slice position; rewrite it
-            // to the user-visible 1-based segment.index for the diagnostic.
+            // TooLargeSegment carries a 0-based slice position. Segments are
+            // built 1-based-contiguous (index = position + 1), so the
+            // user-visible turn number is simply idx + 1.
             let reason = match e {
                 memex_core::chunk::ChunkError::TooLargeSegment(idx, toks) => {
-                    let visible = segments.get(idx).and_then(|s| s.index).unwrap_or(idx + 1);
+                    let visible = idx + 1;
                     format!(
                         "segment {visible} is {toks} tokens, exceeds chunk_max_tokens={chunk_max} \
                          (transcripts can't be split mid-segment)"
@@ -183,7 +186,7 @@ pub(super) async fn handle_ingest_transcript_content(
     };
     tracing::info!(
         n_chunks = chunks.len(),
-        total_segments = segments.len(),
+        total_segments,
         job_id = %job_id,
         "chunked transcript"
     );
