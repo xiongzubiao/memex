@@ -99,9 +99,10 @@ pub fn chunk_transcript_segments(
 
     // Estimate the average per-turn tokens from the input so we can
     // reserve budget for the `overlap_turns` we'll prepend to chunks[1..].
-    // Best-effort: based on the average, not pessimistic. If the average
-    // misjudges and a post-overlap chunk exceeds cap, the worker's
-    // fit_miss restart trigger is the safety net.
+    // This reservation is approximate (based on the average); the
+    // post-overlap pass below trims prepended turns until each chunk fits
+    // `chunk_max_tokens`, so the cap is enforced exactly regardless of how
+    // far the average misjudges the trailing segments.
     let avg_seg_tokens = {
         let total: usize = segments.iter().map(|s| estimate_tokens(&s.text)).sum();
         (total / segments.len()).max(1)

@@ -1,4 +1,3 @@
-<!-- /autoplan restore point: /root/.gstack/projects/xiongzubiao-memex/strip-tags-injection-fix-autoplan-restore-20260522-050848.md -->
 # Model-aware chunked EXTRACT for transcripts and documents
 
 ## Problem

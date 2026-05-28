@@ -832,10 +832,13 @@ fn job_prompt_tokens(job: &BackendJob) -> u64 {
 /// applies `STRUCTURED_CONTENT_MULTIPLIER` if non-alpha density crosses the
 /// threshold.
 fn scale_for_structured_content(tokens: u64, job: &BackendJob) -> u64 {
-    // Sample the same fields the prompt actually serializes: Ingest = segment
-    // text; Merge = both `existing` and `proposed` (build_merge_prompt and
-    // job_prompt_tokens cover both, so classifying on `proposed` alone could
-    // miss code/JSON density that lives in `existing`).
+    // Sample the same fields the prompt actually serializes, for every job
+    // type: the worker projects fit_miss for all of them, so excluding any
+    // would let a structured prompt undercount. Ingest = segment text;
+    // Merge = both `existing` and `proposed` (build_merge_prompt and
+    // job_prompt_tokens cover both); Synth = context block (the large field)
+    // plus question; Expand = question (always small — scaling is a no-op
+    // here, but the arm keeps the match exhaustive).
     let texts: Box<dyn Iterator<Item = &str>> = match job {
         BackendJob::Ingest(j) => Box::new(j.segments.iter().map(|s| s.text.as_str())),
         BackendJob::Merge(j) => Box::new(
@@ -843,7 +846,8 @@ fn scale_for_structured_content(tokens: u64, job: &BackendJob) -> u64 {
                 .iter()
                 .flat_map(|p| [p.existing.as_str(), p.proposed.as_str()]),
         ),
-        _ => Box::new(std::iter::empty()),
+        BackendJob::Synth(j) => Box::new([j.context.as_str(), j.question.as_str()].into_iter()),
+        BackendJob::Expand(j) => Box::new(std::iter::once(j.question.as_str())),
     };
     let mut head = Vec::with_capacity(STRUCTURED_SAMPLE_BYTES);
     for text in texts {
@@ -1359,7 +1363,9 @@ mod tests {
     /// itself; this exercises each arm.
     #[test]
     fn scale_for_structured_content_dispatches_per_backend_job() {
-        use crate::daemon::queue::{BackendJob, ExpandJob, IngestJob, MergeJob, MergePair};
+        use crate::daemon::queue::{
+            BackendJob, ExpandJob, IngestJob, MergeJob, MergePair, SynthJob,
+        };
         let code_dense: String = "{\"k\":1,\"v\":[2,3]}".repeat(300);
         assert!(
             code_dense.len() > STRUCTURED_SAMPLE_BYTES,
@@ -1426,8 +1432,21 @@ mod tests {
         });
         assert_eq!(
             scale_for_structured_content(100, &expand),
-            100,
-            "Expand variant must short-circuit (empty sample) regardless of input",
+            (100.0 * STRUCTURED_CONTENT_MULTIPLIER) as u64,
+            "Expand with a code-dense question must scale tokens",
+        );
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let synth = BackendJob::Synth(SynthJob {
+            context: code_dense.clone(),
+            question: "what is this?".into(),
+            intent: None,
+            reply: tx,
+        });
+        assert_eq!(
+            scale_for_structured_content(100, &synth),
+            (100.0 * STRUCTURED_CONTENT_MULTIPLIER) as u64,
+            "Synth with a code-dense context block must scale tokens",
         );
 
         let (tx, _rx) = tokio::sync::oneshot::channel();
