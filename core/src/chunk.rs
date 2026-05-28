@@ -65,23 +65,43 @@ pub fn chunk_markdown(
     let segments = split_into_segments(content);
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
+    // Track `current`'s char and byte counts incrementally instead of
+    // rescanning the whole buffer each iteration (which made packing O(n²)
+    // in the document size). Both counts are exactly additive, so
+    // `cur_tokens` equals `estimate_tokens(&current)` without the rescan.
+    let mut cur_chars = 0usize;
+    let mut cur_bytes = 0usize;
+    let cur_tokens = |chars: usize, bytes: usize| {
+        chars
+            .div_ceil(3)
+            .max(bytes.div_ceil(crate::model::BYTES_PER_TOKEN))
+    };
     for seg in segments {
-        let combined_tokens = estimate_tokens(&current) + estimate_tokens(&seg);
-        if combined_tokens > chunk_max_tokens && !current.is_empty() {
+        let seg_tokens = estimate_tokens(&seg);
+        if cur_tokens(cur_chars, cur_bytes) + seg_tokens > chunk_max_tokens && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
+            cur_chars = 0;
+            cur_bytes = 0;
         }
-        if estimate_tokens(&seg) > chunk_max_tokens {
+        if seg_tokens > chunk_max_tokens {
             // Single segment too big — recursively split at paragraph then line.
             for sub in split_oversize(&seg, chunk_max_tokens) {
-                if estimate_tokens(&current) + estimate_tokens(&sub) > chunk_max_tokens
+                let sub_tokens = estimate_tokens(&sub);
+                if cur_tokens(cur_chars, cur_bytes) + sub_tokens > chunk_max_tokens
                     && !current.is_empty()
                 {
                     chunks.push(std::mem::take(&mut current));
+                    cur_chars = 0;
+                    cur_bytes = 0;
                 }
-                push_with_newline(&mut current, &sub);
+                let sep = push_with_newline(&mut current, &sub);
+                cur_chars += sep + sub.chars().count();
+                cur_bytes += sep + sub.len();
             }
         } else {
-            push_with_newline(&mut current, &seg);
+            let sep = push_with_newline(&mut current, &seg);
+            cur_chars += sep + seg.chars().count();
+            cur_bytes += sep + seg.len();
         }
         if chunks.len() >= max_chunks {
             return Err(ChunkError::TooManyChunks(max_chunks));
@@ -207,15 +227,23 @@ pub enum ChunkError {
     TooLargeSegment(usize, usize),
 }
 
-fn push_with_newline(buf: &mut String, s: &str) {
+/// Append `s` to `buf`, inserting a blank-line separator first when needed.
+/// Returns the number of separator bytes added (0, 1, or 2; the separator is
+/// ASCII `\n`, so this is also the separator char count), letting callers keep
+/// a running length without rescanning `buf`.
+fn push_with_newline(buf: &mut String, s: &str) -> usize {
+    let mut sep = 0;
     if !buf.is_empty() && !buf.ends_with("\n\n") {
         if buf.ends_with('\n') {
             buf.push('\n');
+            sep = 1;
         } else {
             buf.push_str("\n\n");
+            sep = 2;
         }
     }
     buf.push_str(s);
+    sep
 }
 
 /// Split content into top-level segments at H1/H2 headings. If no
