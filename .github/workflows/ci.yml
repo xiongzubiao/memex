@@ -44,12 +44,18 @@ jobs:
       # Run the in-process `integration` target explicitly (gated on the
       # `test-harness` feature, which the line above doesn't enable). This
       # catches harness-mocked regressions like the multi-chunk document
-      # tests. The `e2e` target is intentionally NOT run here yet — it spawns
-      # the compiled binary and depends on runtime env that doesn't hold in
-      # GitHub runners; enabling it requires separate work to make those
-      # tests environment-portable.
+      # tests. The skip filters exclude tests that need the ONNX runtime +
+      # embedding model on disk (not installed in GitHub runners); those
+      # tests, and the full `e2e` target (which spawns the compiled binary
+      # and needs additional runtime env), stay local-only until separate
+      # work makes them environment-portable.
       - name: cargo test (integration harness)
-        run: cargo test -p memex-cli --features test-harness --test integration
+        run: |
+          cargo test -p memex-cli --features test-harness --test integration -- \
+            --skip daemon_query:: \
+            --skip daemon_search:: \
+            --skip query_intent:: \
+            --skip per_slug
 
       # actionlint catches workflow YAML mistakes and surfaces them as
       # inline PR annotations on the diff via reviewdog. `fail_level: error`
