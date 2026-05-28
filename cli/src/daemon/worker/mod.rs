@@ -830,7 +830,9 @@ fn job_prompt_tokens(job: &BackendJob) -> u64 {
         BackendJob::Merge(j) => j.pages.len() * memex_core::chunk::SEGMENT_ENVELOPE_TOKENS,
         _ => 0,
     };
-    (bytes / memex_core::model::BYTES_PER_TOKEN) as u64 + envelope_tokens as u64
+    // Ceiling division: the fit_miss projection should err high near the
+    // overflow threshold, not floor away up to BYTES_PER_TOKEN-1 bytes.
+    bytes.div_ceil(memex_core::model::BYTES_PER_TOKEN) as u64 + envelope_tokens as u64
 }
 
 /// Scale a prompt-token estimate when the prompt looks structured (code,
@@ -900,7 +902,9 @@ fn outcome_response_tokens(outcome: &JobOutcome) -> u64 {
         JobOutcome::Synth(Ok(r)) => r.answer.len(),
         _ => 0,
     };
-    (bytes / memex_core::model::BYTES_PER_TOKEN) as u64
+    // Ceiling division, matching job_prompt_tokens: last_response_tokens
+    // feeds the next turn's fit_miss projection, so err high near the cap.
+    bytes.div_ceil(memex_core::model::BYTES_PER_TOKEN) as u64
 }
 
 pub(crate) fn build_extract_prompt(job: &crate::daemon::queue::IngestJob) -> String {
