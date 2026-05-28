@@ -91,25 +91,7 @@ pub struct ExtractedPage {
 
 pub type IngestResult = Result<IngestReply, WorkerError>;
 
-/// One unit of LLM-visible content fed into the Extract task. Optional
-/// fields convey the asymmetry between transcripts (per-turn role +
-/// timestamp) and documents (single segment, no role).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExtractSegment {
-    /// 1-based ordinal hint. Optional — array position is canonical.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub index: Option<usize>,
-    /// Speaker identity for transcripts (e.g. "user", "assistant").
-    /// Absent for documents.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    /// ISO 8601 timestamp when known. Absent for documents and for
-    /// transcripts whose underlying turn lacked a timestamp.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<String>,
-    /// The body of this segment.
-    pub text: String,
-}
+pub use memex_core::chunk::ExtractSegment;
 
 /// Position of a chunk within a multi-chunk document. The two fields are
 /// always set together — a chunk that knows its index also knows the

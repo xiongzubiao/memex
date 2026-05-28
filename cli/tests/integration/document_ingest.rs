@@ -3,6 +3,30 @@
 use crate::integration_harness::IntegrationHarness;
 use memex_cli::daemon::protocol::{Event, IngestSource, Request};
 
+/// Build an H1-sectioned markdown doc whose estimated tokens comfortably
+/// exceed the harness's model-derived chunk cap, so `chunk_markdown` is forced
+/// to produce multiple chunks. Sized relative to the actual cap (not a
+/// hard-coded token count) so it stays correct if the cap changes.
+fn doc_forcing_multiple_chunks() -> String {
+    let cap = memex_cli::daemon::worker::worker_chunk_max_tokens(
+        &memex_cli::daemon::config::Config::default(),
+    );
+    // ASCII content: estimate_tokens ≈ chars/3, so target ~2× cap in tokens to
+    // guarantee ≥2 chunks. Section bodies of 30K chars ≈ 10k tokens each.
+    let target_tokens = cap.saturating_mul(2);
+    let section_chars = 30_000usize;
+    let n_sections = (target_tokens.saturating_mul(3))
+        .div_ceil(section_chars)
+        .max(2);
+    let mut content = String::with_capacity(n_sections * (section_chars + 32));
+    for i in 0..n_sections {
+        content.push_str(&format!("# Section {i}\n\n"));
+        content.push_str(&"x".repeat(section_chars));
+        content.push_str("\n\n");
+    }
+    content
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn document_ingest_short_content_runs_one_chunk() {
     let h = IntegrationHarness::start_with_mock_extract(|_prompt| {
@@ -82,15 +106,9 @@ async fn document_ingest_multi_chunk_runs_extract_per_chunk() {
     })
     .await;
 
-    // Build a document with H1 sections sized to force chunking with the
-    // default chunk_target_tokens=30000. Each section ~12K chars (~4K tokens);
-    // 12 sections → ~48K tokens → 2-3 chunks expected.
-    let mut content = String::with_capacity(180_000);
-    for i in 0..12 {
-        content.push_str(&format!("# Section {i}\n\n"));
-        content.push_str(&"x".repeat(12_000));
-        content.push_str("\n\n");
-    }
+    // Build a document that exceeds the model-derived chunk cap so chunking
+    // produces multiple chunks (sizing is relative to the actual cap).
+    let content = doc_forcing_multiple_chunks();
     let req = Request::Ingest {
         source: IngestSource::Document {
             source_path: "https://example.com/long-doc".into(),
@@ -143,13 +161,8 @@ async fn document_ingest_cross_chunk_same_slug_runs_merge() {
     )
     .await;
 
-    // Force chunking the same way as the prior test.
-    let mut content = String::with_capacity(120_000);
-    for i in 0..8 {
-        content.push_str(&format!("# Section {i}\n\n"));
-        content.push_str(&"y".repeat(12_000));
-        content.push_str("\n\n");
-    }
+    // Force chunking the same way as the prior test (cap-relative sizing).
+    let content = doc_forcing_multiple_chunks();
     let req = Request::Ingest {
         source: IngestSource::Document {
             source_path: "https://example.com/dup-slug".into(),

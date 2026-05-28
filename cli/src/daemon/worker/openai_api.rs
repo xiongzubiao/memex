@@ -177,6 +177,8 @@ fn build_request(
             .into(),
     ]);
     request.response_format(response_format_for_task(task_kind));
+    // Bound reasoning effort (mirrors claude_code.rs rationale).
+    request.reasoning_effort(async_openai::types::chat::ReasoningEffort::Low);
     request
         .build()
         .context("building openai chat completion request")

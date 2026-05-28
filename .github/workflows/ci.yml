@@ -32,11 +32,30 @@ jobs:
       # Clippy runs first because it doubles as the compile check and is
       # cheap to re-use for `cargo test` below (same artifacts).
       # `-D warnings` makes any new clippy warning fail CI.
+      # Clippy compiles the gated integration + e2e test code too (compilation
+      # is environment-independent, so it works in CI regardless of runtime
+      # env). This catches lint regressions in test-harness code.
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --features memex-cli/test-harness --no-deps -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace --all-targets
+
+      # Run the in-process `integration` target explicitly (gated on the
+      # `test-harness` feature, which the line above doesn't enable). This
+      # catches harness-mocked regressions like the multi-chunk document
+      # tests. The skip filters exclude tests that need the ONNX runtime +
+      # embedding model on disk (not installed in GitHub runners); those
+      # tests, and the full `e2e` target (which spawns the compiled binary
+      # and needs additional runtime env), stay local-only until separate
+      # work makes them environment-portable.
+      - name: cargo test (integration harness)
+        run: |
+          cargo test -p memex-cli --features test-harness --test integration -- \
+            --skip daemon_query:: \
+            --skip daemon_search:: \
+            --skip query_intent:: \
+            --skip per_slug
 
       # actionlint catches workflow YAML mistakes and surfaces them as
       # inline PR annotations on the diff via reviewdog. `fail_level: error`

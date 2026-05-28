@@ -398,7 +398,13 @@ stay in topical sections only, never Timeline.)
     subject without needing the original source.
 
   Output strict JSON: `{"pages":[{"slug":"...","title":"...","body":"..."}]}`
-  — no surrounding prose, no code fences.
+  — no surrounding prose, no code fences. Every interior `"`, `\`, and
+  newline in a string value MUST be JSON-escaped (`\"`, `\\`, `\n`). A
+  raw `"` inside a body string is invalid JSON and is parsed as a
+  failure. When the body would naturally contain quoted English ("X
+  said Y"), prefer single quotes or italic phrasing ("X said 'Y'" or
+  "X said *Y*") so you don't have to escape — this is the single most
+  common JSON failure mode in extractor output.
 
   If the source has nothing wiki-worthy, output `{"pages":[]}` exactly.
   Never a prose summary or status report — that's parsed as a failure.
