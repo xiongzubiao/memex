@@ -12,6 +12,21 @@ pub fn estimate_tokens(s: &str) -> usize {
     by_chars.max(by_bytes)
 }
 
+/// Token overhead of the JSON envelope wrapping each transcript segment in
+/// the EXTRACT payload — the `index`/`role`/`timestamp`/`text` keys, quotes,
+/// braces, and commas (~70 chars ≈ 24 tokens, independent of the text body).
+/// The worker's per-call overhead reserve is flat, so without counting this
+/// per segment a transcript of many short turns could exceed
+/// `chunk_max_tokens` on envelope alone and fail at dispatch with
+/// "Prompt is too long".
+pub const SEGMENT_ENVELOPE_TOKENS: usize = 24;
+
+/// Tokens a transcript segment contributes to the serialized EXTRACT payload:
+/// its text plus the JSON envelope (see [`SEGMENT_ENVELOPE_TOKENS`]).
+fn segment_tokens(seg: &ExtractSegment) -> usize {
+    estimate_tokens(&seg.text) + SEGMENT_ENVELOPE_TOKENS
+}
+
 /// A single addressable unit of source content for the EXTRACT worker.
 ///
 /// Transcripts produce one ExtractSegment per turn (role, timestamp, index
@@ -104,7 +119,7 @@ pub fn chunk_transcript_segments(
     // `chunk_max_tokens`, so the cap is enforced exactly regardless of how
     // far the average misjudges the trailing segments.
     let avg_seg_tokens = {
-        let total: usize = segments.iter().map(|s| estimate_tokens(&s.text)).sum();
+        let total: usize = segments.iter().map(segment_tokens).sum();
         (total / segments.len()).max(1)
     };
     let overlap_budget = overlap_turns.saturating_mul(avg_seg_tokens);
@@ -114,7 +129,7 @@ pub fn chunk_transcript_segments(
     let mut current_tokens: usize = 0;
 
     for (idx, seg) in segments.iter().enumerate() {
-        let seg_tokens = estimate_tokens(&seg.text);
+        let seg_tokens = segment_tokens(seg);
         if seg_tokens > chunk_max_tokens {
             return Err(ChunkError::TooLargeSegment(idx, seg_tokens));
         }
@@ -159,10 +174,10 @@ pub fn chunk_transcript_segments(
             let mut new_chunk = Vec::with_capacity(overlap.len() + chunks[i].len());
             new_chunk.extend(overlap);
             new_chunk.extend(std::mem::take(&mut chunks[i]));
-            let mut total: usize = new_chunk.iter().map(|s| estimate_tokens(&s.text)).sum();
+            let mut total: usize = new_chunk.iter().map(segment_tokens).sum();
             let mut drop_from_front = 0usize;
             while total > chunk_max_tokens && drop_from_front < take {
-                total = total.saturating_sub(estimate_tokens(&new_chunk[drop_from_front].text));
+                total = total.saturating_sub(segment_tokens(&new_chunk[drop_from_front]));
                 drop_from_front += 1;
             }
             if drop_from_front > 0 {
@@ -510,17 +525,18 @@ mod tests {
 
     #[test]
     fn chunk_transcript_segments_overlap_prepends_last_k_turns() {
+        // segment_tokens = estimate_tokens(text) + 24 envelope. 120-char text
+        // = 40 text tokens + 24 = 64. Cap 256 → chunk[0] packs 4 segments
+        // (256); chunk[1] takes 3 overlap + 1 original = 256 (no trim).
         let segs: Vec<ExtractSegment> = (0..10)
             .map(|i| ExtractSegment {
                 index: Some(i),
                 role: Some("user".into()),
                 timestamp: None,
-                text: format!("seg-{i}"),
+                text: "x".repeat(120),
             })
             .collect();
-        // Force two chunks. Each segment is ~5 chars / ~2 tokens. Cap = 8 tokens
-        // → ~4 segments per chunk.
-        let chunks = chunk_transcript_segments(&segs, 8, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(&segs, 256, 100, 3).unwrap();
         assert!(
             chunks.len() >= 2,
             "expected >=2 chunks, got {}",
@@ -544,19 +560,17 @@ mod tests {
 
     #[test]
     fn chunk_transcript_segments_overlap_chunk_0_unchanged() {
-        // Geometry must produce >=2 chunks AND satisfy the post-overlap
-        // invariant (overlap_turns * avg_tokens <= cap). Cap=8, 10 segs of
-        // ~2 tokens each: chunks[0] packs 4 segs at full cap; chunks[1+]
-        // pack 1 seg at effective_cap=2; after overlap each is 4 segs / 8 tokens.
+        // 120-char segments = 64 segment_tokens (40 text + 24 envelope).
+        // Cap 256 → chunk[0] packs 4 at full cap and is never prepended to.
         let segs: Vec<ExtractSegment> = (0..10)
             .map(|i| ExtractSegment {
                 index: Some(i),
                 role: Some("user".into()),
                 timestamp: None,
-                text: format!("seg-{i}"),
+                text: "x".repeat(120),
             })
             .collect();
-        let chunks = chunk_transcript_segments(&segs, 8, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(&segs, 256, 100, 3).unwrap();
         assert!(
             chunks.len() >= 2,
             "expected >=2 chunks, got {}",
@@ -574,20 +588,19 @@ mod tests {
     fn chunk_transcript_segments_chunks_1plus_smaller_than_chunk_0() {
         // Verifies the overlap-budget reservation: chunks[0] uses the
         // full cap, but chunks 1..N use a smaller effective_cap to leave
-        // room for prepended overlap. With homogeneous segs of S tokens,
-        // chunks[0] packs floor(cap/S) segs and chunks[1+] pack fewer.
-        // 20 segs of 40 chars = 14 tokens each. Cap=60, overlap=3.
-        // avg=14, overlap_budget=42, effective_cap=18. Chunks[0] holds
-        // 4 segs (56 tokens); chunks 1..N hold 1 seg each (14 tokens).
+        // room for prepended overlap. 120-char segs = 64 segment_tokens
+        // (40 text + 24 envelope). Cap=256, overlap=3. avg=64,
+        // overlap_budget=192, effective_cap=64. chunks[0] holds 4 segs
+        // (256); chunks 1..N hold 1 original seg each.
         let segs: Vec<ExtractSegment> = (0..20)
             .map(|i| ExtractSegment {
                 index: Some(i),
                 role: Some("user".into()),
                 timestamp: None,
-                text: "x".repeat(40),
+                text: "x".repeat(120),
             })
             .collect();
-        let chunks = chunk_transcript_segments(&segs, 60, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(&segs, 256, 100, 3).unwrap();
         assert!(
             chunks.len() >= 2,
             "expected >=2 chunks, got {}",
@@ -608,28 +621,25 @@ mod tests {
 
     #[test]
     fn chunk_transcript_segments_post_overlap_stays_under_cap() {
-        // Pack tight, then overlap should NOT push chunks 1..N over cap.
-        // 15 segments of 40 chars = 14 tokens each (chars/3 ceil_div).
-        // Cap = 60 tokens, overlap_turns = 3. Without budget reservation,
-        // chunks pack to ~56 tokens, then overlap adds 3 × 14 = 42 tokens
-        // → chunk 1 = ~98 tokens (over cap). With reservation:
-        // overlap_budget = 3 × 14 = 42, effective_cap for chunks 1..N
-        // = 60 - 42 = 18, so they hold 1 original segment each (14 tokens),
-        // and post-overlap totals = 3 × 14 + 14 = 56 ≤ 60.
+        // Pack tight, then overlap must NOT push chunks 1..N over cap.
+        // 15 segments of 120 chars = 64 segment_tokens each (40 text + 24
+        // envelope). Cap = 256, overlap_turns = 3. The budget reservation
+        // plus the post-overlap trim keep every chunk within cap — asserted
+        // in segment_tokens terms, which is what the cap is enforced in.
         let segs: Vec<ExtractSegment> = (0..15)
             .map(|i| ExtractSegment {
                 index: Some(i),
                 role: Some("user".into()),
                 timestamp: None,
-                text: "x".repeat(40),
+                text: "x".repeat(120),
             })
             .collect();
-        let chunks = chunk_transcript_segments(&segs, 60, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(&segs, 256, 100, 3).unwrap();
         for (i, c) in chunks.iter().enumerate() {
-            let total: usize = c.iter().map(|s| estimate_tokens(&s.text)).sum();
+            let total: usize = c.iter().map(segment_tokens).sum();
             assert!(
-                total <= 60,
-                "post-overlap chunk {i} total = {total} tokens > cap 60 (chunks.len()={})",
+                total <= 256,
+                "post-overlap chunk {i} total = {total} tokens > cap 256 (chunks.len()={})",
                 chunks.len()
             );
         }
@@ -642,17 +652,17 @@ mod tests {
         // segments. The overlap loop must use .min(prev.len()) to avoid
         // panic on usize underflow.
         //
-        // Geometry: cap=100, overlap_turns=3, segs of 30 tokens each.
-        // avg=30, overlap_budget=90, effective_cap=10. Packing produces
-        // chunks[0]=3 segs (30+30+30=90 ≤ 100), then chunks[1..N]=1 seg each
-        // (since 30 > effective_cap=10, packer pushes 1-seg chunks).
-        // At i=2, chunks[1].len()=1 < overlap_turns=3 — the .min() guard fires.
+        // Geometry: cap=100, overlap_turns=3, segs of 54 segment_tokens
+        // each (90 chars → 30 text + 24 envelope). overlap_budget = 3×54
+        // = 162 ≥ cap, so effective_cap saturates to 0 and chunks[1..N] hold
+        // 1 segment each. With prev.len()=1 < overlap_turns=3, the .min()
+        // guard prevents a usize underflow in the overlap slice.
         let segs: Vec<ExtractSegment> = (0..6)
             .map(|i| ExtractSegment {
                 index: Some(i),
                 role: Some("user".into()),
                 timestamp: None,
-                text: "x".repeat(90), // ~30 tokens at chars/3
+                text: "x".repeat(90),
             })
             .collect();
         // Should not panic.
@@ -663,53 +673,80 @@ mod tests {
 
     #[test]
     fn chunk_transcript_segments_post_overlap_heterogeneous_trims_to_fit() {
-        // Adversarial heterogeneity: 8 tiny segments (1 token each) followed by
-        // 2 large segments (20 tokens each). avg_seg_tokens = floor(48/10) = 4,
-        // overlap_budget = 3*4 = 12, effective_cap = 30-12 = 18. Pack:
-        //   chunks[0] = [s0..s8] (8 small + 1 large = 28 tokens, fits cap=30)
-        //   chunks[1] = [s9] (20 tokens, alone — 20 > effective_cap=18)
-        // Overlap prepends last 3 of chunks[0] = [s6, s7, s8] = [1, 1, 20]
-        // → chunks[1] would be [s6, s7, s8, s9] = 42 tokens > cap=30.
-        // The post-overlap trim must drop overlap from the front until the
-        // chunk fits. Final chunks[1] = [s9] (all 3 overlap turns trimmed).
-        let mut segs: Vec<ExtractSegment> = (0..8)
+        // Adversarial heterogeneity (segment_tokens = text + 24 envelope):
+        // 6 small turns (~30 chars → 10+24 = 34) then 2 large (~900 chars →
+        // 300+24 = 324). Cap 600. Pack:
+        //   chunks[0] = [s0..s6] (6 small + first large = 528 ≤ 600)
+        //   chunks[1] = [s7] (second large, 324)
+        // Overlap prepends chunks[0]'s last 3 = [s4, s5, s6] = [34, 34, 324]
+        // → chunks[1] would be [s4, s5, s6, s7] = 716 > 600. The post-overlap
+        // trim must drop overlap from the front until it fits; here all 3
+        // overlap turns are dropped, leaving chunks[1] = [s7].
+        let mut segs: Vec<ExtractSegment> = (0..6)
             .map(|i| ExtractSegment {
                 index: Some(i),
                 role: Some("user".into()),
                 timestamp: None,
-                text: "x".to_string(), // 1 char → 1 token
+                text: "x".repeat(30),
             })
             .collect();
         segs.push(ExtractSegment {
-            index: Some(8),
-            role: Some("user".into()),
+            index: Some(6),
+            role: Some("assistant".into()),
             timestamp: None,
-            text: "x".repeat(60), // 60 chars → 20 tokens
+            text: "x".repeat(900),
         });
         segs.push(ExtractSegment {
-            index: Some(9),
-            role: Some("user".into()),
+            index: Some(7),
+            role: Some("assistant".into()),
             timestamp: None,
-            text: "x".repeat(60),
+            text: "x".repeat(900),
         });
-        let chunks = chunk_transcript_segments(&segs, 30, 100, 3).unwrap();
+        let chunks = chunk_transcript_segments(&segs, 600, 100, 3).unwrap();
         for (i, c) in chunks.iter().enumerate() {
-            let total: usize = c.iter().map(|s| estimate_tokens(&s.text)).sum();
+            let total: usize = c.iter().map(segment_tokens).sum();
             assert!(
-                total <= 30,
-                "post-overlap chunk {i} = {total} tokens, exceeds cap 30"
+                total <= 600,
+                "post-overlap chunk {i} = {total} tokens, exceeds cap 600"
             );
         }
         assert!(chunks.len() >= 2, "expected multiple chunks");
         // chunks[1] should have been trimmed all the way back to its single
-        // non-overlap segment (s9), since each successive overlap drop still
+        // non-overlap segment (s7), since each successive overlap drop still
         // left a chunk > cap until the overlap was fully removed.
         assert_eq!(
             chunks[1][0].index,
-            Some(9),
-            "chunks[1] should start with s9 after all 3 overlap turns were trimmed; got {:?}",
+            Some(7),
+            "chunks[1] should start with s7 after all 3 overlap turns were trimmed; got {:?}",
             chunks[1][0].index
         );
+    }
+
+    #[test]
+    fn chunk_transcript_segments_counts_envelope_overhead() {
+        // 20 one-token turns. By text alone they sum to ~20 tokens (a single
+        // chunk), but each carries SEGMENT_ENVELOPE_TOKENS (24) of JSON
+        // envelope. At segment_tokens = 25 a cap of 100 holds only 4 per
+        // chunk → 5 chunks. Without envelope accounting this would pack into
+        // one chunk and overflow the real serialized prompt.
+        let segs: Vec<ExtractSegment> = (0..20)
+            .map(|i| ExtractSegment {
+                index: Some(i),
+                role: Some("user".into()),
+                timestamp: None,
+                text: "x".repeat(3),
+            })
+            .collect();
+        let chunks = chunk_transcript_segments(&segs, 100, 100, 0).unwrap();
+        assert_eq!(
+            chunks.len(),
+            5,
+            "envelope overhead must force 5 chunks (4 turns each), not 1"
+        );
+        for (i, c) in chunks.iter().enumerate() {
+            let total: usize = c.iter().map(segment_tokens).sum();
+            assert!(total <= 100, "chunk {i} = {total} tokens > cap 100");
+        }
     }
 
     /// Load-bearing contract test: the EXTRACT system prompt's Mode A

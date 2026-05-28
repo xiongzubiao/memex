@@ -811,6 +811,9 @@ fn apply_intent_prefix(user: &str, intent: Option<&str>) -> String {
 }
 
 /// Estimate the user-supplied portion of the prompt for `job` in tokens.
+/// Per-item JSON envelope overhead (field names, quotes, escaping) is added
+/// on top of the raw content bytes — for Ingest/Merge with many items this
+/// is a material fraction the raw-bytes count alone would miss.
 fn job_prompt_tokens(job: &BackendJob) -> u64 {
     let bytes: usize = match job {
         BackendJob::Expand(j) => j.question.len(),
@@ -822,7 +825,12 @@ fn job_prompt_tokens(job: &BackendJob) -> u64 {
             .map(|p| p.proposed.len() + p.existing.len())
             .sum(),
     };
-    (bytes / memex_core::model::BYTES_PER_TOKEN) as u64
+    let envelope_tokens = match job {
+        BackendJob::Ingest(j) => j.segments.len() * memex_core::chunk::SEGMENT_ENVELOPE_TOKENS,
+        BackendJob::Merge(j) => j.pages.len() * memex_core::chunk::SEGMENT_ENVELOPE_TOKENS,
+        _ => 0,
+    };
+    (bytes / memex_core::model::BYTES_PER_TOKEN) as u64 + envelope_tokens as u64
 }
 
 /// Scale a prompt-token estimate when the prompt looks structured (code,

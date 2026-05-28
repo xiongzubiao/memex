@@ -171,7 +171,7 @@ pub(super) async fn handle_ingest_transcript_content(
                 memex_core::chunk::ChunkError::TooLargeSegment(idx, toks) => {
                     let visible = segments.get(idx).and_then(|s| s.index).unwrap_or(idx + 1);
                     format!(
-                        "segment {visible} is {toks} tokens, exceeds chunk_max_tokens \
+                        "segment {visible} is {toks} tokens, exceeds chunk_max_tokens={chunk_max} \
                          (transcripts can't be split mid-segment)"
                     )
                 }
