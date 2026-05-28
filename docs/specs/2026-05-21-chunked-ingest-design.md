@@ -137,11 +137,12 @@ pub fn chunk_transcript_segments(
 ```
 
 Behavior:
-- Greedy: pack consecutive segments into a chunk until adding the next segment would exceed `chunk_max_tokens`; emit the chunk, start a new one. Never split mid-segment.
-- A single segment exceeding `chunk_max_tokens` → `ChunkError::TooLargeSegment(idx, tokens)`. The segment index points at the offending turn for diagnostics. (Transcripts can't be split mid-turn.)
+- Greedy packing: pack consecutive segments into a chunk until adding the next would exceed the per-chunk budget; emit the chunk, start a new one. Never split mid-segment.
+- Per-chunk budget: chunk 0 uses the full `chunk_max_tokens`; chunks 1.. reserve an overlap budget (`overlap_turns × average segment tokens`) to leave room for the prepended overlap.
+- A single segment exceeding `chunk_max_tokens` → `ChunkError::TooLargeSegment(idx, tokens)` (transcripts can't be split mid-turn). `idx` is the 0-based slice position; the handler maps it to the 1-based turn index in the user-facing diagnostic.
 - Total would exceed `max_chunks` → `ChunkError::TooManyChunks(max_chunks)` (sanity bound on cost).
-- After packing, walk `chunks[1..]`: prepend the last `overlap_turns` segments of `chunks[i−1]` to `chunks[i]`. If `chunks[i−1]` has fewer than `overlap_turns` segments, prepend what's available (best-effort).
-- Token estimation uses `BYTES_PER_TOKEN` from `core::model` (chars/4).
+- After packing, prepend the last `overlap_turns` segments of `chunks[i−1]` to `chunks[i]` (what's available if fewer), then trim overlap from the front until the chunk fits `chunk_max_tokens` exactly — overlap is anchor context, not load-bearing.
+- Token estimation: `estimate_tokens` = `max(chars/3, bytes/4)` (conservative for both Latin and multibyte/CJK text), plus a per-segment JSON-envelope overhead so many-short-turn transcripts can't overflow on envelope alone.
 - Empty `segments` → empty `Vec` (no chunks).
 
 `chunk_max_tokens` is supplied by the caller and is the maximum size a single chunk should be. The handler derives this from the worker model's context window (see `worker_chunk_max_tokens` below). The chunker stays model-agnostic — same function works for any cap value.
@@ -306,7 +307,7 @@ Inherited (no change):
 - Daemon crash mid-flight: `recover_stuck_ingest_jobs` on next startup flips row to `failed: interrupted by daemon restart`.
 
 New errors:
-- `ChunkError::TooLargeSegment(idx, tokens)` → `DaemonError::BadRequest("transcript segment {idx} is {tokens} tokens, exceeds chunk_max {cap}")`. Updates `ingest_jobs.status=failed`. Fires before any worker calls; no LLM credits spent.
+- `ChunkError::TooLargeSegment(idx, tokens)` → `DaemonError::BadRequest("segment {n} is {tokens} tokens, exceeds chunk_max_tokens={cap} ...")`, where `{n}` is the 1-based turn index. Updates `ingest_jobs.status=failed`. Fires before any worker calls; no LLM credits spent.
 - `ChunkError::TooManyChunks(max_chunks)` → `DaemonError::BadRequest("transcript would split into more than {max} chunks; raise daemon.ingest.max_chunks")`.
 
 Logging additions:
@@ -326,13 +327,13 @@ Per-chunk daemon worker timeout (300s default) applies independently to each chu
 - Total > `max_chunks` → `TooManyChunks(max)`.
 - Empty input → empty `Vec`.
 - Single segment exactly at `chunk_max_tokens` → own chunk (boundary).
-- Token estimation uses `BYTES_PER_TOKEN` from `core::model`.
+- Token estimation = `max(chars/3, bytes/4)` + per-segment envelope; multibyte/CJK content estimates via the byte path; many short turns split on envelope overhead.
 
 ### Unit — `worker_chunk_max_tokens`
 
 - Known model (e.g., `claude-sonnet-4-6`) → value derived from `lookup_model`, not the `DEFAULT_MODEL_INFO` fallback.
 - Unknown model → falls back to `DEFAULT_MODEL_INFO` (128k input) → derived cap.
-- Model in 1M-context tier returns a derived cap > 800k; baseline 200k-context model returns > 150k. (Verifies model-aware sizing actually scales.)
+- Model-aware sizing scales: a non-derated 1M-context model returns a derived cap > 800k; a 200k-context model returns > 150k. `claude-sonnet-4-6` is capped to 200k by `apply_known_overrides`, so its derived cap reflects the 200k tier (see Implementation notes).
 
 ### Unit — worker `fit_miss` restart trigger
 
@@ -362,7 +363,7 @@ Per-chunk daemon worker timeout (300s default) applies independently to each chu
 
 ### Manual end-to-end
 
-- Re-ingest the 30 MB claude-code session at `~/.claude/projects/-data-MemVerge-memex--claude-worktrees-locomo-benchmark-origin/e57b697d-6aad-4ad7-abe8-de52e9e926f2.jsonl` (the originally-failing session — ~205k tokens). On sonnet-200k worker: expect ~1–2 chunks at model-derived `chunk_max_tokens` (~180k), with at most one `trigger="fit_miss"` reset between chunks. On sonnet-1M worker: expect 1 chunk, no reset. Verify successful page extraction, no degraded outputs, ingest_jobs status flips to `completed`.
+- Re-ingest the originally-failing 30 MB claude-code session (~205k tokens). On a sonnet-200k worker: expect ~1–2 chunks at model-derived `chunk_max_tokens` (~180k), with at most one `trigger="fit_miss"` reset between chunks. On a sonnet-1M worker: expect 1 chunk, no reset. Verify successful page extraction, no degraded outputs, ingest_jobs status flips to `completed`.
 - Re-ingest a small opencode transcript (single chunk on any model) — confirm chunk count = 1, no `fit_miss` triggers, fast path preserved.
 - Re-ingest a document with body > 50k but ≤ derived `chunk_max_tokens` (e.g., 100k markdown). Today this produces ~3 chunks (50k hard cap force-splits); after the change, expect 1 chunk. Verify the wiki pages produced cover the same subjects as the old 3-chunk extraction (spot-check 2–3 page slugs).
 - Re-ingest a document that previously fit comfortably under 30k (e.g., a 20k README). Confirm output is unchanged — single-chunk path was already optimal and remains so.
@@ -378,159 +379,32 @@ Per-chunk daemon worker timeout (300s default) applies independently to each chu
 
 ---
 
-## /autoplan Review — CEO Phase
+## Implementation notes
 
-Run: 2026-05-22 (sonnet-4-6 subagent + codex-cli 0.130.0). User challenge surfaced and **rejected** — original direction held; both config knobs remain removed as designed.
+The design shipped as specified, with the deviations and additional fixes below. (The full `/autoplan` CEO + Eng review and the day-by-day post-implementation debugging log live in the PR history; they're omitted here to keep this a design record rather than a process log.)
 
-### Concerns to acknowledge (not blocking, but recorded)
+### Deviations from the design as written
 
-| # | Severity | Source | Concern | Disposition |
-|---|---|---|---|---|
-| C1 | HIGH | both voices | Bigger chunks may degrade extraction quality (lost-in-the-middle); not empirically validated | Held. Manual end-to-end tests verify the small + large cases; if regressions surface post-ship, re-introduce knob then. |
-| C2 | HIGH | both voices | `chars/4` token estimation under-counts for code/JSON-heavy transcripts by 30–50%; `fit_miss` may miscompute | Add Failure Modes Registry entry. Consider widening the safety margin from 10% to ~20% if real-world undercounting shows up. |
-| C3 | HIGH | both voices | Cross-chunk MERGE-by-slug doesn't actually handle topic continuity when the same topic gets slightly-different slugs across chunks | Acknowledged as accepted defect; revisit if eval evidence shows cross-chunk subject splitting in practice. |
-| C4 | MED | Claude subagent | 30 MB locomo-benchmark session is the only forcing example, and it's from an eval workflow not a real user transcript | Held. Future re-evaluation: if no other transcript-too-large cases surface within ~3 months, transcript chunking can be downgraded to a `--truncate-tokens N` flag. |
-| C5 | MED | Claude subagent | `overlap_turns = 3` is arbitrary; no measurement of how many cross-boundary topics it actually recovers | Held. Cheap to revisit later as a tuning param. |
-| C6 | MED | Codex | Migration "silently ignore old config fields" is operationally fragile for users with existing configs | Held per the project's no-back-compat-scaffolding policy. Documented in Migration notes. |
-| C7 | LOW | Claude subagent | Wiki contains pages extracted at old (30k) and new (>=180k) chunk sizes; user search sees inconsistent page granularity across eras | Acknowledged silent technical debt; not blocking. |
+- **Overlap budget** uses a single average over the whole input (not a per-chunk running average), and the per-chunk cap is enforced exactly by *trimming* prepended overlap from the front until each chunk fits — not by a debug-assert (which would only fire in debug builds).
+- **No `MIN_CHUNK_TOKENS` clamp.** `worker_chunk_max_tokens` forwards `compute_batch_budget(...)` directly; the clamp would guard a scenario that can't occur (overhead is 8k; no catalog model has a context window small enough to saturate the budget to 0). The startup log of resolved model + `chunk_max` did ship.
+- **Per-item JSON envelope** (`SEGMENT_ENVELOPE_TOKENS`) is counted per segment when packing and in the worker's `job_prompt_tokens`, so a transcript of many short turns can't overflow on envelope alone.
+- **Token estimates ceil**, not floor (`bytes.div_ceil(BYTES_PER_TOKEN)`), so the `fit_miss` projection errs high near the cap. `estimate_tokens` takes `max(chars/3, bytes/4)`; the `fit_miss` safety margin is 20% and structured (code/JSON-dense) content is scaled 1.4×.
 
-### Out of scope per CEO challenge (raised, deferred)
+### Three orthogonal worker/model fixes (not in the original design)
 
-- Replacing chunking strategy with a semantic / topic-boundary chunker (competitive parity with Mem0/MemMachine/Letta) — separate work, larger scope.
-- Adaptive overlap (boundary confidence, speaker switches) — premature optimization until C5 is measured.
-- A pre-summarize-with-cheap-model pass before EXTRACT — interesting alternative, deferred.
-- Schema-first decoding + parser-repair stage in the worker (Codex #3) — separate work; the INSTRUCTION BOUNDARY and quote-escape prompt fixes on this branch already address a subset.
-- Outcome-based release gates (% correct facts, time-to-first-useful-page, cost per useful fact) — adopt for future eval cycles; out of scope for this PR.
+Surfaced during end-to-end verification on a real 30 MB claude-code session; each was diagnosed from raw stream-json capture:
 
-### Premise gate status
+1. **`--effort low`** on claude-code / codex / openai-api. Default reasoning effort spent the entire per-turn timeout in extended thinking on dense content and emitted zero output text (≈48 KB thinking / 0 B output in 1200s); with `low`, the same input completes in ~207s.
+2. **`apply_known_overrides` derates `claude-sonnet-4-6` to 200k.** The vendored LiteLLM catalog lists it at the 1M tier, but that tier needs usage credits enabled; without them, requests over 200k fail with `[invalid_request] Prompt is too long`. The derate lives in code so re-vendoring can't lose it.
+3. **Parse-then-cache gate.** `run_job_with_retry` cached raw worker text *before* the schema-parse step, so prose responses poisoned the cache and every retry returned `backend_unavailable` instantly. The cache insert now happens after the parse outcome, gated on parse success.
 
-- Premises **CONFIRMED** by user at D2.
-- User Challenge on config knob removal: **REJECTED by user** (Hold scope, no knobs).
-- Phase 1 closed.
+### End-to-end result
 
----
+The originally-failing 30 MB session (~205k tokens) ingests cleanly: 4 chunks of ~108k, 3 inter-chunk `fit_miss` resets, cross-chunk MERGE-by-slug, `status=completed`, 6 pages stored. The full workspace test suite is green.
 
-## /autoplan Review — Eng Phase
+### Follow-ups (tracked, out of scope here)
 
-Run: 2026-05-22 (sonnet-4-6 subagent + codex-cli 0.130.0). Both voices read the actual repo source (queue.rs, config.rs, model.rs, worker/mod.rs, handler/ingest.rs) and verified claims at file/line level. Strong convergence on six critical or high findings. Four require spec changes (folded in below); two require call-out in the spec text but not new sections.
-
-### Spec changes folded in (must implement)
-
-1. **Reserve overlap budget when packing (E-CRIT-1).** `chunk_transcript_segments` packs to `chunk_max_tokens − reserved_overlap_tokens`, not to `chunk_max_tokens`. `reserved_overlap_tokens` is estimated from the running average turn size × `overlap_turns`, recomputed per-chunk. After overlap is prepended, a debug-assert verifies total chunk tokens ≤ `chunk_max_tokens`. Without this reservation, a chunk packed to exactly `chunk_max_tokens` and then prefixed with 3 overlap turns can exceed the model's context — recreating the failure the design exists to prevent.
-
-   *Implemented as:* the overlap budget uses a single average over the whole input (not a per-chunk running average), and the cap is enforced exactly by **trimming** prepended overlap from the front until each chunk fits — not by a debug-assert (which would only fire in debug builds). Per-segment token counts also include a JSON-envelope overhead so many-short-turn transcripts can't overflow on envelope alone.
-
-2. **`MIN_CHUNK_TOKENS` floor in `worker_chunk_max_tokens` (E-CRIT-2).** `compute_batch_budget` saturates to 0 when overhead exceeds `max_input` (e.g., unknown model falls back to `DEFAULT_MODEL_INFO` 128k input − 16k max_output − 8k overhead − 12.8k safety = ~91k, OK; but a hypothetical model with bizarre catalog values could saturate to 0). Add `const MIN_CHUNK_TOKENS: usize = 8_000;` and return `cmp::max(MIN_CHUNK_TOKENS, compute_batch_budget(...))`. At daemon startup, log the resolved model name and the computed `chunk_max` so operators can see what's in effect.
-
-   *Implemented as:* the startup log (resolved model + `chunk_max`) shipped. The `MIN_CHUNK_TOKENS` clamp was **not** added — it guards a scenario that can't occur (overhead is 8k; no catalog model has a context window small enough to saturate the budget to 0), so the clamp would be dead code. `worker_chunk_max_tokens` forwards `compute_batch_budget(...)` directly.
-
-3. **Mode B serde contract test (E-CRIT-3).** Add in `cli/src/daemon/queue.rs` tests:
-   ```rust
-   #[test]
-   fn extract_segment_doc_mode_omits_optional_fields() {
-       let seg = ExtractSegment { index: None, role: None, timestamp: None, text: "x".into() };
-       let json = serde_json::to_string(&seg).unwrap();
-       assert_eq!(json, r#"{"text":"x"}"#);
-   }
-   ```
-   This is the load-bearing test for the entire shared-helper design: it pins the contract that the EXTRACT prompt's Mode A vs Mode B detection depends on.
-
-4. **Delete the orphaned `IngestConfig::validate` clauses (E-CRIT-4).** When removing `chunk_target_tokens` and `chunk_hard_cap_tokens` from `IngestConfig`, also remove the validator clauses at `cli/src/daemon/config.rs:238-248`. The migration as written says "serde silently ignores the field" but if the validator clauses aren't deleted alongside, the code won't compile (the validators reference the removed fields).
-
-5. **`fit_miss` state reset (E-HIGH-6).** When `soft_reset` returns false (claude-code respawn path) OR when `subprocess = None` is set, also zero `last_turn_input_tokens = 0; last_response_tokens = 0;` (not just `jobs_done = 0`). Without this, the next iteration's `fit_miss` check uses stale tracking from the now-dead subprocess, false-positives a reset that just happened.
-
-### Spec text changes (no implementation impact)
-
-6. **Token estimation: "chars/4" → "bytes/4" (E-HIGH-5).** Spec text in the "Token estimation" notes claims `chars/4`. Verified in `core/src/model.rs:19`: `BYTES_PER_TOKEN = 4`, and `prompt.len() / BYTES_PER_TOKEN` uses `String::len()` which is bytes. Fix the spec wording. Add a content-class margin: when the chunk text is > 30% non-alphabetic by byte count (code, JSON, base64), scale the estimate by 1.4× before comparison. Widen the `fit_miss` safety margin from 10% to 20%.
-
-### Eng phase findings acknowledged but deferred
-
-| ID | Issue | Disposition |
-|---|---|---|
-| E-MED-7 | Sequential per-slug MERGE truncates to 20k chars on the LLM-fail concat-fallback path (Codex #6) — silent data loss when 4+ fragments share a slug | Acknowledged. Out of scope for this spec; track as a separate follow-up if real data shows >4 fragments per slug is common. |
-| E-MED-8 | Per-ingest concurrency is unbounded; a 20-chunk ingest can monopolize the worker queue and starve other ingests/queries (Codex #7) | Acknowledged. The default `max_chunks=20` and typical `worker.max_count` (CPU count) make this a real concern at peak load. Out of scope here; consider a per-ingest semaphore in a follow-up. |
-| E-MED-9 | Cross-chunk merge waits for ALL chunk replies before merging — slowest chunk pins total latency at the 300s worker timeout (subagent F8) | Acknowledged. Stream-merge by slug as chunks complete is a clean optimization; defer until peak-load profile shows it matters. |
-| E-MED-10 | Slug drift across chunks (`acme-auth` vs `acme-auth-service`) escapes by-slug consolidation (both voices) | Already captured as C3 in CEO phase. No new disposition. |
-| E-LOW-11 | Manual e2e fixture references `~/.claude/projects/.../e57b697d-...jsonl` — a developer-local path, not reproducible in CI (subagent F20) | Acknowledged. The eng phase recommendation is to check in a sanitized fixture under `tests/fixtures/`. Out of scope for this design doc; track as test-infrastructure work. |
-| E-LOW-12 | Memory cost: ~60 MB peak during a 30 MB transcript chunking pass (original + cloned segments) (subagent F19) | Noted. Not worth speculative optimization; revisit if profiling shows it. |
-
-### Phase 3 status
-
-- Eng dual voices: ran, both completed in foreground, consensus table produced.
-- 4 critical findings folded into the spec as required changes (E-CRIT-1 through E-CRIT-4).
-- 2 high findings folded as spec-text updates (E-HIGH-5, E-HIGH-6).
-- 6 medium/low findings acknowledged in the table above; out of scope.
-- Phase 3 closed.
-
----
-
-## Post-implementation manual e2e — initial failure, root-cause investigation, resolution (2026-05-22 to 2026-05-23)
-
-The 30 MB `e57b697d-...jsonl` claude-code session was re-ingested after the implementation landed (commit `fe9b7a2`). First attempt failed with a prose response that bypassed the JSON parser. Investigation across the following day diagnosed **three layered issues**, each masking the others. After all three are addressed the session ingests end-to-end.
-
-### What the investigation actually found
-
-Initial framing in this section claimed the failure was prompt-injection from dense imperative content and was "outside the chunked-ingest design's scope." That framing was wrong. The real diagnosis took several rounds of experimentation:
-
-**Issue 1 — Extended thinking exhausts the per-turn timeout.** Default reasoning effort on `claude-sonnet-4-6` (via `claude -p`) enables extended thinking. On dense pipeline-meta content the model spends the entire per-turn timeout in internal deliberation and emits no output text:
-
-| Effort   | Elapsed | Thinking block | Output text |
-|----------|---------|----------------|-------------|
-| default  | 1200s   | 48,616 bytes   | 0 bytes     |
-| low      | 207s    | 69 bytes       | 29,942 bytes |
-
-Same input, same model, same system prompt. The worker discards `thinking` content blocks (`block.ty == "text"` is the only kept type), so the cached cause of failure was invisible until we captured raw stream-json. Fixed in commit `424f75f` by adding `--effort low` (claude-code), `-c model_reasoning_effort=low` (codex), and `request.reasoning_effort(Low)` (openai-api). Gemini CLI has no equivalent knob; left at default.
-
-**Issue 2 — The catalog's 1M context for `claude-sonnet-4-6` isn't accessible by default.** The vendored LiteLLM catalog lists `claude-sonnet-4-6` at `max_input_tokens=1_000_000` (the 1M-context tier). That tier requires "usage credits" enabled at `claude.ai/settings/usage`. Without them, requests above 200k tokens trigger an auto-compaction attempt that fails with `API Error: Usage credits required for 1M context...`, surfaced to the caller as `[invalid_request] Prompt is too long`. `claude -p --verbose` confirms via `modelUsage.{model}.contextWindow=200000` for the default OAuth path.
-
-Adding `--effort low` exposes this because the compaction path triggers at lower input sizes than default-effort runs (which seem to compact silently, often producing prose summaries as the eventual EXTRACT output — which is itself one of the failure modes we were observing).
-
-Fixed in commit `e400777` via a new `apply_known_overrides()` layer inside `core::model::lookup_model`. The override caps `claude-sonnet-4-6` to `max_input_tokens=200_000`, matching what claude-code actually delivers. The vendored LiteLLM catalog stays as a faithful copy of upstream; the memex-specific derate lives in code where re-vendoring can't lose it. With the cap in place, `compute_batch_budget` returns `108_000` (= 200k − 10% safety − 64k max_output − 8k overhead) and the 480k-token transcript chunks into 4 pieces that fit cleanly under the 200k API limit.
-
-**Issue 3 — The LLM cache stores prose responses, poisoning future retries.** `worker::run_job_with_retry` was inserting the raw worker text into `llm_cache` on `TurnOutcome::Ok` *before* the schema-parse step. When EXTRACT or MERGE emitted prose, the prose got cached. Every subsequent retry of the same prompt hit the cache and returned `backend_unavailable` in milliseconds. On this machine: 312 of 630 cache entries (~50%) were unparseable prose, making the original failure look reproducible even after the prompt fixes landed. Fixed in commit `886d29a` by moving the cache insert to after the parse outcome is built, gated on `parse_ok`.
-
-### End-to-end verification (2026-05-23, after all three fixes)
-
-```
-chunk_max_tokens=108000   ← derived from 200k-derate via apply_known_overrides
-n_chunks=4
-total_segments=4449
-
-EXTRACT phase  : 20:58:12 → 21:07:39 (~9 min, 4 chunks × ~135-165s each on --effort low)
-fit_miss reset : 3 inter-chunk worker resets (last_turn_input_tokens=155100, projected_input=162659)
-dedup search   : 4 existing wiki pages to merge with + 2 new pages
-MERGE phase    : 21:08:42 → 21:15:31 (~7 min, 4 sequential merges: 62s, 225s, 297s, 471s)
-indexing tail  : 21:15:31 → 21:49:01 (~34 min, see below)
-ingest_jobs    : status=completed, stored=6 pages
-total elapsed  : 51 min
-```
-
-### Indexing tail (34 minutes, unobservable from logs)
-
-After the last MERGE completes, the handler runs through `store_extracted_pages` lines 526–593: write the raw file under content-hash-named path, commit the source row, embed the raw source, run `maintain_backlinks_batch` across the existing wiki. **No progress logs fire during any of this.** The only events in the 34-minute window are one WARN at the start (`raw file body hash does not match path expected=fc... found=None`, expected since we cleared the prior raw file to force re-ingest) and the final `ingest job completed`.
-
-The work hidden inside the tail:
-- **Embed the raw source.** 1.4 MB / ~480k tokens of canonical transcript text, semantic-split into ~250 chunks of ≤ 2044 tokens each, embedded sequentially under the single shared `embed_model` lock. With a remote embedder this is many individual API calls.
-- **`maintain_backlinks_batch`** across 173 existing wiki pages × 2 new pages to add backlinks where applicable. Each backlink-update touches a wiki file under per-page locks.
-- Both phases run under one acquisition of `embed_model.lock().await` (lines 568-593), so they serialize relative to concurrent reconcile and watcher embed-work but don't show progress to the operator.
-
-**Not a bug in the chunked-ingest design**; it's a pre-existing operational visibility gap. Follow-up worth tracking: periodic progress logging (`embedding raw source: chunk N of M`, `maintaining backlinks for new slug X`) during these phases. A 50+ minute ingest with 34 minutes of silent indexing looks like a hang from outside the daemon.
-
-### What this verifies about the spec
-
-The chunked-ingest design **does work end-to-end** on the originally-failing 30 MB session, with the right config:
-
-- **Chunker correctness**: 4 chunks of ~108k each fit the 200k API context; overlap budget reservation prevents post-overlap overflow (E-CRIT-1); `fit_miss` worker resets fire correctly between chunks (E-HIGH-5/6 worked as designed); cross-chunk MERGE-by-slug consolidated multi-chunk subjects.
-- **6 review fold-ins** (E-CRIT-1 through E-CRIT-4, E-HIGH-5, E-HIGH-6) all behaved as specified in production conditions.
-- **Three orthogonal fixes layered onto the chunked-ingest design** to handle real-world claude-code OAuth realities: reasoning-effort capped, catalog override for sonnet-4-6's accessible context, parse-then-cache ordering. None of these were in the spec; all are tracked in their own commits (`424f75f`, `e400777`, `886d29a`).
-- **Full workspace test suite passes**: `cargo test --workspace` is green.
-
-### Items still flagged for follow-up
-
-| Concern | Where it lives |
-|---|---|
-| **Per-account context-window probe** — `apply_known_overrides` caps `claude-sonnet-4-6` to 200k unconditionally. Users with usage credits enabled get suboptimal chunk sizes (smaller than necessary, not failures). A startup probe of `claude --verbose` to read `modelUsage.contextWindow` would derive the per-account real cap. Deferred. | `core::model::apply_known_overrides` docstring |
-| **Indexing-tail progress logging** — `embed_and_mark` for the raw source + `maintain_backlinks_batch` together can take 30+ minutes silently on a 1.4 MB transcript + 170-page wiki. Add periodic INFO logs so 50-min ingests are observable. | Out of scope for this PR; future ops-visibility work. |
-| **Anthropic's parallel-call throttling** — claude-code workers run in parallel via the worker pool. Practical throughput is limited by per-org concurrency that the test machine hit during early /8 experiments. Not currently addressed; usually invisible because individual chunk count stays low. | Already captured in /autoplan Eng Phase as E-MED-8. |
-
-Phase 6 (manual e2e) closes with successful end-to-end ingest. The "outside the chunked-ingest design's scope" framing in the first revision of this section was a misdiagnosis; the actual issues were three layered config/library bugs and have been fixed.
+- **Per-account context probe** to replace the unconditional 200k derate — users with usage credits enabled would get larger chunks.
+- **Indexing-tail progress logging** — `embed_and_mark` + `maintain_backlinks_batch` can run 30+ min silently on a large transcript; a 50-min ingest looks like a hang from outside the daemon.
+- **Per-ingest concurrency cap** — a large chunk count can monopolize the worker pool and hit Anthropic per-org throttling.
+- **Slug drift across chunks** — the same subject under slightly different slugs escapes by-slug consolidation.
