@@ -12,13 +12,15 @@ pub fn estimate_tokens(s: &str) -> usize {
     by_chars.max(by_bytes)
 }
 
-/// Token overhead of the JSON envelope wrapping each transcript segment in
-/// the EXTRACT payload — the `index`/`role`/`timestamp`/`text` keys, quotes,
-/// braces, and commas (~70 chars ≈ 24 tokens, independent of the text body).
+/// Token overhead of the JSON object wrapping a single item in a worker
+/// payload — field-name keys, quotes, braces, and commas (~70 chars ≈ 24
+/// tokens, independent of the item's text body). Counted per EXTRACT
+/// transcript segment (`index`/`role`/`timestamp`/`text`) when packing here,
+/// and reused by the worker's `job_prompt_tokens` for MERGE page pairs
+/// (`slug`/`proposed`/`existing`), whose envelope is the same magnitude.
 /// The worker's per-call overhead reserve is flat, so without counting this
-/// per segment a transcript of many short turns could exceed
-/// `chunk_max_tokens` on envelope alone and fail at dispatch with
-/// "Prompt is too long".
+/// per item a payload of many short items could exceed the budget on
+/// envelope alone and fail at dispatch with "Prompt is too long".
 pub const SEGMENT_ENVELOPE_TOKENS: usize = 24;
 
 /// Tokens a transcript segment contributes to the serialized EXTRACT payload:

@@ -4,7 +4,7 @@
 
 The EXTRACT ingest path has two related sizing problems, one acute and one chronic.
 
-**Acute (transcripts).** A claude-code session at `~/.claude/projects/-data-MemVerge-memex--claude-worktrees-locomo-benchmark-origin/e57b697d-6aad-4ad7-abe8-de52e9e926f2.jsonl` (30 MB, ~205,000 tokens of text after parsing) cannot be ingested at all. `handle_ingest_transcript_content` sends the entire transcript to the EXTRACT worker in one call; the prompt exceeds the worker model's context window; the worker returns a degraded response (prose status report or tool-use markup instead of the required `{"pages":[]}` JSON); the daemon's parser rejects it; the ingest fails. There is no transcript-side chunking today.
+**Acute (transcripts).** A real claude-code session transcript (30 MB, ~205,000 tokens of text after parsing) cannot be ingested at all. `handle_ingest_transcript_content` sends the entire transcript to the EXTRACT worker in one call; the prompt exceeds the worker model's context window; the worker returns a degraded response (prose status report or tool-use markup instead of the required `{"pages":[]}` JSON); the daemon's parser rejects it; the ingest fails. There is no transcript-side chunking today.
 
 **Chronic (documents).** `handle_ingest_document` does chunk via `chunk_markdown`, but with two static, model-blind size knobs: `chunk_target_tokens = 30k` and `chunk_hard_cap_tokens = 50k`. A worker pointed at sonnet-200k (~180k usable context) or sonnet-1M tier (~900k usable) is artificially capped at 30k chunks. Documents pay extra EXTRACT calls, extra cross-chunk MERGE calls, and extra system-prompt re-tokenization for no quality reason — the model has plenty of room to take whole sections in one pass.
 
@@ -225,12 +225,15 @@ State added: `last_response_tokens: u64` (set after each completed job from the 
 Pre-job check, added to the existing `count_hit || context_hit` clause:
 
 ```rust
-let new_prompt = build_prompt_for(&job);  // already computed for dispatch
-let new_prompt_tokens: u64 = (new_prompt.len() / memex_core::model::BYTES_PER_TOKEN) as u64;
+// As implemented: estimate the new prompt from its content + per-item JSON
+// envelope, then scale up if the content looks structured (code/JSON), which
+// bytes/4 undercounts.
+let new_prompt_tokens = job_prompt_tokens(&job);
+let scaled_prompt_tokens = scale_for_structured_content(new_prompt_tokens, &job);
 let projected_input = last_turn_input_tokens
     .saturating_add(last_response_tokens)
-    .saturating_add(new_prompt_tokens);
-let safety = max_input / 10; // 10% margin
+    .saturating_add(scaled_prompt_tokens);
+let safety = max_input / 5; // 20% margin (compensates for bytes/4 undercount)
 let fit_miss = projected_input > max_input.saturating_sub(safety);
 if count_hit || context_hit || fit_miss {
     let trigger = if fit_miss { "fit_miss" }
@@ -415,7 +418,11 @@ Run: 2026-05-22 (sonnet-4-6 subagent + codex-cli 0.130.0). Both voices read the 
 
 1. **Reserve overlap budget when packing (E-CRIT-1).** `chunk_transcript_segments` packs to `chunk_max_tokens − reserved_overlap_tokens`, not to `chunk_max_tokens`. `reserved_overlap_tokens` is estimated from the running average turn size × `overlap_turns`, recomputed per-chunk. After overlap is prepended, a debug-assert verifies total chunk tokens ≤ `chunk_max_tokens`. Without this reservation, a chunk packed to exactly `chunk_max_tokens` and then prefixed with 3 overlap turns can exceed the model's context — recreating the failure the design exists to prevent.
 
+   *Implemented as:* the overlap budget uses a single average over the whole input (not a per-chunk running average), and the cap is enforced exactly by **trimming** prepended overlap from the front until each chunk fits — not by a debug-assert (which would only fire in debug builds). Per-segment token counts also include a JSON-envelope overhead so many-short-turn transcripts can't overflow on envelope alone.
+
 2. **`MIN_CHUNK_TOKENS` floor in `worker_chunk_max_tokens` (E-CRIT-2).** `compute_batch_budget` saturates to 0 when overhead exceeds `max_input` (e.g., unknown model falls back to `DEFAULT_MODEL_INFO` 128k input − 16k max_output − 8k overhead − 12.8k safety = ~91k, OK; but a hypothetical model with bizarre catalog values could saturate to 0). Add `const MIN_CHUNK_TOKENS: usize = 8_000;` and return `cmp::max(MIN_CHUNK_TOKENS, compute_batch_budget(...))`. At daemon startup, log the resolved model name and the computed `chunk_max` so operators can see what's in effect.
+
+   *Implemented as:* the startup log (resolved model + `chunk_max`) shipped. The `MIN_CHUNK_TOKENS` clamp was **not** added — it guards a scenario that can't occur (overhead is 8k; no catalog model has a context window small enough to saturate the budget to 0), so the clamp would be dead code. `worker_chunk_max_tokens` forwards `compute_batch_budget(...)` directly.
 
 3. **Mode B serde contract test (E-CRIT-3).** Add in `cli/src/daemon/queue.rs` tests:
    ```rust
