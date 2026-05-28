@@ -38,9 +38,9 @@ pub(crate) fn worker_chunk_max_tokens(cfg: &crate::daemon::config::Config) -> us
 /// changing the multiplier decision.
 const STRUCTURED_SAMPLE_BYTES: usize = 4096;
 
-/// Non-alpha-byte fraction (3/10 = 30%) above which a prompt's `bytes/4`
-/// token estimate is scaled by `STRUCTURED_CONTENT_MULTIPLIER`. Code,
-/// JSON, and base64 trip this; English prose doesn't.
+/// Non-alphabetic character fraction (3/10 = 30%) above which a prompt's
+/// `bytes/4` token estimate is scaled by `STRUCTURED_CONTENT_MULTIPLIER`.
+/// Code, JSON, and base64 trip this; prose (any language) doesn't.
 const NON_ALPHA_NUMERATOR: usize = 3;
 const NON_ALPHA_DENOMINATOR: usize = 10;
 
@@ -837,10 +837,12 @@ fn job_prompt_tokens(job: &BackendJob) -> u64 {
 
 /// Scale a prompt-token estimate when the prompt looks structured (code,
 /// JSON, base64). bytes/4 systematically undercounts those by ~30-50%;
-/// the heuristic samples up to `STRUCTURED_SAMPLE_BYTES` of leading bytes
+/// the heuristic samples up to `STRUCTURED_SAMPLE_BYTES` of leading text
 /// (walking across segments so heterogeneous payloads still classify) and
-/// applies `STRUCTURED_CONTENT_MULTIPLIER` if non-alpha density crosses the
-/// threshold.
+/// applies `STRUCTURED_CONTENT_MULTIPLIER` (rounded up) if the non-alphabetic
+/// character density crosses the threshold. The classification is
+/// Unicode-aware so multilingual prose (CJK, accented Latin) isn't misread as
+/// structured.
 fn scale_for_structured_content(tokens: u64, job: &BackendJob) -> u64 {
     // Sample the same fields the prompt actually serializes, for every job
     // type: the worker projects fit_miss for all of them, so excluding any
@@ -859,23 +861,33 @@ fn scale_for_structured_content(tokens: u64, job: &BackendJob) -> u64 {
         BackendJob::Synth(j) => Box::new([j.context.as_str(), j.question.as_str()].into_iter()),
         BackendJob::Expand(j) => Box::new(std::iter::once(j.question.as_str())),
     };
-    let mut head = Vec::with_capacity(STRUCTURED_SAMPLE_BYTES);
+    // Char-bounded sample up to STRUCTURED_SAMPLE_BYTES (never splits a
+    // multibyte char).
+    let mut sample = String::with_capacity(STRUCTURED_SAMPLE_BYTES);
     for text in texts {
-        if head.len() >= STRUCTURED_SAMPLE_BYTES {
+        if sample.len() >= STRUCTURED_SAMPLE_BYTES {
             break;
         }
-        let take = (STRUCTURED_SAMPLE_BYTES - head.len()).min(text.len());
-        head.extend_from_slice(&text.as_bytes()[..take]);
+        for ch in text.chars() {
+            if sample.len() + ch.len_utf8() > STRUCTURED_SAMPLE_BYTES {
+                break;
+            }
+            sample.push(ch);
+        }
     }
-    if head.is_empty() {
+    if sample.is_empty() {
         return tokens;
     }
-    let non_alpha = head
-        .iter()
-        .filter(|b| !b.is_ascii_alphabetic() && !b.is_ascii_whitespace())
+    // Unicode-aware: CJK and accented-Latin letters count as alphabetic, so
+    // multilingual prose does NOT trip the multiplier — only code/JSON/base64
+    // punctuation density does.
+    let total = sample.chars().count();
+    let non_alpha = sample
+        .chars()
+        .filter(|c| !c.is_alphabetic() && !c.is_whitespace())
         .count();
-    if non_alpha * NON_ALPHA_DENOMINATOR > head.len() * NON_ALPHA_NUMERATOR {
-        (tokens as f64 * STRUCTURED_CONTENT_MULTIPLIER) as u64
+    if non_alpha * NON_ALPHA_DENOMINATOR > total * NON_ALPHA_NUMERATOR {
+        (tokens as f64 * STRUCTURED_CONTENT_MULTIPLIER).ceil() as u64
     } else {
         tokens
     }
@@ -1472,6 +1484,33 @@ mod tests {
             scale_for_structured_content(100, &empty_ingest),
             100,
             "Ingest with no segments must not scale (empty sample short-circuit)",
+        );
+    }
+
+    #[test]
+    fn scale_for_structured_content_treats_multibyte_prose_as_unstructured() {
+        use crate::daemon::queue::{BackendJob, ExtractSegment, IngestJob};
+        // Accented-Latin prose: every char is alphabetic per Unicode, but the
+        // UTF-8 bytes are non-ASCII. The old byte-level `is_ascii_alphabetic`
+        // check counted all of them as non-alpha and would scale this up; the
+        // char-based check must classify it as prose and leave it unscaled.
+        let prose = "é".repeat(2000); // 2000 alphabetic chars, 4000 bytes
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let job = BackendJob::Ingest(IngestJob {
+            segments: vec![ExtractSegment {
+                index: None,
+                role: None,
+                timestamp: None,
+                text: prose,
+            }],
+            source: "test".into(),
+            chunk: None,
+            reply: tx,
+        });
+        assert_eq!(
+            scale_for_structured_content(100, &job),
+            100,
+            "multibyte alphabetic prose must NOT trip the structured multiplier",
         );
     }
 
