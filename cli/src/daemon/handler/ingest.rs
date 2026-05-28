@@ -889,7 +889,9 @@ pub(super) async fn extract_pages_from_chunked_jobs(
         let job = BackendJob::Ingest(IngestJob {
             segments: chunk_segments,
             source: source.to_string(),
-            chunk: Some(ChunkPosition {
+            // Only multi-chunk ingests carry chunk metadata; a single-chunk
+            // ingest gets `None` so its EXTRACT payload shape is unchanged.
+            chunk: (total_chunks > 1).then_some(ChunkPosition {
                 index: idx,
                 total: total_chunks,
             }),

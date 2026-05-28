@@ -199,9 +199,7 @@ pub fn chunk_transcript_segments(
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChunkError {
-    #[error(
-        "document would split into more than {0} chunks; raise max_chunks or shrink the source"
-    )]
+    #[error("input would split into more than {0} chunks; raise max_chunks or shrink the source")]
     TooManyChunks(usize),
     #[error(
         "segment {0} is {1} tokens, exceeds chunk_max_tokens (transcripts can't be split mid-segment)"
