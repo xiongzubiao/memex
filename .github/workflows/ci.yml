@@ -32,11 +32,14 @@ jobs:
       # Clippy runs first because it doubles as the compile check and is
       # cheap to re-use for `cargo test` below (same artifacts).
       # `-D warnings` makes any new clippy warning fail CI.
+      # `--features memex-cli/test-harness` enables the gated integration +
+      # e2e test targets so they're actually compiled and run (without it
+      # they're silently skipped, letting harness-only regressions land).
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --features memex-cli/test-harness --no-deps -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --features memex-cli/test-harness
 
       # actionlint catches workflow YAML mistakes and surfaces them as
       # inline PR annotations on the diff via reviewdog. `fail_level: error`

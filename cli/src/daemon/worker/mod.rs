@@ -24,7 +24,7 @@ const EXTRACT_PROMPT_OVERHEAD_TOKENS: usize = 8_000;
 /// model's context window via the vendored litellm catalog. Used by both
 /// transcript ingest (`chunk_transcript_segments`) and document ingest
 /// (`extract_pages_from_content` → `chunk_markdown`).
-pub(crate) fn worker_chunk_max_tokens(cfg: &crate::daemon::config::Config) -> usize {
+pub fn worker_chunk_max_tokens(cfg: &crate::daemon::config::Config) -> usize {
     let w = &cfg.daemon.worker;
     let model = w
         .model
