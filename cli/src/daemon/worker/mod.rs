@@ -912,6 +912,17 @@ fn outcome_response_tokens(outcome: &JobOutcome) -> u64 {
         JobOutcome::Merge(Ok(r)) => r.merged_pages.iter().map(|p| p.body.len()).sum(),
         JobOutcome::Expand(Ok(r)) => r.lex.len() + r.vec.len() + r.hyde.len(),
         JobOutcome::Synth(Ok(r)) => r.answer.len(),
+        // Backend errors include schema-parse failures, where `message` holds
+        // the raw model text. That text is now part of the persistent
+        // subprocess's conversation history, so it must contribute to
+        // last_response_tokens for the next turn's fit_miss projection —
+        // otherwise a prose response can leave a large carry-over the
+        // projection misses. Crash/Timeout kill the subprocess (next
+        // iteration spawns fresh), so no carry-over → 0.
+        JobOutcome::Ingest(Err(WorkerError::Backend { message, .. }))
+        | JobOutcome::Merge(Err(WorkerError::Backend { message, .. }))
+        | JobOutcome::Expand(Err(WorkerError::Backend { message, .. }))
+        | JobOutcome::Synth(Err(WorkerError::Backend { message, .. })) => message.len(),
         _ => 0,
     };
     // Ceiling division, matching job_prompt_tokens: last_response_tokens
@@ -1512,6 +1523,29 @@ mod tests {
             100,
             "multibyte alphabetic prose must NOT trip the structured multiplier",
         );
+    }
+
+    #[test]
+    fn outcome_response_tokens_counts_backend_error_message() {
+        use crate::daemon::queue::WorkerError;
+        // A schema-parse-failed Backend error carries the model's raw text
+        // in `message` — that text is in the persistent subprocess's
+        // conversation history, so its token cost must feed the next turn's
+        // fit_miss projection. Before the fix, all Err outcomes returned 0,
+        // letting a large prose response slip past the restart trigger.
+        let prose = "x".repeat(8192); // 8192 bytes → 2048 tokens (bytes/4 ceil)
+        let outcome = JobOutcome::Ingest(Err(WorkerError::Backend {
+            message: prose,
+            code: None,
+        }));
+        assert_eq!(
+            outcome_response_tokens(&outcome),
+            (8192_u64).div_ceil(memex_core::model::BYTES_PER_TOKEN as u64),
+            "Backend-error message bytes must contribute to last_response_tokens",
+        );
+        // Crash kills the subprocess → no carry-over → 0.
+        let crashed: JobOutcome = JobOutcome::Ingest(Err(WorkerError::Crash("boom".into())));
+        assert_eq!(outcome_response_tokens(&crashed), 0);
     }
 
     /// Regression test for the cache-poisoning fix: outcomes whose parse

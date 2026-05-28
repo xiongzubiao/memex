@@ -129,7 +129,7 @@ A separate worker-side change adds a third restart trigger (`fit_miss`) so the w
 
 ```rust
 pub fn chunk_transcript_segments(
-    segments: &[ExtractSegment],
+    segments: Vec<ExtractSegment>,
     chunk_max_tokens: usize,
     max_chunks: usize,
     overlap_turns: usize,
@@ -183,8 +183,11 @@ let segments: Vec<ExtractSegment> = transcript.turns.into_iter()
     .collect();
 
 let chunk_max = worker_chunk_max_tokens(&state.config);
+// chunk_transcript_segments consumes `segments` (moves each into its chunk
+// to avoid cloning the full transcript text); capture metadata first.
+let total_segments = segments.len();
 let chunks = match chunk_transcript_segments(
-    &segments,
+    segments,
     chunk_max,
     state.config.ingest.max_chunks,
     3, // overlap_turns
