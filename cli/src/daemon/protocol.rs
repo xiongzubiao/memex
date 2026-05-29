@@ -117,8 +117,10 @@ pub enum Request {
     Search {
         title: String,
     },
-    /// `memex lint --fix` — apply auto-fixes for `StaleIndex` and
-    /// `OutdatedEmbedding` issues. Daemon-routed so the daemon
+    /// `memex lint --fix` — apply auto-fixes for the index/file/embedding
+    /// drift kinds (`StaleIndex`, `UntrackedFile`, `MissingFile`,
+    /// `OutdatedEmbedding`, `RawHashMismatch`); link issues are report-only.
+    /// Daemon-routed so the daemon
     /// remains the single writer; concurrent ingests/writes serialize
     /// against the same lock the daemon uses for everything else.
     LintFix {},

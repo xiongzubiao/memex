@@ -10,7 +10,11 @@ use super::SearchResult;
 ///   for list `i`. Missing entries default to 1.0. Compose weights from
 ///   independent trust axes (e.g. wiki-doc_type × primary-probe).
 /// - Formula: score(d) = sum_i(w_i / (k + rank_i(d))) + bonus(rank_i(d))
-/// - Bonus: +0.05 for rank 1, +0.02 for ranks 2-3 (1-based)
+/// - Bonus: +0.05 for rank 1, +0.02 for ranks 2-3 (1-based).
+///   Rationale: preserve a doc that ranks #1 (or top-3) in ANY lane so
+///   off-topic query expansion can't dilute a strong exact match for the
+///   original query (large `k` flattens RRF; the bonus restores top-rank
+///   emphasis). Ported from QMD (`store.ts`).
 /// - Post-fusion: reassign scores as 1/rank
 pub fn rrf_fuse(lists: &[Vec<SearchResult>], weights: &[f32], k: u32) -> Vec<SearchResult> {
     // Single list: no fusion needed, just assign 1/rank scores directly.
