@@ -154,9 +154,10 @@ stay in topical sections only, never Timeline.)
   has fields:
     - `rank` (integer) — retrieval rank, lower is more relevant
     - `doc_type` (string) — `wiki` (a curated subject page distilled
-      from one or more source documents) or `source` (a raw ingested
+      from one or more source documents) or `raw` (an original ingested
       document: could be a conversation transcript, a note, a report,
-      an article, or any other original file). WIKI pages are
+      an article, or any other original file — its `doc_type` value is
+      `raw`; the text below refers to these as 'source' entries). WIKI pages are
       LLM-distilled summaries and may OMIT specific facts. SOURCE
       entries are the authoritative originals and contain every detail
       — dates, quotes, names, numbers, code, measurements — exactly as
