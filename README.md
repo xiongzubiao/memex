@@ -99,10 +99,21 @@ memex doctor                        # verify
 
 `npm install -g` puts the platform binary on PATH and downloads the embedding model, tokenizer, and ONNX Runtime into `~/.memex/`. `memex install` auto-detects which of `~/.claude`, `~/.codex`, `~/.gemini` exist, merges hooks into each agent's settings, and (for Claude Code) copies skills into `~/.claude/skills/`. Re-running is idempotent. Target one agent with `memex install --agent claude-code`.
 
+### Claude Code plugin
+
+Install through Claude Code's plugin marketplace instead of npm:
+
+```bash
+claude plugin marketplace add https://github.com/xiongzubiao/memex
+claude plugin install memex
+```
+
+Use the full `https://` URL (not the `owner/repo` shorthand, which can fail without a GitHub SSH key). This registers the plugin with **Claude Code only** — for the other agents, use the `npm install -g` path above (its `memex install` wires up every detected CLI).
+
 ### Build from source
 
 ```bash
-git clone https://github.com/xiongzubiao/memex.git   # private repo; auth required
+git clone https://github.com/xiongzubiao/memex.git
 cd memex
 cargo build --release -p memex-cli
 mkdir -p ~/.local/bin && cp target/release/memex ~/.local/bin/
@@ -153,6 +164,25 @@ The daemon auto-spawns on first use (`query`, `ingest`, `backfill`) and exits af
 - `memex daemon start` — foreground
 - `memex daemon stop` — SIGTERM, waits up to 10s
 - `memex daemon status` — PID + ping health check
+
+## 🧹 Uninstall
+
+```bash
+memex uninstall                       # stop the daemon, strip hooks + skills
+npm uninstall -g @xiongzubiao/memex   # remove the binary
+rm -rf ~/.memex/                      # optional: model, ORT, wiki, index
+```
+
+Run `memex uninstall` **before** `npm uninstall -g` — it needs `memex` on PATH. Pass `--purge` to fold the `~/.memex/` cleanup into the uninstall step.
+
+Installed via the Claude Code marketplace instead?
+
+```bash
+claude plugin uninstall memex@xiongzubiao
+claude plugin marketplace remove xiongzubiao
+```
+
+`marketplace remove` may need running twice — the first pass can leave the entry in `~/.claude/settings.json`'s `extraKnownMarketplaces`.
 
 ## 🧱 Architecture
 
