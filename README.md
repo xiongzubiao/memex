@@ -33,8 +33,7 @@ memex query "how does the auth migration work"
 ## 🚀 Quickstart
 
 ```bash
-npm install -g @xiongzubiao/memex   # binary + embedding model + ONNX runtime
-memex install                       # wire session hooks into your installed agents
+npm install -g @xiongzubiao/memex   # binary + model + ONNX runtime; auto-registers hooks
 memex doctor                        # verify everything's ready
 ```
 
@@ -92,12 +91,11 @@ The worker LLM is **your agent CLI** — `claude -p`, `codex`, or `gemini`, run 
 ### npm (recommended)
 
 ```bash
-npm install -g @xiongzubiao/memex   # binary + model + ORT
-memex install                       # register hooks with detected agents
+npm install -g @xiongzubiao/memex   # binary + model + ORT; auto-registers hooks
 memex doctor                        # verify
 ```
 
-`npm install -g` puts the platform binary on PATH and downloads the embedding model, tokenizer, and ONNX Runtime into `~/.memex/`. `memex install` auto-detects which of `~/.claude`, `~/.codex`, `~/.gemini` exist, merges hooks into each agent's settings, and (for Claude Code) copies skills into `~/.claude/skills/`. Re-running is idempotent. Target one agent with `memex install --agent claude-code`.
+`npm install -g` puts the platform binary on PATH, downloads the embedding model, tokenizer, and ONNX Runtime into `~/.memex/`, and — because it's a global install — runs `memex install` for you: it detects whichever of `~/.claude`, `~/.codex`, `~/.gemini` exist, merges hooks into each agent's settings, and (for Claude Code) copies skills into `~/.claude/skills/`. Run `memex install` by hand only if that auto-step fails (the installer tells you), if you installed without `-g`, or to register an agent CLI you added later — it's idempotent. Target one agent with `memex install --agent claude-code`.
 
 ### Claude Code plugin
 
